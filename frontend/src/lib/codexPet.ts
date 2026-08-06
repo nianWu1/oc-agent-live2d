@@ -14,12 +14,30 @@ export type CodexPetState =
   | 'running'
   | 'review'
 
+export type PetKind = 'sprite' | 'live2d'
+
+export interface Live2DMotionGroups {
+  idle?: string
+  working?: string
+  waiting?: string
+  jumping?: string
+}
+
 export interface CodexPet {
   id: string
   displayName: string
   description: string
   // Resolved absolute URL ready to use as a CSS background-image source.
+  // For Live2D pets this points at a preview texture instead of an atlas.
   spritesheetUrl: string
+  kind?: PetKind
+  // Absolute URL to `.model3.json` when kind === 'live2d'.
+  modelUrl?: string
+  motionGroups?: Live2DMotionGroups
+}
+
+export function isLive2DPet(pet: CodexPet | null | undefined): boolean {
+  return !!pet && pet.kind === 'live2d' && !!pet.modelUrl
 }
 
 export const ATLAS = {
@@ -120,6 +138,8 @@ export function petStateToCodexState(state: MiniPetSourceState): CodexPetState {
 
 const BUILTIN_BASE = '/assets/builtin'
 const MANIFEST_URL = `${BUILTIN_BASE}/pets-manifest.json`
+const LIVE2D_BASE = '/assets/live2d'
+const LIVE2D_MANIFEST_URL = `${LIVE2D_BASE}/manifest.json`
 
 interface RawPetMeta {
   id: string
@@ -128,40 +148,95 @@ interface RawPetMeta {
   spritesheetPath: string
 }
 
+interface RawLive2DPetMeta {
+  id: string
+  displayName: string
+  description?: string
+  kind?: PetKind
+  modelPath: string
+  previewPath?: string
+  motionGroups?: Live2DMotionGroups
+}
+
 interface PetsManifest {
   pets: string[]
 }
 
 let cachedPets: Promise<CodexPet[]> | null = null
 
+async function loadBuiltinSpritePets(): Promise<CodexPet[]> {
+  const manifestRes = await fetch(MANIFEST_URL)
+  if (!manifestRes.ok) {
+    throw new Error(`pets-manifest.json fetch failed: ${manifestRes.status}`)
+  }
+  const manifest = (await manifestRes.json()) as PetsManifest
+  const ids = Array.isArray(manifest.pets) ? manifest.pets : []
+
+  const results = await Promise.all(
+    ids.map(async (id): Promise<CodexPet | null> => {
+      try {
+        const res = await fetch(`${BUILTIN_BASE}/${id}/pet.json`)
+        if (!res.ok) return null
+        const meta = (await res.json()) as RawPetMeta
+        return {
+          id: meta.id || id,
+          displayName: meta.displayName || id,
+          description: meta.description || '',
+          spritesheetUrl: `${BUILTIN_BASE}/${id}/${meta.spritesheetPath}`,
+          kind: 'sprite',
+        }
+      } catch {
+        return null
+      }
+    }),
+  )
+  return results.filter((p): p is CodexPet => p !== null)
+}
+
+async function loadBuiltinLive2DPets(): Promise<CodexPet[]> {
+  try {
+    const manifestRes = await fetch(LIVE2D_MANIFEST_URL)
+    if (!manifestRes.ok) return []
+    const manifest = (await manifestRes.json()) as PetsManifest
+    const ids = Array.isArray(manifest.pets) ? manifest.pets : []
+    const results = await Promise.all(
+      ids.map(async (folder): Promise<CodexPet | null> => {
+        try {
+          const res = await fetch(`${LIVE2D_BASE}/${folder}/pet.json`)
+          if (!res.ok) return null
+          const meta = (await res.json()) as RawLive2DPetMeta
+          const preview =
+            meta.previewPath ||
+            meta.modelPath.replace(/\.model3\.json$/i, '.png')
+          return {
+            id: meta.id || `live2d-${folder}`,
+            displayName: meta.displayName || folder,
+            description: meta.description || '',
+            spritesheetUrl: `${LIVE2D_BASE}/${folder}/${preview}`,
+            kind: 'live2d',
+            modelUrl: `${LIVE2D_BASE}/${folder}/${meta.modelPath}`,
+            motionGroups: meta.motionGroups,
+          }
+        } catch {
+          return null
+        }
+      }),
+    )
+    return results.filter((p): p is CodexPet => p !== null)
+  } catch (e) {
+    console.warn('[codexPet] loadBuiltinLive2DPets failed:', e)
+    return []
+  }
+}
+
 export function loadCodexPets(): Promise<CodexPet[]> {
   if (!cachedPets) {
     cachedPets = (async () => {
-      const manifestRes = await fetch(MANIFEST_URL)
-      if (!manifestRes.ok) {
-        throw new Error(`pets-manifest.json fetch failed: ${manifestRes.status}`)
-      }
-      const manifest = (await manifestRes.json()) as PetsManifest
-      const ids = Array.isArray(manifest.pets) ? manifest.pets : []
-
-      const results = await Promise.all(
-        ids.map(async (id): Promise<CodexPet | null> => {
-          try {
-            const res = await fetch(`${BUILTIN_BASE}/${id}/pet.json`)
-            if (!res.ok) return null
-            const meta = (await res.json()) as RawPetMeta
-            return {
-              id: meta.id || id,
-              displayName: meta.displayName || id,
-              description: meta.description || '',
-              spritesheetUrl: `${BUILTIN_BASE}/${id}/${meta.spritesheetPath}`,
-            }
-          } catch {
-            return null
-          }
-        }),
-      )
-      return results.filter((p): p is CodexPet => p !== null)
+      const [sprites, live2d] = await Promise.all([
+        loadBuiltinSpritePets(),
+        loadBuiltinLive2DPets(),
+      ])
+      return [...sprites, ...live2d]
     })()
   }
   return cachedPets

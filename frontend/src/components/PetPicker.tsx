@@ -13,9 +13,10 @@ import {
   Sparkles,
   X as XIcon,
 } from 'lucide-react'
-import { SpritePet } from './SpritePet'
+import { PetThumb } from './PetAvatar'
 import {
   clearCodexPetCache,
+  isLive2DPet,
   loadCodexPets,
   loadCustomCodexPets,
   type CodexPet,
@@ -407,7 +408,7 @@ export function PetPicker({
                     style={{ width: 32, height: 32 }}
                   >
                     {meta ? (
-                      <SpritePet pet={meta} state="idle" size={32} />
+                      <PetThumb pet={meta} size={32} />
                     ) : (
                       <span className="text-[10px] text-white/30">?</span>
                     )}
@@ -467,7 +468,7 @@ export function PetPicker({
                         className="shrink-0 rounded-md bg-black/40 border border-white/10 overflow-hidden flex items-center justify-center"
                         style={{ width: 28, height: 28 }}
                       >
-                        <SpritePet pet={pet} state="idle" size={28} />
+                        <PetThumb pet={pet} size={28} />
                       </div>
                       <span className="text-xs text-white/75 truncate flex-1 text-left">
                         {pet.displayName}
@@ -628,10 +629,15 @@ function PetRow({ pet, selected, onSelect }: PetRowProps) {
         className="shrink-0 rounded-lg bg-black/40 border border-white/10 overflow-hidden flex items-center justify-center"
         style={{ width: 40, height: 40 }}
       >
-        <SpritePet pet={pet} state="idle" size={40} />
+        <PetThumb pet={pet} size={40} />
       </div>
       <div className="min-w-0 flex-1">
-        <div className="text-sm text-white/85 font-medium truncate">{pet.displayName}</div>
+        <div className="text-sm text-white/85 font-medium truncate">
+          {pet.displayName}
+          {isLive2DPet(pet) && (
+            <span className="ml-1.5 text-[10px] text-sky-300/80 font-normal">Live2D</span>
+          )}
+        </div>
         {description && (
           <div className="text-[11px] text-white/40 truncate">{description}</div>
         )}
@@ -913,7 +919,7 @@ function ExtraMascotControls({
                 style={{ width: 32, height: 32 }}
               >
                 {primaryPet ? (
-                  <SpritePet pet={primaryPet} state="idle" size={32} />
+                  <PetThumb pet={primaryPet} size={32} />
                 ) : primaryAvatar ? (
                   primaryAvatar
                 ) : (
@@ -960,7 +966,7 @@ function ExtraMascotControls({
                   style={{ width: 32, height: 32 }}
                 >
                   {meta ? (
-                    <SpritePet pet={meta} state="idle" size={32} />
+                    <PetThumb pet={meta} size={32} />
                   ) : (
                     <span className="text-[10px] text-white/30">?</span>
                   )}
@@ -1053,7 +1059,7 @@ function ExtraMascotControls({
                     className="shrink-0 rounded-md bg-black/40 border border-white/10 overflow-hidden flex items-center justify-center"
                     style={{ width: 28, height: 28 }}
                   >
-                    <SpritePet pet={pet} state="idle" size={28} />
+                    <PetThumb pet={pet} size={28} />
                   </div>
                   <span className="text-xs text-white/75 truncate flex-1 text-left">
                     {pet.displayName}
@@ -1199,7 +1205,7 @@ function DemoMascotControls({
                     style={{ width: 32, height: 32 }}
                   >
                     {meta ? (
-                      <SpritePet pet={meta} state="idle" size={32} />
+                      <PetThumb pet={meta} size={32} />
                     ) : (
                       <span className="text-[10px] text-white/30">?</span>
                     )}
@@ -1243,7 +1249,7 @@ function DemoMascotControls({
                       className="shrink-0 rounded-md bg-black/40 border border-white/10 overflow-hidden flex items-center justify-center"
                       style={{ width: 28, height: 28 }}
                     >
-                      <SpritePet pet={pet} state="idle" size={28} />
+                      <PetThumb pet={pet} size={28} />
                     </div>
                     <span className="text-xs text-white/75 truncate flex-1 text-left">
                       {pet.displayName}

@@ -31,13 +31,37 @@ import {
 } from './lib/petStore'
 import {
   DEFAULT_PET_QUEUE_IDS,
+  isLive2DPet,
   loadCodexPetById, loadDefaultCodexPet,
   petStateToCodexState,
   type CodexPet, type CodexPetState,
 } from './lib/codexPet'
 import { MiniPetMascot } from './components/MiniPetMascot'
 import { SpritePet } from './components/SpritePet'
+import { PetThumb } from './components/PetAvatar'
 import { PetPicker } from './components/PetPicker'
+
+/** Session-list icon: animate sprites, but keep Live2D as a static thumb (no per-row Pixi). */
+function SessionPetIcon({
+  pet,
+  state,
+  size,
+  style,
+}: {
+  pet: CodexPet
+  state: CodexPetState
+  size: number
+  style?: React.CSSProperties
+}) {
+  if (isLive2DPet(pet)) {
+    return (
+      <div style={style}>
+        <PetThumb pet={pet} size={size} />
+      </div>
+    )
+  }
+  return <SpritePet pet={pet} state={state} size={size} style={style} />
+}
 
 interface CharacterMeta {
   name: string
@@ -276,7 +300,7 @@ function ChatList({ messages, accentColor }: { messages: { role: string; text: s
 
 type LargePetAction = 'work' | 'rest' | 'question' | 'grasp' | 'spin' | 'angry'
 
-// Pet mode action → largeActions video key mapping
+// Pet mode action ? largeActions video key mapping
 const PET_ACTION_VIDEO_MAP: Record<PetAction, string> = {
   idle: 'idle',
   sleep: 'rest',
@@ -337,7 +361,7 @@ type OcParams = { mode?: string; url?: string; token?: string; sshHost?: string;
 function connToOcParams(conn: OcConnection): OcParams | null {
   if (conn.type === 'remote') {
     if (conn.host && conn.user) return { mode: 'remote', sshHost: conn.host, sshUser: conn.user }
-    return null // incomplete remote — skip
+    return null // incomplete remote ? skip
   }
   return {} // local
 }
@@ -357,7 +381,7 @@ export default function Mini() {
   const [characters, setCharacters] = useState<CharacterMeta[]>([])
   const [agentCharMap, setAgentCharMap] = useState<Record<string, string>>({})
   const [miniChar, setMiniChar] = useState<CharacterMeta | null>(null)
-  // ─── Codex sprite pet (mini mode) ───
+  // ??? Codex sprite pet (mini mode) ???
   // miniPet is the user-selected codex pet rendered in every mini slot.
   // walkDir captures locomotion direction (-1 left, 1 right, 0 stationary)
   // for the main mascot's sprite state override while the native window
@@ -412,7 +436,7 @@ export default function Mini() {
   const claudeSessionsRef = useRef<any[]>([])
   claudeSessionsRef.current = claudeSessions
   const [charQueue, setCharQueue] = useState<string[]>([DEFAULT_CHAR_NAME])
-  // ─── Codex pet rotation queue (mini mode) ───
+  // ??? Codex pet rotation queue (mini mode) ???
   // Each session slot maps to petQueue[i % petQueue.length] so multiple
   // running agents show different pets. Persisted in settings.json under
   // `mini_pet_queue`. Defaults to a single-item queue containing the
@@ -488,7 +512,7 @@ export default function Mini() {
     }
   }, [showPanel, editingSessionTitle, saveSessionNickname])
 
-  // OC multi-connection: qualifiedId → connection params, qualifiedId → real agent ID, qualifiedId → source label
+  // OC multi-connection: qualifiedId ? connection params, qualifiedId ? real agent ID, qualifiedId ? source label
   const agentConnMapRef = useRef<Map<string, OcParams>>(new Map())
   const agentRealIdMapRef = useRef<Map<string, string>>(new Map())
   // Source label dictionary is still populated by `fetchAgents` for future
@@ -539,7 +563,7 @@ export default function Mini() {
   const [autoCloseCompletion, setAutoCloseCompletion] = useState(false)
   const [petSfxEnabled, setPetSfxEnabled] = useState(true)
   const petSfxEnabledRef = useRef(true)
-  // Pet mode: random idle action trigger interval, in minutes (0.5 – 30, default 2).
+  // Pet mode: random idle action trigger interval, in minutes (0.5 ? 30, default 2).
   const [petIdleIntervalMin, setPetIdleIntervalMin] = useState(2)
   const petIdleIntervalMinRef = useRef(2)
   useEffect(() => { petIdleIntervalMinRef.current = petIdleIntervalMin }, [petIdleIntervalMin])
@@ -599,7 +623,7 @@ export default function Mini() {
     _setNativeDialogActive(v)
   }, [])
   // Diagnostic IPC: forwards UI state transitions to the backend log file.
-  // Skipped entirely in production builds — no IPC overhead, no log noise.
+  // Skipped entirely in production builds ? no IPC overhead, no log noise.
   const debugToTerminal = useCallback((scope: string, msg: string) => {
     if (!import.meta.env.DEV) return
     invoke('debug_log', { scope, msg }).catch(() => {})
@@ -644,7 +668,7 @@ export default function Mini() {
     isCreateModalOpenRef.current = v
     _setIsCreateModalOpen(v)
   }
-  // ─── Pet / Nurture mode state ───
+  // ??? Pet / Nurture mode state ???
   const [appMode, setAppMode] = useState<AppMode | null>(null)
   const appModeRef = useRef<AppMode | null>(null)
   const [showOnboarding, setShowOnboarding] = useState(false)
@@ -715,7 +739,7 @@ export default function Mini() {
   const viewModeRef = useRef<'island' | 'efficiency'>('efficiency')
   const expandedRef = useRef(false)
   const expandedWindowModeRef = useRef<'island' | 'efficiency' | null>(null)
-  // showIdleSessions removed — all sessions visible, important ones sorted to top
+  // showIdleSessions removed ? all sessions visible, important ones sorted to top
   const collapsingRef = useRef(false)
   const customPosRef = useRef<{ x: number; y: number } | null>(null)
   const [moveMode, _setMoveMode] = useState(false)
@@ -723,7 +747,7 @@ export default function Mini() {
   const moveModeActivatedAtRef = useRef(0)
   const mascotDragActiveRef = useRef(false)
   // Mirror of mascotDragActiveRef for React-driven UI (e.g. suppressing the
-  // sprite's hover-jump while dragging so walkDir → run-left/run-right
+  // sprite's hover-jump while dragging so walkDir ? run-left/run-right
   // actually shows). Keep both in sync via setMascotDragActive below.
   const [mascotDragActive, _setMascotDragActive] = useState(false)
   const [resizeHandleHovered, setResizeHandleHovered] = useState(false)
@@ -759,7 +783,7 @@ export default function Mini() {
   const [updateModalProgressStage, setUpdateModalProgressStage] = useState('preparing')
   // Server-driven UI config (latest.json `ui` block). The codex pet hub
   // URL is sourced from `ui.petdex.url`. We deliberately do NOT fall
-  // back to a hardcoded value — when the fetch fails or the field is
+  // back to a hardcoded value ? when the fetch fails or the field is
   // missing, PetPicker shows a "network error" message so users
   // understand why the link is unavailable rather than us silently
   // routing them to a possibly-stale URL.
@@ -825,7 +849,7 @@ export default function Mini() {
 
   // Pet mode data loaded inside main init effect below (no separate effect)
 
-  // React to hunger changes (e.g. from Dev slider) — switch to/from hungry
+  // React to hunger changes (e.g. from Dev slider) ? switch to/from hungry
   useEffect(() => {
     if (appMode !== 'pet') return
     if (petData.hunger < 30 && petActionPriority(currentPetAction) < petActionPriority('hungry')) {
@@ -869,7 +893,7 @@ export default function Mini() {
     }
   }, [appMode, largeMascot])
 
-  // Pet mode: check system idle time → rest (5min no activity & no media) or idle
+  // Pet mode: check system idle time ? rest (5min no activity & no media) or idle
   const idleCheckRef = useRef<ReturnType<typeof setInterval> | null>(null)
   // Shared now-playing cache/lock for pet-mode polling.
   // We have two loops querying media state (2s media auto-detect + 10s idle check).
@@ -930,7 +954,7 @@ export default function Mini() {
   }, [appMode, getNowPlayingSafe])
 
   // Pet mode: while idle, randomly trigger weighted actions on a user-tunable
-  // interval (default 2 min, range 0.5–30 min). Keep spin out of the random
+  // interval (default 2 min, range 0.5?30 min). Keep spin out of the random
   // pool; spin is reserved for high-affection click.
   const idleAutoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   useEffect(() => {
@@ -977,7 +1001,7 @@ export default function Mini() {
   }, [appMode, currentPetAction])
 
   // Pet mode always uses the builtin mascot character assets.
-  const PET_BUILTIN_BASE = '/assets/builtin/香企鹅'
+  const PET_BUILTIN_BASE = '/assets/builtin/???'
   const preferWebmLarge = typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows')
   const largeFolder = preferWebmLarge ? 'webm' : 'mov'
   const largeExt = preferWebmLarge ? 'webm' : 'mov'
@@ -1050,13 +1074,13 @@ export default function Mini() {
       lastGraspAudioAtRef.current = now
     }
     const FALLBACK_AUDIO: Record<string, string> = {
-      angry: '/assets/builtin/香企鹅/audio/angry.mp3',
-      grasp: '/assets/builtin/香企鹅/audio/angry.mp3',
-      headpat: '/assets/builtin/香企鹅/audio/cute.mp3',
-      farewell: '/assets/builtin/香企鹅/audio/cute.mp3',
-      spin: '/assets/builtin/香企鹅/audio/happy.mp3',
-      walkout: '/assets/builtin/香企鹅/audio/happy.mp3',
-      eat: '/assets/builtin/香企鹅/audio/happy.mp3',
+      angry: '/assets/builtin/???/audio/angry.mp3',
+      grasp: '/assets/builtin/???/audio/angry.mp3',
+      headpat: '/assets/builtin/???/audio/cute.mp3',
+      farewell: '/assets/builtin/???/audio/cute.mp3',
+      spin: '/assets/builtin/???/audio/happy.mp3',
+      walkout: '/assets/builtin/???/audio/happy.mp3',
+      eat: '/assets/builtin/???/audio/happy.mp3',
     }
     const map = petAudioMapRef.current || FALLBACK_AUDIO
     const src = map[action]
@@ -1119,7 +1143,7 @@ export default function Mini() {
   }, [appMode, currentPetAction])
 
   // Walk animation: move the window and flip direction every 3 seconds.
-  // In "walk to edge" mode, walk straight to the nearest screen edge → peek.
+  // In "walk to edge" mode, walk straight to the nearest screen edge ? peek.
   useEffect(() => {
     if (walkTimerRef.current) {
       clearInterval(walkTimerRef.current)
@@ -1652,7 +1676,7 @@ export default function Mini() {
   }, [])
 
   const fetchAgents = useCallback(async () => {
-    // Skip polling while settings page is open — snapshot comparison would
+    // Skip polling while settings page is open ? snapshot comparison would
     // detect the config change prematurely, consuming it before the user exits
     // settings, which means exitSettings' call wouldn't show the loading overlay.
     if (settingsModeRef.current) return
@@ -1672,7 +1696,7 @@ export default function Mini() {
       const connections = await loadOcConnections()
       setHasConfiguredOpenClaw(connections.some((conn) => connToOcParams(conn) !== null))
 
-      // Detect connection config changes — show loading overlay if changed
+      // Detect connection config changes ? show loading overlay if changed
       const snapshot = JSON.stringify(connections.map((c) => ({ id: c.id, type: c.type, host: c.host, user: c.user })))
       const configChanged = lastConnSnapshotRef.current !== '' && snapshot !== lastConnSnapshotRef.current
       lastConnSnapshotRef.current = snapshot
@@ -1716,7 +1740,7 @@ export default function Mini() {
       const charMap = (await store.get('agent_char_map')) as Record<string, string> | null
       setAgents(allAgents)
       setAgentCharMap(charMap || {})
-      // Clear loading overlay — data is now fresh
+      // Clear loading overlay ? data is now fresh
       setRefreshingAgents(false)
       if (refreshTimeoutRef.current) {
         clearTimeout(refreshTimeoutRef.current)
@@ -1760,7 +1784,7 @@ export default function Mini() {
 
   const prevHealthRef = useRef<Record<string, boolean>>({})
   const prevSessionHealthRef = useRef<Record<string, boolean>>({})
-  // Prevent concurrent pollHealth calls — if a remote SSH call takes > 1s,
+  // Prevent concurrent pollHealth calls ? if a remote SSH call takes > 1s,
   // the 1s interval would stack requests, overwhelming the SSH socket and
   // causing repeated "stale socket" failures.
   const pollHealthBusyRef = useRef(false)
@@ -1769,7 +1793,7 @@ export default function Mini() {
     pollHealthBusyRef.current = true
     try {
       const connections = await loadOcConnections()
-      // Start with previous data — only overwrite for connections that succeed
+      // Start with previous data ? only overwrite for connections that succeed
       const hMap: Record<string, boolean> = { ...prevHealthRef.current }
       const sMap: Record<string, boolean> = { ...prevSessionHealthRef.current }
       const freshKeys = new Set<string>() // session keys that got fresh data this round
@@ -1779,7 +1803,7 @@ export default function Mini() {
           try {
             const oc = connToOcParams(conn)
             if (!oc) {
-              // Incomplete remote connection — still clear stale health data for
+              // Incomplete remote connection ? still clear stale health data for
               // this prefix so the mascot/status doesn't stay "busy" from the
               // previous (now-removed) connection's data.
               for (const k of Object.keys(hMap)) {
@@ -1791,7 +1815,7 @@ export default function Mini() {
               return
             }
             const health = (await invoke('get_health', oc)) as { agents: AgentHealth[]; gatewayAlive?: boolean }
-            // Gateway dead (local OpenClaw process not running) — remove this
+            // Gateway dead (local OpenClaw process not running) ? remove this
             // connection from settings so the character cleanly goes idle instead
             // of flickering between stale "working" and "idle" states.
             if (health.gatewayAlive === false) {
@@ -1824,13 +1848,13 @@ export default function Mini() {
               }
             })
           } catch {
-            /* SSH/invoke failed — previous data preserved */
+            /* SSH/invoke failed ? previous data preserved */
           }
         }),
       )
 
-      // Detect session active→inactive transitions (only for fresh data)
-      // Skip sub-agent sessions — their key contains ":subagent:" (from OpenClaw session key format)
+      // Detect session active?inactive transitions (only for fresh data)
+      // Skip sub-agent sessions ? their key contains ":subagent:" (from OpenClaw session key format)
       const prev = prevSessionHealthRef.current
       if (freshKeys.size > 0) {
         const anyBecameInactive = Array.from(freshKeys).some((k) => prev[k] === true && sMap[k] === false && !k.includes(':subagent:'))
@@ -1856,7 +1880,7 @@ export default function Mini() {
   const previewQueueRef = useRef<string[]>([])
   const previewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const sessionFileMapRef = useRef<Map<string, string>>(new Map())
-  const sessionAgentMapRef = useRef<Map<string, string>>(new Map()) // sessionCompositeKey → qualifiedAgentId
+  const sessionAgentMapRef = useRef<Map<string, string>>(new Map()) // sessionCompositeKey ? qualifiedAgentId
   const fetchingSessionsRef = useRef(false)
 
   const fetchAllSessions = useCallback(async () => {
@@ -2154,7 +2178,7 @@ export default function Mini() {
     }
     const seenCompletions = new Set<string>(shownCompletionsRef.current)
     // Track previously logged session statuses so we only emit a backend log
-    // line when something actually changes — keeps oc-claw.log readable.
+    // line when something actually changes ? keeps oc-claw.log readable.
     const lastLoggedStatus = new Map<string, string>()
     const poll = async () => {
       try {
@@ -2212,7 +2236,7 @@ export default function Mini() {
         // setClaudeSessions(sessions) below so the panel's first frame
         // already has both the new session list and the new filter state.
         // Otherwise React renders once with new completionSessionId + stale
-        // claudeSessions (lastResponse not yet present) → user sees the
+        // claudeSessions (lastResponse not yet present) ? user sees the
         // full session list (image 2) flash before it collapses to the
         // single completed session (image 1).
         let completionCandidate: any = null
@@ -2340,7 +2364,7 @@ export default function Mini() {
     return () => clearInterval(t)
   }, [enableClaudeCode, enableClaudeDesktop, enableCodex, enableCursor, enableGemini, enableOpencode, enableHermes, hermesConns, appMode])
 
-  // Listen for Claude/Codex/Cursor task completion → play sound
+  // Listen for Claude/Codex/Cursor task completion ? play sound
   const soundEnabledRef = useRef(soundEnabled)
   soundEnabledRef.current = soundEnabled
   const codexSoundEnabledRef = useRef(codexSoundEnabled)
@@ -2507,7 +2531,7 @@ export default function Mini() {
   })
   // Sessions belonging to a disabled stream (CC CLI / CC Desktop / Codex /
   // Cursor) must not affect mascot state, slot visualization, or the
-  // task-list views — otherwise a stale "processing" session in a muted
+  // task-list views ? otherwise a stale "processing" session in a muted
   // stream keeps the mascot in working state forever.
   const visibleClaudeSessions = claudeSessions.filter((cs) => {
     if (cs.source === 'cursor') return enableCursor
@@ -2528,7 +2552,7 @@ export default function Mini() {
     return {
       agentId: `claude:${cs.sessionId}`,
       sessionIdx: ocSlots.length + i,
-      agent: { id: `claude:${cs.sessionId}`, identityName: 'Claude', identityEmoji: '🤖' },
+      agent: { id: `claude:${cs.sessionId}`, identityName: 'Claude', identityEmoji: '??' },
       char,
       isWorking: isActive || isCompacting || isWaiting,
       petState,
@@ -2547,7 +2571,7 @@ export default function Mini() {
   const [effListCollapsed, setEffListCollapsed] = useState(false)
   const collapseFnRef = useRef<(() => void) | null>(null)
   const shownCompletionsRef = useRef(new Set<string>())
-  // Sessions whose permission/clarify popup the user dismissed via "稍后处理".
+  // Sessions whose permission/clarify popup the user dismissed via "????".
   // The session itself stays in the waiting state, but we hide the action
   // buttons until it leaves waiting and re-enters (next request).
   const [dismissedWaitingIds, setDismissedWaitingIds] = useState<Set<string>>(new Set())
@@ -2685,7 +2709,7 @@ export default function Mini() {
 
   // Mirror the primary mascot exactly: while the session panel is expanded the
   // primary mascot is replaced by the panel, so the extra (multi-pet) mascots
-  // must hide too — and reappear when it collapses. Pet mode has none.
+  // must hide too ? and reappear when it collapses. Pet mode has none.
   useEffect(() => {
     if (appMode !== 'coding') return
     invoke('set_extra_mascots_hidden', { hidden: expanded }).catch(() => {})
@@ -2812,7 +2836,7 @@ export default function Mini() {
     let cancelled = false
     const checkForUpdates = async () => {
       try {
-        // Always fetch — we want the `ui` block (e.g. petdex url) even
+        // Always fetch ? we want the `ui` block (e.g. petdex url) even
         // when the modal cadence gate skips showing the update prompt.
         const info = (await invoke('check_for_update', {
           lang: i18n.language,
@@ -3093,7 +3117,7 @@ export default function Mini() {
         }
         // The window-focus auto-expand fires slightly before pointerdown
         // when clicking an unfocused mini window. Cancel it so this click
-        // path is the single source of truth for expand vs drag —
+        // path is the single source of truth for expand vs drag ?
         // otherwise a quick wiggle ends up dragging the auto-expanded
         // panel.
         cancelFocusExpand()
@@ -3109,7 +3133,7 @@ export default function Mini() {
         // Capture the window's logical origin once at pointerdown so we can
         // drive the drag with absolute positioning. The previous `move_mini_by`
         // path read `outer_position()` on every event, dividing by scale
-        // factor to convert physical→logical and then re-multiplying inside
+        // factor to convert physical?logical and then re-multiplying inside
         // Tauri to set the new position. Repeated rounding plus the chance
         // that a fast burst of events would read a stale (not-yet-applied)
         // position made the window drift away from the cursor on high-DPI
@@ -3431,7 +3455,7 @@ export default function Mini() {
       return
     }
     // The enter/exit-settings transition resizes the native window which
-    // can momentarily steal focus → onBlur → collapse. Skip collapse
+    // can momentarily steal focus ? onBlur ? collapse. Skip collapse
     // while we're mid-transition so the UI we're building isn't torn
     // down before it appears.
     if (settingsTransitioningRef.current) return
@@ -3439,10 +3463,10 @@ export default function Mini() {
     collapsingRef.current = true
     hoverExpandedRef.current = false
     // Intentionally DO NOT clear completionSessionId / effListCollapsed here.
-    // While the panel fades out (opacity 1 → 0 over panelChromeTransition),
+    // While the panel fades out (opacity 1 ? 0 over panelChromeTransition),
     // the content is still mounted. Clearing the popup state mid-fade would
     // re-render the panel back to the full session list under the fading
-    // overlay — visible as a "list flash" before the panel actually goes
+    // overlay ? visible as a "list flash" before the panel actually goes
     // away. We reset both inside the setTimeout below, after setExpanded
     // unmounts the panel content.
     if (hoverCloseTimerRef.current) {
@@ -3499,11 +3523,11 @@ export default function Mini() {
       expandedRef.current = false
       expandedWindowModeRef.current = null
       // Now that the expanded panel is unmounted, it's safe to clear the
-      // completion popup state (which also resets effListCollapsed → false).
+      // completion popup state (which also resets effListCollapsed ? false).
       // Doing it earlier would cause the fading panel to flash the full
       // session list before going away.
       setCompletionSessionId(null)
-      // Hide the entire document during the resize→reposition pair below.
+      // Hide the entire document during the resize?reposition pair below.
       // `set_mini_expanded(expanded:false)` first parks the window at the
       // default collapsed slot (right-near-notch); only the follow-up
       // set_mini_origin moves it to the saved customPos. Without this
@@ -3560,7 +3584,7 @@ export default function Mini() {
   }, [fetchAgents, restoreCollapsedMascotPosition, debugToTerminal, isSettingsPickerBlockingClose])
   collapseFnRef.current = collapse
 
-  // ── Efficiency-mode notch hover tracking (native cursor polling) ──
+  // ?? Efficiency-mode notch hover tracking (native cursor polling) ??
   // On macOS the mini window sits in the menu-bar / notch area where the
   // system intercepts mouse events, so web-level onMouseEnter never fires.
   // A Rust-side 50ms poll of NSEvent.mouseLocation emits "efficiency-hover"
@@ -3723,7 +3747,7 @@ export default function Mini() {
   }, [])
 
   // `force` is set when the close path is a trusted, in-app user action
-  // (e.g. clicking the ✕ button). Untrusted paths (blur / backdrop click)
+  // (e.g. clicking the ? button). Untrusted paths (blur / backdrop click)
   // still go through the picker-grace guard so macOS-synthesised events
   // can't tear settings down right after a native dialog closes.
   const exitSettings = useCallback(async (force = false) => {
@@ -3758,7 +3782,7 @@ export default function Mini() {
       // resized + repositioned. Without this guard React would render the
       // collapsed mascot inside the still-large settings window, briefly
       // showing it centred in the old (settings) frame before Rust snaps
-      // the window back — visually that looks like the mascot teleports.
+      // the window back ? visually that looks like the mascot teleports.
       setHiding(true)
       setShowPanel(false)
       setExpanded(false)
@@ -3780,7 +3804,7 @@ export default function Mini() {
         // Previously this called `syncExpandedWindowLayout`, which sized
         // the window for the expanded panel (600x350 top-center). The
         // collapsed mascot React tree then rendered flex-centered at the
-        // top of that big window — visually the mascot teleported under
+        // top of that big window ? visually the mascot teleported under
         // the notch on macOS.
         const store = await load('settings.json', { defaults: {}, autoSave: true })
         const cc = await store.get('enable_claudecode')
@@ -3840,7 +3864,7 @@ export default function Mini() {
   // Windows: an auto-expanded completion popup never takes OS focus, so the
   // window-blur close path never fires and clicking another app won't close
   // the panel. A Rust-side global mouse watcher emits `mini-outside-click`
-  // when the user clicks outside the mini window — collapse on that.
+  // when the user clicks outside the mini window ? collapse on that.
   useEffect(() => {
     if (!isWindowsPlatform) return
     if (!expanded || pinned || settingsMode || settingsTransitioning || updateModalOpen) {
@@ -3912,7 +3936,7 @@ export default function Mini() {
       // enter/exit-settings transition can momentarily steal focus from
       // the webview. Without this guard, the resulting blur tears the
       // half-built settings UI back down via `collapse()`, leaving the
-      // user staring at an empty mascot ("设置页出不来"). Skip blur while
+      // user staring at an empty mascot ("??????"). Skip blur while
       // either transition is in flight.
       if (settingsTransitioningRef.current) {
         debugToTerminal('blur', 'ignore blur: settingsTransitioning=true')
@@ -3942,7 +3966,7 @@ export default function Mini() {
     if (expanded || moveMode || updateModalOpen) return
     // Auto-expand on window focus is Windows-only. macOS opens the panel
     // through the notch-hover poll, and clicking the mascot will focus the
-    // mini window — auto-expanding here would re-introduce the popup that
+    // mini window ? auto-expanding here would re-introduce the popup that
     // we explicitly suppressed in the pointerdown handler.
     if (!isWindowsPlatform) return
     const onFocus = () => {
@@ -3964,7 +3988,7 @@ export default function Mini() {
         if (largeMascotRef.current) return
         // The mini window is always-on-top, so Windows hands it focus when any
         // other window is minimized. Only auto-expand when the cursor is
-        // actually over the mascot — i.e. a real click — not an incidental
+        // actually over the mascot ? i.e. a real click ? not an incidental
         // focus grab from minimizing another app.
         invoke('cursor_over_mini_window')
           .then((over) => {
@@ -4038,7 +4062,7 @@ export default function Mini() {
   // changes, including which claude sessions (and other inputs) are pinning
   // it. Helps pinpoint stuck-mascot bugs without opening webview DevTools.
   // We dedupe by message content because `visibleClaudeSessions` is a fresh
-  // array on every render — without dedupe this would log on every render.
+  // array on every render ? without dedupe this would log on every render.
   const lastMascotLogRef = useRef<string>('')
   useEffect(() => {
     if (!import.meta.env.DEV) return
@@ -4067,11 +4091,11 @@ export default function Mini() {
     return c?.largeActions
   }, [characters])
   const largeCharForRender = (appMode === 'pet' || appMode === 'coding')
-    ? ({ name: '香企鹅', largeActions: petBuiltinLargeActions } as CharacterMeta)
+    ? ({ name: '???', largeActions: petBuiltinLargeActions } as CharacterMeta)
     : miniChar
   // hasAnyLargeActions used to gate the legacy header toggle. Toggling is
-  // now driven from the pet picker (selecting 香企鹅 enters large-mascot
-  // mode), so the predicate itself is no longer referenced — but we keep
+  // now driven from the pet picker (selecting ??? enters large-mascot
+  // mode), so the predicate itself is no longer referenced ? but we keep
   // the computation cheap in case future logic wants to read it.
   const largeVideoBaseUrl = largeMascot
     ? appMode === 'pet'
@@ -4095,7 +4119,7 @@ export default function Mini() {
 
   useEffect(() => {
     if (!largeVideoUrl) {
-      // No video to show — reset tracking so we load fresh when a URL
+      // No video to show ? reset tracking so we load fresh when a URL
       // appears (e.g. switching back to pet mode restores the same URL).
       prevLargeVideoUrlRef.current = undefined
       return
@@ -4134,7 +4158,7 @@ export default function Mini() {
       if (cancelled) return
       activeBufferRef.current = newFront
       setActiveBuffer(newFront)
-      // Only pause the old buffer — do NOT clear its src synchronously.
+      // Only pause the old buffer ? do NOT clear its src synchronously.
       // setActiveBuffer triggers an async React render that sets visibility:hidden,
       // but removeAttribute('src') + load() would clear the frame buffer
       // *before* React hides the element, causing a blank flash.
@@ -4194,7 +4218,7 @@ export default function Mini() {
   // `hiding` gates the collapsed mascot view in JSX (along with `expanded`).
   // Without it in deps, the effect runs while refs are null (hiding=true)
   // and bails out, then never re-runs when hiding flips back to false and the
-  // <video> elements remount — leaving the mascot blank after closing a popup.
+  // <video> elements remount ? leaving the mascot blank after closing a popup.
   }, [largeVideoUrl, expanded, hiding])
 
   const inAgentDetail = selectedAgentId !== null
@@ -4202,7 +4226,7 @@ export default function Mini() {
   const inDetailPage = inAgentDetail || selectedClaudeSession !== null || selectedSessionKey !== null || showClaudeStats
   const detailPageMaxHeight = typeof window !== 'undefined' ? Math.max(240, Math.floor(((window.screen?.availHeight || 800) * 0.75) / Math.max(uiScale, 0.01))) : 600
 
-  // Panel dimensions — CSS uses fixed base sizes; on Windows high-DPI screens
+  // Panel dimensions ? CSS uses fixed base sizes; on Windows high-DPI screens
   // the panel root applies `zoom: uiScale` so all content scales uniformly.
   const panelW = viewMode === 'efficiency' ? 575 : 475
   const closedNotchWidth = 44
@@ -4341,7 +4365,7 @@ export default function Mini() {
         }
         ctx.putImageData(frame, 0, 0)
       } else if (front && front.src && front.paused) {
-        // Video has a source but isn't playing — kick-start it.
+        // Video has a source but isn't playing ? kick-start it.
         // This handles cases where play() was called while the element
         // was hidden (e.g. during settingsTransitioning display:none) and
         // WebView2 silently rejected or stalled decoding.
@@ -4356,7 +4380,7 @@ export default function Mini() {
       cancelAnimationFrame(rafId)
     }
   // `expanded` and `hiding` are included so the rAF loop restarts when the
-  // collapsed view (re)mounts — the canvas element is only in the DOM when
+  // collapsed view (re)mounts ? the canvas element is only in the DOM when
   // `!expanded && !hiding`. Missing `hiding` causes the same "mascot blank
   // after closing a popup" symptom as the video loader effect above.
   }, [useWindowsChromaKey, largeMascot, largeMascotVisualSize, activeBuffer, largeVideoUrl, expanded, hiding])
@@ -4376,7 +4400,7 @@ export default function Mini() {
         <div
           id="mini-panel"
           onMouseEnter={() => {
-            // Hover expand disabled — efficiency mode only opens on click.
+            // Hover expand disabled ? efficiency mode only opens on click.
           }}
           style={{
             width: '100%',
@@ -4420,7 +4444,7 @@ export default function Mini() {
               overflow: 'visible',
               // During peek, the mascot box is full-width but the character only
               // pokes out a thin slice at one edge. Don't paint a pointer cursor
-              // over the empty side — narrow cursor handling is delegated to the
+              // over the empty side ? narrow cursor handling is delegated to the
               // peek overlay below.
               cursor: moveMode
                 ? 'grab'
@@ -4684,7 +4708,7 @@ export default function Mini() {
               />
             )}
 
-            {/* Food rain effect — rendered outside context menu so it persists after menu closes */}
+            {/* Food rain effect ? rendered outside context menu so it persists after menu closes */}
             {foodRainDrops.length > 0 && (
               <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none', overflow: 'hidden', zIndex: 9999 }}>
                 <AnimatePresence>
@@ -4778,7 +4802,7 @@ export default function Mini() {
             />
           )}
 
-          {/* Top Control Bar — outside the transform wrapper so sticky works correctly */}
+          {/* Top Control Bar ? outside the transform wrapper so sticky works correctly */}
           <div
             className="flex items-center justify-between px-4 py-2.5 shrink-0 sticky top-0 z-20 bg-black text-white"
             style={{
@@ -5058,7 +5082,7 @@ export default function Mini() {
                                         {(() => {
                                           const rowPet = getQueuePet(index)
                                           return rowPet ? (
-                                            <SpritePet pet={rowPet} state={ocSpriteState} size={Math.round(40 * SESSION_SPRITE_DISPLAY_MULTIPLIER)} />
+                                            <SessionPetIcon pet={rowPet} state={ocSpriteState} size={Math.round(40 * SESSION_SPRITE_DISPLAY_MULTIPLIER)} />
                                           ) : (
                                             <span className="text-white/40 text-lg">{agent?.identityEmoji || '?'}</span>
                                           )
@@ -5137,8 +5161,8 @@ export default function Mini() {
                                           {sessionNicknames[`oc:${s.agentId}:${s.key}`] || title}
                                         </span>
                                       )}
-                                      {subtitle && <span className="min-w-0 max-w-[25%] truncate text-[13px] font-normal text-slate-500">· {subtitle}</span>}
-                                      {s.lastAssistantMsg && <span className="min-w-0 max-w-[30%] truncate text-[11px] text-white/40">· {s.lastAssistantMsg}</span>}
+                                      {subtitle && <span className="min-w-0 max-w-[25%] truncate text-[13px] font-normal text-slate-500">? {subtitle}</span>}
+                                      {s.lastAssistantMsg && <span className="min-w-0 max-w-[30%] truncate text-[11px] text-white/40">? {s.lastAssistantMsg}</span>}
                                     </div>
                                     <div className="flex items-center gap-2 shrink-0 ml-auto">
                                       {s.channel && <span className="text-[11px] px-2 py-0.5 rounded-md font-normal bg-[#27272a] text-slate-300 whitespace-nowrap">{formatChannelLabel(s.channel)}</span>}
@@ -5256,9 +5280,9 @@ export default function Mini() {
                                           {(() => {
                                             const rowPet = getQueuePet(index)
                                             return rowPet ? (
-                                              <SpritePet pet={rowPet} state={claudeSpriteState} size={Math.round(40 * SESSION_SPRITE_DISPLAY_MULTIPLIER)} />
+                                              <SessionPetIcon pet={rowPet} state={claudeSpriteState} size={Math.round(40 * SESSION_SPRITE_DISPLAY_MULTIPLIER)} />
                                             ) : (
-                                              <span className="text-white/40 text-lg">🤖</span>
+                                              <span className="text-white/40 text-lg">??</span>
                                             )
                                           })()}
                                           <div
@@ -5339,8 +5363,8 @@ export default function Mini() {
                                             {projectName}
                                           </span>
                                         )}
-                                        {subtitle && <span className="min-w-0 max-w-[25%] truncate text-[13px] font-normal text-slate-500">· {subtitle}</span>}
-                                        {cs.lastResponse && <span className="min-w-0 max-w-[30%] truncate text-[11px] text-white/40">· {cs.lastResponse}</span>}
+                                        {subtitle && <span className="min-w-0 max-w-[25%] truncate text-[13px] font-normal text-slate-500">? {subtitle}</span>}
+                                        {cs.lastResponse && <span className="min-w-0 max-w-[30%] truncate text-[11px] text-white/40">? {cs.lastResponse}</span>}
                                       </div>
                                       <div className="flex items-center gap-2 shrink-0 ml-auto">
                                         <span className={`text-[11px] px-2 py-0.5 rounded-md font-normal whitespace-nowrap ${sourceBadgeClass}`}>{sourceLabel}</span>
@@ -5364,18 +5388,18 @@ export default function Mini() {
                                         </div>
                                       </div>
                                     </div>
-                                    {/* ── 提醒弹窗 (Reminder Popup) ──
-                                       在效率模式下，当 CC session 需要用户批准
-                                       (PermissionRequest → isWaiting) 且该 session
-                                       对应的终端 tab 不在当前激活状态时，自动弹出
-                                       此面板。包含四个操作按钮：拒绝、允许一次、
-                                       全部允许、自动批准。
-                                       用途：让用户无需切换到终端即可快速处理权限请求。 */}
+                                    {/* ?? ???? (Reminder Popup) ??
+                                       ???????? CC session ??????
+                                       (PermissionRequest ? isWaiting) ?? session
+                                       ????? tab ??????????????
+                                       ?????????????????????
+                                       ??????????
+                                       ???????????????????????? */}
                                     {isWaiting && cs.source !== 'cursor' && !dismissedWaitingIds.has(cs.sessionId) && (
                                       <div className="mt-2 flex flex-col" style={{ maxHeight: panelMaxHeight - 140 }}>
                                         {cs.tool && (
                                           <div className="flex items-center gap-1.5 mb-2">
-                                            <span className="text-amber-400 text-[12px]">⚠</span>
+                                            <span className="text-amber-400 text-[12px]">?</span>
                                             <span className="text-amber-400 text-[12px] font-bold">{cs.tool}</span>
                                           </div>
                                         )}
@@ -5395,7 +5419,7 @@ export default function Mini() {
                                                     {fileName && (
                                                       <div className="flex items-center gap-2 px-3 py-1.5 border-b border-[#2a2a2e] sticky top-0 bg-[#1a1a1e] z-10">
                                                         <span className="text-[12px] text-slate-300 font-mono">{fileName}</span>
-                                                        {isNew && <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-900/50 text-emerald-400">{t('mini.newFile', '新文件')}</span>}
+                                                        {isNew && <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-900/50 text-emerald-400">{t('mini.newFile', '???')}</span>}
                                                       </div>
                                                     )}
                                                     <div className="px-3 py-2 overflow-y-auto scrollbar-thin" style={{ maxHeight: 120 }}>
@@ -5477,10 +5501,10 @@ export default function Mini() {
                                               const jumpLabel = cs.source === 'hermes'
                                                 ? (hermesPlatLabel ? t('mini.viewInHermes', 'Go to Hermes').replace('Hermes', hermesPlatLabel) : t('mini.viewInHermes', 'Go to Hermes'))
                                                 : cs.source === 'gemini'
-                                                ? t('mini.viewInGemini', '前往 Gemini')
+                                                ? t('mini.viewInGemini', '?? Gemini')
                                                 : cs.source === 'opencode'
-                                                ? t('mini.viewInOpencode', '前往 opencode')
-                                                : t('mini.viewInCodex', '前往 Codex')
+                                                ? t('mini.viewInOpencode', '?? opencode')
+                                                : t('mini.viewInCodex', '?? Codex')
                                               return (
                                                 <>
                                                   <button
@@ -5526,7 +5550,7 @@ export default function Mini() {
                                                     }}
                                                     className="flex-1 py-1.5 rounded-md text-[12px] font-normal bg-[#27272a] text-slate-300 hover:bg-[#303033] transition-colors"
                                                   >
-                                                    {t('mini.later', '稍后处理')}
+                                                    {t('mini.later', '????')}
                                                   </button>
                                                 </>
                                               )
@@ -5542,7 +5566,7 @@ export default function Mini() {
                                                   }}
                                                   className="flex-1 py-1.5 rounded-md text-[12px] font-normal bg-[#27272a] text-slate-300 hover:bg-[#303033] transition-colors"
                                                 >
-                                                  {t('mini.deny', '拒绝')}
+                                                  {t('mini.deny', '??')}
                                                 </button>
                                                 <button
                                                   data-no-drag
@@ -5552,7 +5576,7 @@ export default function Mini() {
                                                   }}
                                                   className="flex-1 py-1.5 rounded-md text-[12px] font-normal bg-[#27272a] text-slate-300 hover:bg-[#303033] transition-colors"
                                                 >
-                                                  {t('mini.allowOnce', '允许一次')}
+                                                  {t('mini.allowOnce', '????')}
                                                 </button>
                                                 <button
                                                   data-no-drag
@@ -5562,7 +5586,7 @@ export default function Mini() {
                                                   }}
                                                   className="flex-1 py-1.5 rounded-md text-[12px] font-normal bg-emerald-900/50 text-emerald-300 hover:bg-emerald-800/50 transition-colors"
                                                 >
-                                                  {t('mini.allowAll', '全部允许')}
+                                                  {t('mini.allowAll', '????')}
                                                 </button>
                                                 <button
                                                   data-no-drag
@@ -5572,7 +5596,7 @@ export default function Mini() {
                                                   }}
                                                   className="flex-1 py-1.5 rounded-md text-[12px] font-normal bg-rose-900/50 text-rose-300 hover:bg-rose-800/50 transition-colors"
                                                 >
-                                                  {t('mini.autoApprove', '自动批准')}
+                                                  {t('mini.autoApprove', '????')}
                                                 </button>
                                               </>
                                             )
@@ -5580,10 +5604,10 @@ export default function Mini() {
                                         </div>
                                       </div>
                                     )}
-                                    {/* ── 完成提醒弹窗 (Completion Reminder) ──
-                                       任务完成且终端未激活时，显示用户问题和 AI 回复预览，
-                                       点击跳转到对应终端。
-                                       只有刚完成的 session 才展开弹窗，其余已完成的只显示标题行。 */}
+                                    {/* ?? ?????? (Completion Reminder) ??
+                                       ??????????????????? AI ?????
+                                       ??????????
+                                       ?????? session ??????????????????? */}
                                     {!isWaiting && !isWorking && cs.lastResponse && completionSessionId === cs.sessionId && (
                                       <div data-no-drag className="mt-2 rounded-lg bg-[#1a1a1e] border border-[#2a2a2e] overflow-hidden">
                                         <div
@@ -5601,7 +5625,7 @@ export default function Mini() {
                                             } else if (!(isWindowsPlatform && cs.source === 'gemini')) {
                                               // Gemini on Windows runs in a terminal whose window can't be
                                               // reliably targeted from the detached process tree, so don't
-                                              // attempt to jump — just dismiss the popup.
+                                              // attempt to jump ? just dismiss the popup.
                                               invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
                                             }
                                             collapseFnRef.current?.()
@@ -5610,17 +5634,17 @@ export default function Mini() {
                                           <span className="text-[12px] text-slate-300 truncate">
                                             {cs.userPrompt ? (
                                               <>
-                                                <span className="text-slate-500">{t('mini.you', '你')}：</span>
+                                                <span className="text-slate-500">{t('mini.you', '?')}?</span>
                                                 {cs.userPrompt}
                                               </>
                                             ) : (
                                               <span className="text-slate-500">{t('mini.taskCompleted', 'Task completed')}</span>
                                             )}
                                           </span>
-                                          <span className="text-[11px] px-1.5 py-0.5 rounded bg-emerald-900/50 text-emerald-400 shrink-0 ml-2">{t('mini.done', '完成')}</span>
+                                          <span className="text-[11px] px-1.5 py-0.5 rounded bg-emerald-900/50 text-emerald-400 shrink-0 ml-2">{t('mini.done', '??')}</span>
                                         </div>
                                         <div className="px-3 py-2 max-h-[160px] overflow-y-auto scrollbar-thin text-[12px] text-slate-400 leading-[1.6] markdown-content">
-                                          {(cs.source === 'cursor' || cs.source === 'codex' || cs.source === 'gemini' || cs.source === 'opencode') && cs.lastResponse === '✓' ? (
+                                          {(cs.source === 'cursor' || cs.source === 'codex' || cs.source === 'gemini' || cs.source === 'opencode') && cs.lastResponse === '?' ? (
                                             <p>
                                               {cs.source === 'codex'
                                                 ? t('mini.codeDone', 'Code has finished working. Click to view.')
@@ -5684,7 +5708,7 @@ export default function Mini() {
                           onClick={() => invoke('open_url', { url: 'https://github.com/rainnoon/oc-claw' })}
                           className="text-[8px] font-bold tracking-[0.2em] text-slate-500 uppercase cursor-pointer"
                         >
-                          oc–claw
+                          oc?claw
                         </span>
                       </div>
                     </div>
@@ -5775,7 +5799,7 @@ export default function Mini() {
                           }}
                         >
                           {miniPet ? (
-                            <SpritePet
+                            <SessionPetIcon
                               pet={miniPet}
                               state="idle"
                               size={Math.round(68 * SESSION_SPRITE_DISPLAY_MULTIPLIER)}
@@ -5844,7 +5868,7 @@ export default function Mini() {
                                 {(() => {
                                   const rowPet = getQueuePet(sortedIdx)
                                   return rowPet ? (
-                                    <SpritePet pet={rowPet} state={slotSpriteState} size={Math.round(56 * SESSION_SPRITE_DISPLAY_MULTIPLIER)} />
+                                    <SessionPetIcon pet={rowPet} state={slotSpriteState} size={Math.round(56 * SESSION_SPRITE_DISPLAY_MULTIPLIER)} />
                                   ) : null
                                 })()}
                                 {!miniPet && petQueueResolved.length === 0 && (
@@ -5976,11 +6000,11 @@ export default function Mini() {
                                 const isActive = item.active
                                 const isWaiting = cs.status === 'waiting'
                                 const statusText = cs.tool
-                                  ? `🔧 ${cs.tool}`
+                                  ? `?? ${cs.tool}`
                                   : cs.status === 'stopped'
                                     ? t('mini.idle')
                                     : cs.status === 'waiting'
-                                      ? '⏳ ' + t('mini.waiting')
+                                      ? '? ' + t('mini.waiting')
                                       : cs.status === 'processing'
                                         ? t('mini.thinking')
                                         : cs.status === 'tool_running'
@@ -6045,7 +6069,7 @@ export default function Mini() {
                           onClick={() => invoke('open_url', { url: 'https://github.com/rainnoon/oc-claw' })}
                           className="text-[10px] font-black tracking-[0.25em] text-slate-500 uppercase cursor-pointer hover:text-slate-300 transition-colors"
                         >
-                          oc–claw.ai
+                          oc?claw.ai
                         </span>
                       </div>
                     </div>
@@ -6274,7 +6298,7 @@ export default function Mini() {
                     <div className="h-full overflow-y-auto bg-[#151515] pt-6 px-6 pb-10 scrollbar-hidden">
                       <div className="max-w-3xl mx-auto">
                         <p className="text-sm text-white/50 mb-6">
-                          选择小看板娘要使用的 codex 像素宠物。大看板娘（香企鹅）由顶部按钮切换。
+                          ?????????? codex ??????????????????????
                         </p>
                         <PetPicker
                           selectedId={largeMascot ? '__xiang-qi-e__' : (miniPet?.id ?? null)}
@@ -6292,9 +6316,9 @@ export default function Mini() {
                           specialPets={[
                             {
                               id: '__xiang-qi-e__',
-                              displayName: '香企鹅',
-                              description: '特殊的存在',
-                              avatar: <span style={{ fontSize: 24, lineHeight: 1 }}>🐧</span>,
+                              displayName: '???',
+                              description: '?????',
+                              avatar: <span style={{ fontSize: 24, lineHeight: 1 }}>??</span>,
                             },
                           ]}
                           onSelectSpecial={async (pet) => {
@@ -6510,7 +6534,7 @@ export default function Mini() {
                       e.currentTarget.style.letterSpacing = '0px'
                     }}
                   >
-                    {t('mini.starPrompt')} <span style={{ fontSize: 13, lineHeight: 1 }}>⭐</span> {t('mini.starPromptSuffix')}
+                    {t('mini.starPrompt')} <span style={{ fontSize: 13, lineHeight: 1 }}>?</span> {t('mini.starPromptSuffix')}
                   </span>
                 </div>
               </div>
@@ -6541,7 +6565,7 @@ export default function Mini() {
         }}
       />
 
-      {/* Onboarding modal — first launch only */}
+      {/* Onboarding modal ? first launch only */}
       <OnboardingModal open={showOnboarding} onSelect={handleSelectAppMode} />
 
       {/* Pet context menu rendered inside mascot wrapper below */}

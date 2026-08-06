@@ -1,0 +1,22 @@
+Live2D Sample Models Notice
+===========================
+
+This directory includes Live2D Cubism sample models redistributed for learning
+and SDK integration testing:
+
+- Haru Greeter (from pixi-live2d-display test assets / Live2D samples)
+- Mao (from Open-LLM-VTuber live2d-models / Live2D samples)
+
+These assets are owned by Live2D Inc. and are NOT covered by this project's
+MIT (or other) license. Use is subject to:
+
+- Live2D Free Material License Agreement
+  https://www.live2d.com/eula/live2d-free-material-license-agreement_en.html
+- Terms of Use for Live2D Cubism Sample Data
+  https://www.live2d.com/eula/live2d-sample-model-terms_en.html
+
+Cubism Core Web (`/vendor/live2dcubismcore.min.js`) is subject to the
+Live2D Cubism SDK License Agreement.
+
+For commercial use by medium/large enterprises, obtain appropriate rights
+from Live2D Inc. or replace these samples with models you own.

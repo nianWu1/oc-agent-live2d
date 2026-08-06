@@ -1,0 +1,14 @@
+{
+  "id": "live2d-haru",
+  "displayName": "Haru (Live2D)",
+  "description": "Live2D Cubism sample model (Haru Greeter). Free Material License by Live2D Inc.",
+  "kind": "live2d",
+  "modelPath": "haru_greeter_t03.model3.json",
+  "previewPath": "haru_greeter_t03.2048/texture_00.png",
+  "motionGroups": {
+    "idle": "Idle",
+    "working": "Tap",
+    "waiting": "Idle",
+    "jumping": "Tap"
+  }
+}

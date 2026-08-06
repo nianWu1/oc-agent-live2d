@@ -8,4 +8,7 @@ export default defineConfig({
   server: {
     port: 5222,
   },
+  optimizeDeps: {
+    include: ['pixi.js', 'pixi-live2d-display/cubism4'],
+  },
 })

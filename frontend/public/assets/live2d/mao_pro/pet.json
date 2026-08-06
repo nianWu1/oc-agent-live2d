@@ -1,0 +1,14 @@
+{
+  "id": "live2d-mao",
+  "displayName": "Mao (Live2D)",
+  "description": "Live2D Cubism sample model (Mao). Free Material License by Live2D Inc.",
+  "kind": "live2d",
+  "modelPath": "runtime/mao_pro.model3.json",
+  "previewPath": "runtime/mao_pro.4096/texture_00.png",
+  "motionGroups": {
+    "idle": "Idle",
+    "working": "",
+    "waiting": "Idle",
+    "jumping": ""
+  }
+}

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { SpritePet } from './SpritePet'
-import { ANIMATION_ROWS, fpsFor } from '../lib/codexPet'
+import { PetAvatar } from './PetAvatar'
+import { ANIMATION_ROWS, fpsFor, isLive2DPet } from '../lib/codexPet'
 import type { CodexPet, CodexPetState } from '../lib/codexPet'
 
 interface MiniPetMascotProps {
@@ -115,6 +115,14 @@ export function MiniPetMascot({
   }, [showJump, jumpKey, handleJumpEnd])
 
   const renderState: CodexPetState = showJump ? 'jumping' : baseState
+  // Live2D remounts are expensive (Pixi + model reload); keep a stable key
+  // and let Live2DPet swap motions in place. Sprite pets keep the old
+  // remount-on-jump behavior for clean one-shot replays.
+  const avatarKey = isLive2DPet(pet)
+    ? `live2d-${pet.id}`
+    : showJump
+      ? `jump-${jumpKey}`
+      : `base-${renderState}`
 
   return (
     <div
@@ -123,8 +131,8 @@ export function MiniPetMascot({
       onMouseLeave={enableHoverJump && !useExternalHover ? onLeave : undefined}
       style={{ display: 'inline-block', lineHeight: 0, ...style }}
     >
-      <SpritePet
-        key={showJump ? `jump-${jumpKey}` : `base-${renderState}`}
+      <PetAvatar
+        key={avatarKey}
         pet={pet}
         state={renderState}
         size={size}
