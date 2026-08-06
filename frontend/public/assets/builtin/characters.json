@@ -1,0 +1,16 @@
+{
+  "defaults": {
+    "mini_character": "香企鹅",
+    "claude_char": "香企鹅",
+    "char_queue": ["香企鹅"]
+  },
+  "descriptions": {
+    "香企鹅": "特殊的存在"
+  },
+  "ips": [
+    {
+      "name": "其他",
+      "characters": ["香企鹅"]
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "platforms": {
+    "macos": {
+      "version": "1.8.6",
+      "url": "https://github.com/rainnoon/oc-claw/releases/download/v1.8.6/oc-claw_1.8.6_aarch64.dmg",
+      "notes_i18n": {
+        "zh": "新增 opencode 集成与 Windows 端 Codex 支持；多看板娘模式；多项稳定性修复",
+        "en": "opencode integration and Codex on Windows; multi-mascot mode; various stability fixes",
+        "ja": "opencode 統合と Windows での Codex 対応、マルチマスコットモード、各種安定性の修正",
+        "ko": "opencode 통합 및 Windows Codex 지원, 멀티 마스코트 모드, 다양한 안정성 수정",
+        "es": "Integración de opencode y Codex en Windows; modo multi-mascota; varias correcciones de estabilidad",
+        "fr": "Intégration d'opencode et Codex sur Windows ; mode multi-mascotte ; diverses corrections de stabilité"
+      }
+    },
+    "windows": {
+      "version": "1.8.6",
+      "url": "https://github.com/rainnoon/oc-claw/releases/download/v1.8.6/oc-claw_1.8.6_x64-setup.exe",
+      "notes_i18n": {
+        "zh": "新增 opencode 集成与 Windows 端 Codex 支持；多看板娘模式；多项稳定性修复",
+        "en": "opencode integration and Codex on Windows; multi-mascot mode; various stability fixes",
+        "ja": "opencode 統合と Windows での Codex 対応、マルチマスコットモード、各種安定性の修正",
+        "ko": "opencode 통합 및 Windows Codex 지원, 멀티 마스코트 모드, 다양한 안정성 수정",
+        "es": "Integración de opencode y Codex en Windows; modo multi-mascota; varias correcciones de estabilidad",
+        "fr": "Intégration d'opencode et Codex sur Windows ; mode multi-mascotte ; diverses corrections de stabilité"
+      }
+    }
+  },
+  "ui": {
+    "petdex": {
+      "url": "https://codexpet.xyz/"
+    }
+  }
+}

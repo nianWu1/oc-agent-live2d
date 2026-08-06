@@ -1,0 +1,27 @@
+---
+import { type Lang } from '../i18n/index';
+
+interface Props {
+  lang?: Lang;
+}
+
+const { lang = 'en' } = Astro.props;
+---
+
+<nav>
+  <a href={`/${lang}/`} class="logo">
+    <img src="/app-icon.png" alt="OC-Claw" class="logo-icon" />
+    <span class="logo-label">OC-Claw</span>
+  </a>
+  <div class="nav-right">
+    <a href="https://github.com/rainnoon/oc-claw" class="nav-link">GitHub</a>
+  </div>
+</nav>
+
+<style>
+  .nav-right {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+  }
+</style>

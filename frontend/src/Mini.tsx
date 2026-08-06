@@ -1,0 +1,6550 @@
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
+import { invoke } from '@tauri-apps/api/core'
+import { load } from '@tauri-apps/plugin-store'
+import { emit, listen } from '@tauri-apps/api/event'
+import { ChevronDown, Loader2, X, Pin, Bell, BellOff, Settings, Asterisk, Trash2, Cloud, Maximize2 } from 'lucide-react'
+import { AnimatePresence, motion } from 'motion/react'
+import ReactMarkdown from 'react-markdown'
+import { useTranslation } from 'react-i18next'
+import { SettingsTab } from './components/SettingsTab'
+import { UpdateModal, type UpdateModalInfo, type UpdateModalPhase } from './components/UpdateModal'
+import { AgentDetailView } from './components/AgentDetailView'
+import { CreateCharacterModal } from './components/CreateCharacterModal'
+import { ClaudeStatsView } from './components/ClaudeStatsView'
+import { getStore, DEFAULT_CHAR, DEFAULT_CHAR_NAME, loadCharacters, loadOcConnections, saveOcConnections } from './lib/store'
+import type { AgentMetrics, OcConnection } from './lib/types'
+import { OnboardingModal } from './components/OnboardingModal'
+import { PetContextMenu, PomodoroOverlay } from './components/PetContextMenu'
+import {
+  type AppMode, type PetData, type PetAction, type PomodoroState,
+  loadAppMode, saveAppMode, loadPetData, savePetData, tickPetData,
+  loadAppModeVersion, saveAppModeVersion, isAppModeOnboardingStale,
+  APP_MODE_ONBOARDING_VERSION,
+  defaultPetData, getAffectionTier, canWalk,
+  POMODORO_COINS_PER_MIN, AFFECTION_ACTIVITY_PER_10MIN, AFFECTION_MAX,
+  HUNGER_ACTIVITY_PER_HOUR, HUNGER_OFFLINE_FLOOR,
+  applyHeadpat,
+  loadMiniPetId,
+  saveMiniPetId,
+  loadExtraMascots,
+  loadMultiMascotMode,
+} from './lib/petStore'
+import {
+  DEFAULT_PET_QUEUE_IDS,
+  loadCodexPetById, loadDefaultCodexPet,
+  petStateToCodexState,
+  type CodexPet, type CodexPetState,
+} from './lib/codexPet'
+import { MiniPetMascot } from './components/MiniPetMascot'
+import { SpritePet } from './components/SpritePet'
+import { PetPicker } from './components/PetPicker'
+
+interface CharacterMeta {
+  name: string
+  builtin?: boolean
+  ip?: string
+  workGifs: string[]
+  restGifs: string[]
+  miniActions?: Record<string, string[]>
+  largeActions?: Record<string, string>
+  audioMap?: Record<string, string>
+}
+
+interface AgentInfo {
+  id: string
+  identityName?: string
+  identityEmoji?: string
+}
+
+interface SessionHealthInfo {
+  key: string
+  active: boolean
+}
+
+interface AgentHealth {
+  agentId: string
+  active: boolean
+  sessions?: SessionHealthInfo[]
+}
+
+interface MiniSessionInfo {
+  key: string
+  agentId: string
+  sessionId: string
+  label: string
+  channel?: string
+  updatedAt: number
+  active: boolean
+  lastUserMsg?: string
+  lastAssistantMsg?: string
+  sessionFile?: string
+}
+
+interface SessionPreview {
+  active: boolean
+  lastUserMsg?: string
+  lastAssistantMsg?: string
+}
+
+interface SessionSlot {
+  agentId: string
+  sessionIdx: number
+  agent: AgentInfo
+  char?: CharacterMeta
+  isWorking: boolean
+  petState?: PetState
+}
+
+interface UpdateProgressPayload {
+  stage: string
+  progress?: number | null
+  downloadedBytes?: number
+  totalBytes?: number | null
+  message?: string
+}
+
+const MAX_SLOTS = 10
+const MASCOT_SCALE_MIN = 1
+const MASCOT_SCALE_MAX = 3
+const MASCOT_BASE_SIZE = 43
+// Codex sprite-pets render very small at the legacy mascot size (192x208
+// cells scaled down to ~43px). These multipliers blow them up only at the
+// rendering layer, leaving the underlying window/hitbox math untouched so
+// large-mode video sizing keeps working.
+const SESSION_SPRITE_DISPLAY_MULTIPLIER = 0.88
+
+type PetState = 'idle' | 'working' | 'compacting' | 'waiting'
+type ClaudeStatsSource = 'cc' | 'codex' | 'cursor' | 'gemini' | 'hermes' | 'opencode'
+const TRANSIENT_PET_ACTIONS: PetAction[] = ['eat', 'headpat', 'dance', 'farewell', 'angry', 'spin', 'milktea', 'walkout']
+
+// Priority: higher number = harder to interrupt
+function petActionPriority(action: PetAction): number {
+  switch (action) {
+    case 'grasp': return 100
+    case 'study': case 'work': return 90
+    case 'peek': case 'walkout': return 75
+    case 'hungry': return 70
+    case 'watch': return 50
+    case 'music': return 40
+    default: return 0
+  }
+}
+// Hitbox ratio for large mascot interactions.
+// Keep in sync with Rust `pet_passthrough_poll` so cursor shape and click
+// interactivity don't disagree at the mascot edge.
+const LARGE_MASCOT_HITBOX_WIDTH_MULTIPLIER = 2.4
+const LARGE_MASCOT_HITBOX_HEIGHT_MULTIPLIER = 2.8
+const LARGE_MASCOT_SCALE_MIN = 1
+const LARGE_MASCOT_SCALE_MAX = 6
+const MASCOT_RESIZE_HANDLE_SIZE = 34
+const MASCOT_RESIZE_ICON_SIZE = 26
+const MASCOT_RESIZE_CURSOR = 'nwse-resize'
+// Peek hit-area width as a fraction of the mascot visual size. Shared by the
+// click hitbox check and the visual cursor strip so they always agree.
+const PEEK_HIT_WIDTH_RATIO = 0.5
+const MOVE_DRAG_THRESHOLD = 1
+
+function clampMascotScale(value: number): number {
+  if (!Number.isFinite(value)) return 1
+  return Math.min(MASCOT_SCALE_MAX, Math.max(MASCOT_SCALE_MIN, value))
+}
+
+function clampLargeMascotScale(value: number): number {
+  if (!Number.isFinite(value)) return 5
+  return Math.min(LARGE_MASCOT_SCALE_MAX, Math.max(LARGE_MASCOT_SCALE_MIN, value))
+}
+
+function ChatList({ messages, accentColor }: { messages: { role: string; text: string }[]; accentColor: string }) {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const [expandedSet, setExpandedSet] = useState<Set<number>>(new Set())
+
+  useEffect(() => {
+    const el = containerRef.current
+    if (el)
+      requestAnimationFrame(() => {
+        el.scrollTop = el.scrollHeight
+      })
+  }, [messages.length])
+
+  const toggle = (i: number) =>
+    setExpandedSet((prev) => {
+      const s = new Set(prev)
+      if (s.has(i)) s.delete(i)
+      else s.add(i)
+      return s
+    })
+
+  return (
+    <div ref={containerRef} className="scrollbar-thin selectable-text" style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '12px 14px' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {messages.map((msg, i) => (
+          <div key={i}>
+            {msg.role === 'user'
+              ? (() => {
+                  const limit = 300
+                  const truncated = !expandedSet.has(i) && msg.text.length > limit
+                  return (
+                    <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                      <div
+                        style={{
+                          background: accentColor,
+                          borderRadius: 18,
+                          padding: '8px 14px',
+                          maxWidth: '80%',
+                          color: '#fff',
+                          fontSize: 13,
+                          lineHeight: 1.5,
+                          wordBreak: 'break-word',
+                          whiteSpace: 'pre-wrap',
+                        }}
+                      >
+                        {truncated ? msg.text.slice(0, limit) + '...' : msg.text}
+                        {(truncated || (expandedSet.has(i) && msg.text.length > limit)) && (
+                          <button
+                            onClick={() => toggle(i)}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              gap: 2,
+                              width: '100%',
+                              marginTop: 4,
+                              padding: '2px 0',
+                              background: 'none',
+                              border: 'none',
+                              color: 'rgba(255,255,255,0.5)',
+                              fontSize: 11,
+                              cursor: 'pointer',
+                            }}
+                          >
+                            <ChevronDown style={{ width: 12, height: 12, transition: 'transform 0.2s', transform: expandedSet.has(i) ? 'rotate(180deg)' : 'none' }} />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })()
+              : (() => {
+                  const limit = 500
+                  const truncated = !expandedSet.has(i) && msg.text.length > limit
+                  return (
+                    <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+                      <div style={{ width: 5, height: 5, borderRadius: '50%', background: accentColor, marginTop: 6, flexShrink: 0 }} />
+                      <div
+                        className="markdown-content"
+                        style={{
+                          color: '#ddd',
+                          fontSize: 13,
+                          lineHeight: 1.5,
+                          wordBreak: 'break-word',
+                          maxWidth: '90%',
+                        }}
+                      >
+                        <ReactMarkdown>{truncated ? msg.text.slice(0, limit) + '...' : msg.text}</ReactMarkdown>
+                        {(truncated || (expandedSet.has(i) && msg.text.length > limit)) && (
+                          <button
+                            onClick={() => toggle(i)}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              gap: 2,
+                              width: '100%',
+                              marginTop: 2,
+                              padding: '2px 0',
+                              background: 'none',
+                              border: 'none',
+                              color: 'rgba(255,255,255,0.3)',
+                              fontSize: 11,
+                              cursor: 'pointer',
+                            }}
+                          >
+                            <ChevronDown style={{ width: 12, height: 12, transition: 'transform 0.2s', transform: expandedSet.has(i) ? 'rotate(180deg)' : 'none' }} />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })()}
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+
+type LargePetAction = 'work' | 'rest' | 'question' | 'grasp' | 'spin' | 'angry'
+
+// Pet mode action → largeActions video key mapping
+const PET_ACTION_VIDEO_MAP: Record<PetAction, string> = {
+  idle: 'idle',
+  sleep: 'rest',
+  work: 'work',
+  study: 'study',
+  watch: 'watch',
+  music: 'music',
+  walk: 'walk',
+  dance: 'dance',
+  eat: 'eat',
+  hungry: 'hungry',
+  headpat: 'headpat',
+  farewell: 'farewell',
+  grasp: 'grasp',
+  angry: 'angry',
+  spin: 'spin',
+  milktea: 'milktea',
+  rest: 'rest',
+  peek: 'peek',
+  walkout: 'walkout',
+}
+
+function getLargeVideoPetMode(char: CharacterMeta | undefined, petAction: PetAction, fallbackLargeActions?: Record<string, string>): string | undefined {
+  const la = char?.largeActions && Object.keys(char.largeActions).length > 0
+    ? char.largeActions
+    : fallbackLargeActions
+  if (!la || Object.keys(la).length === 0) return undefined
+  const key = PET_ACTION_VIDEO_MAP[petAction] || 'idle'
+  return la[key] || la['idle'] || la['rest'] || Object.values(la)[0]
+}
+
+function getLargeVideo(char: CharacterMeta | undefined, petState: PetState, overrideAction: string | null, fallbackLargeActions?: Record<string, string>): string | undefined {
+  const la = char?.largeActions && Object.keys(char.largeActions).length > 0
+    ? char.largeActions
+    : fallbackLargeActions
+  if (!la || Object.keys(la).length === 0) return undefined
+  if (overrideAction && la[overrideAction]) return la[overrideAction]
+  if (petState === 'waiting' && la['question']) return la['question']
+  if (petState === 'working' || petState === 'compacting') return la['work'] || la['rest']
+  return la['rest'] || la['work']
+}
+
+function getAlternateLargeVideoUrl(url: string): string | undefined {
+  if (url.includes('/large/webm/') && url.endsWith('.webm')) {
+    return url.replace('/large/webm/', '/large/mov/').replace(/\.webm$/, '.mov')
+  }
+  if (url.includes('/large/mov/') && url.endsWith('.mov')) {
+    return url.replace('/large/mov/', '/large/webm/').replace(/\.mov$/, '.webm')
+  }
+  return undefined
+}
+
+
+type OcParams = { mode?: string; url?: string; token?: string; sshHost?: string; sshUser?: string }
+
+// Returns null for incomplete remote connections (missing host/user)
+// so callers can skip them instead of accidentally treating them as local.
+function connToOcParams(conn: OcConnection): OcParams | null {
+  if (conn.type === 'remote') {
+    if (conn.host && conn.user) return { mode: 'remote', sshHost: conn.host, sshUser: conn.user }
+    return null // incomplete remote — skip
+  }
+  return {} // local
+}
+
+export default function Mini() {
+  const [expanded, setExpanded] = useState(false)
+  const [showPanel, setShowPanel] = useState(false)
+  // External hover signal for the codex sprite, driven by a Rust cursor
+  // poll. macOS does not deliver mouseenter to non-key floating windows,
+  // so the webview-level hover would otherwise stay false until the user
+  // first clicks. The Rust side emits `mini-mascot-hover` whenever the
+  // cursor enters/leaves the collapsed mascot's window rect.
+  const [mascotHover, setMascotHover] = useState(false)
+  const [agents, setAgents] = useState<AgentInfo[]>([])
+  const [hasConfiguredOpenClaw, setHasConfiguredOpenClaw] = useState(false)
+  const [healthMap, setHealthMap] = useState<Record<string, boolean>>({})
+  const [characters, setCharacters] = useState<CharacterMeta[]>([])
+  const [agentCharMap, setAgentCharMap] = useState<Record<string, string>>({})
+  const [miniChar, setMiniChar] = useState<CharacterMeta | null>(null)
+  // ─── Codex sprite pet (mini mode) ───
+  // miniPet is the user-selected codex pet rendered in every mini slot.
+  // walkDir captures locomotion direction (-1 left, 1 right, 0 stationary)
+  // for the main mascot's sprite state override while the native window
+  // is being moved by the walk timer.
+  const [miniPet, setMiniPet] = useState<CodexPet | null>(null)
+  const [walkDir, setWalkDir] = useState<-1 | 0 | 1>(0)
+  const walkDirRef = useRef<-1 | 0 | 1>(0)
+  const updateWalkDir = useCallback((dir: -1 | 0 | 1) => {
+    if (walkDirRef.current !== dir) {
+      walkDirRef.current = dir
+      setWalkDir(dir)
+    }
+  }, [])
+
+  const [allSessions, setAllSessions] = useState<MiniSessionInfo[]>([])
+  const [anySessionActive, setAnySessionActive] = useState(false)
+  const [refreshingAgents, setRefreshingAgents] = useState(false)
+  // Snapshot of connection config to detect changes across settings edits
+  const lastConnSnapshotRef = useRef<string>('')
+  const refreshTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const dismissedSessionsRef = useRef<Map<string, number>>(new Map())
+  // Stable Hermes title numbering: map each hermes sessionId to a sequence
+  // number assigned on first sight, so a session keeps the same `#N` even as
+  // the list re-sorts by active/updatedAt across 2s polls.
+  const hermesSeqMapRef = useRef<Map<string, number>>(new Map())
+  const hermesSeqNextRef = useRef(1)
+  const getHermesSeq = useCallback((sessionId: string) => {
+    const existing = hermesSeqMapRef.current.get(sessionId)
+    if (existing !== undefined) return existing
+    const seq = hermesSeqNextRef.current++
+    hermesSeqMapRef.current.set(sessionId, seq)
+    return seq
+  }, [])
+  // Frontend dismissal for remote (ssh:) Hermes sessions. The backend dismissed
+  // set only covers sessions that flow through get_claude_sessions; remote
+  // sessions are merged in on the frontend, so they need their own filter.
+  // Value is the wall-clock ms at dismiss time; a session revives if newer
+  // activity arrives after that.
+  const remoteDismissedRef = useRef<Map<string, number>>(new Map())
+
+  // Agent detail
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null)
+  const [metrics, setMetrics] = useState<AgentMetrics | null>(null)
+  const [extraInfo, setExtraInfo] = useState<any>(null)
+
+  // OpenClaw session chat
+  const [selectedSessionKey, setSelectedSessionKey] = useState<{ agentId: string; key: string } | null>(null)
+  const [sessionMessages, setSessionMessages] = useState<any[]>([])
+
+  // Claude Code & Cursor
+  const [claudeSessions, setClaudeSessions] = useState<any[]>([])
+  const claudeSessionsRef = useRef<any[]>([])
+  claudeSessionsRef.current = claudeSessions
+  const [charQueue, setCharQueue] = useState<string[]>([DEFAULT_CHAR_NAME])
+  // ─── Codex pet rotation queue (mini mode) ───
+  // Each session slot maps to petQueue[i % petQueue.length] so multiple
+  // running agents show different pets. Persisted in settings.json under
+  // `mini_pet_queue`. Defaults to a single-item queue containing the
+  // currently selected mini pet (or DEFAULT_PET_ID).
+  const [petQueue, setPetQueue] = useState<string[]>([])
+  // Resolved CodexPet objects in queue order; populated by an effect that
+  // looks each id up via loadCodexPetById. The session-list / slot
+  // renderers index into this array by row position so multiple sessions
+  // visibly rotate through the configured pets.
+  const [petQueueResolved, setPetQueueResolved] = useState<CodexPet[]>([])
+  const savePetQueue = useCallback(async (next: string[]) => {
+    setPetQueue(next)
+    const store = await load('settings.json', { defaults: {}, autoSave: true })
+    await store.set('mini_pet_queue', next)
+    await store.save()
+  }, [])
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      if (petQueue.length === 0) {
+        if (!cancelled) setPetQueueResolved([])
+        return
+      }
+      const resolved = await Promise.all(petQueue.map((id) => loadCodexPetById(id)))
+      if (cancelled) return
+      setPetQueueResolved(resolved.filter((p): p is CodexPet => p !== null))
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [petQueue])
+  // Returns the queue pet for a given session row index. Falls back to
+  // the user's main mini pet when the queue is empty or hasn't resolved
+  // yet so rows never render with `null`.
+  const getQueuePet = useCallback(
+    (index: number): CodexPet | null => {
+      if (petQueueResolved.length === 0) return miniPet
+      return petQueueResolved[((index % petQueueResolved.length) + petQueueResolved.length) % petQueueResolved.length]
+    },
+    [petQueueResolved, miniPet],
+  )
+  const [selectedClaudeSession, setSelectedClaudeSession] = useState<string | null>(null)
+  const [claudeConversation, setClaudeConversation] = useState<any[]>([])
+  const [showClaudeStats, setShowClaudeStats] = useState(false)
+  const [claudeStatsSource, setClaudeStatsSource] = useState<ClaudeStatsSource>('cc')
+  const [claudeStatsSsh, setClaudeStatsSsh] = useState<{ host: string; user: string } | null>(null)
+  const [claudeStatsSessionId, setClaudeStatsSessionId] = useState<string | null>(null)
+  const [sessionNicknames, setSessionNicknames] = useState<Record<string, string>>({})
+  const [editingSessionTitle, setEditingSessionTitle] = useState<string | null>(null)
+  const editingTitleValueRef = useRef('')
+  const editingTitleDefaultRef = useRef('')
+  const composingRef = useRef(false)
+  const saveSessionNickname = useCallback(async (sessionId: string, val: string, defaultName: string) => {
+    const trimmed = val.trim()
+    setSessionNicknames((prev) => {
+      const next = { ...prev }
+      if (trimmed && trimmed !== defaultName) {
+        next[sessionId] = trimmed
+      } else {
+        delete next[sessionId]
+      }
+      load('settings.json', { defaults: {}, autoSave: true }).then(async (store) => {
+        await store.set('session_nicknames', next)
+        await store.save()
+      })
+      return next
+    })
+  }, [])
+  useEffect(() => {
+    if (!showPanel && editingSessionTitle) {
+      saveSessionNickname(editingSessionTitle, editingTitleValueRef.current, editingTitleDefaultRef.current)
+      setEditingSessionTitle(null)
+    }
+  }, [showPanel, editingSessionTitle, saveSessionNickname])
+
+  // OC multi-connection: qualifiedId → connection params, qualifiedId → real agent ID, qualifiedId → source label
+  const agentConnMapRef = useRef<Map<string, OcParams>>(new Map())
+  const agentRealIdMapRef = useRef<Map<string, string>>(new Map())
+  // Source label dictionary is still populated by `fetchAgents` for future
+  // multi-source UI work; the getter is unused after the pairing refactor.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const [_agentSourceLabels, setAgentSourceLabels] = useState<Record<string, string>>({})
+
+  const resolveClaudeStatsSource = useCallback((source?: string): ClaudeStatsSource => {
+    if (source === 'cursor') return 'cursor'
+    if (source === 'codex') return 'codex'
+    if (source === 'gemini') return 'gemini'
+    if (source === 'hermes') return 'hermes'
+    if (source === 'opencode') return 'opencode'
+    return 'cc'
+  }, [])
+  const resolveClaudeStatsSourceBySession = useCallback(
+    (sessionId: string): ClaudeStatsSource => {
+      const session = claudeSessionsRef.current.find((s) => s.sessionId === sessionId)
+      return resolveClaudeStatsSource(session?.source)
+    },
+    [resolveClaudeStatsSource],
+  )
+
+  const isWindowsPlatform = typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows')
+
+  // Feature toggles
+  const [enableClaudeCode, setEnableClaudeCode] = useState(true)
+  // Separate listener switch for Claude Code Desktop on Windows. macOS/Linux
+  // currently fold both flows into `enableClaudeCode`, so this defaults to
+  // mirror that flag everywhere except Windows.
+  const [enableClaudeDesktop, setEnableClaudeDesktop] = useState(true)
+  const [enableCodex, setEnableCodex] = useState(true)
+  const [enableCursor, setEnableCursor] = useState(true)
+  const [enableGemini, setEnableGemini] = useState(true)
+  const [enableOpencode, setEnableOpencode] = useState(true)
+  const [hermesConns, setHermesConns] = useState<{ id: string; type: 'local' | 'remote'; host?: string; user?: string }[]>([])
+  // Hermes is enabled whenever at least one connection is configured, mirroring
+  // the OpenClaw model (presence of a connection implies it is enabled).
+  const enableHermes = hermesConns.length > 0
+  const [soundEnabled, setSoundEnabled] = useState(true)
+  const [codexSoundEnabled, setCodexSoundEnabled] = useState(true)
+  const [cursorSoundEnabled, setCursorSoundEnabled] = useState(false)
+  const [geminiSoundEnabled, setGeminiSoundEnabled] = useState(true)
+  const [opencodeSoundEnabled, setOpencodeSoundEnabled] = useState(true)
+  const [hermesSoundEnabled, setHermesSoundEnabled] = useState(false)
+  const [notifySound, setNotifySound] = useState<'default' | 'manbo'>('default')
+  const [waitingSound, setWaitingSound] = useState(false)
+  const [autoCloseCompletion, setAutoCloseCompletion] = useState(false)
+  const [petSfxEnabled, setPetSfxEnabled] = useState(true)
+  const petSfxEnabledRef = useRef(true)
+  // Pet mode: random idle action trigger interval, in minutes (0.5 – 30, default 2).
+  const [petIdleIntervalMin, setPetIdleIntervalMin] = useState(2)
+  const petIdleIntervalMinRef = useRef(2)
+  useEffect(() => { petIdleIntervalMinRef.current = petIdleIntervalMin }, [petIdleIntervalMin])
+  const [autoExpandOnTask, setAutoExpandOnTask] = useState(true)
+  const [largeMascot, setLargeMascot] = useState(false)
+  const largeMascotRef = useRef(false)
+  largeMascotRef.current = largeMascot
+  const [largeMascotScale, setLargeMascotScale] = useState(5)
+  const largeMascotScaleRef = useRef(5)
+  largeMascotScaleRef.current = largeMascotScale
+  const [largePetAction, setLargePetAction] = useState<LargePetAction | null>(null)
+  const largePetActionRef = useRef<LargePetAction | null>(null)
+  largePetActionRef.current = largePetAction
+  const largeActionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [panelMaxHeight, setPanelMaxHeight] = useState(300)
+  const panelMaxHeightRef = useRef(300)
+  panelMaxHeightRef.current = panelMaxHeight
+  const [hoverDelay, setHoverDelay] = useState(0.2)
+  const hoverDelayRef = useRef(0.2)
+  hoverDelayRef.current = hoverDelay
+  const [mascotScale, setMascotScale] = useState(1)
+  const mascotScaleRef = useRef(1)
+  mascotScaleRef.current = mascotScale
+  const [, setMascotPosition] = useState<'left' | 'right'>('right')
+  const mascotPositionRef = useRef<'left' | 'right'>('right')
+  const [islandBg, setIslandBg] = useState('__anime__')
+  const [uiScale, setUiScale] = useState(1.0)
+  const [bgPos, setBgPos] = useState({ x: 50, y: 50 })
+
+  // Settings mode: native window grows, then a separate settings card animates in.
+  const [settingsMode, setSettingsMode] = useState(false)
+  const settingsModeRef = useRef(false)
+  const [showSettingsOverlay, setShowSettingsOverlay] = useState(false)
+  const [hiding, setHiding] = useState(false)
+  const [settingsTransitioning, setSettingsTransitioning] = useState(false)
+  const settingsTransitioningRef = useRef(false)
+  const filePickerOpenRef = useRef(false)
+  // Independent flag for native (Tauri-invoked) folder/dialog flows so
+  // they don't share the auto-reset-on-focus logic used by HTML
+  // <input type="file"> clicks. Owned end-to-end by PetPicker.
+  const nativeDialogActiveRef = useRef(false)
+  // Tracks only the picker opened from settings page import flow.
+  // While true, any outside-click/blur close path must be blocked.
+  const settingsPickerOpenRef = useRef(false)
+  // Windows may deliver delayed blur/click events right after the native
+  // picker closes. Keep close handlers blocked for a short grace window.
+  const settingsPickerCloseGraceUntilRef = useRef(0)
+  // React-driven mirror of the ref. Used to render the click-outside
+  // overlay as `pointer-events: none` while a native folder picker is in
+  // flight, so even if the OS routes a click through to our webview
+  // (e.g. the dialog has only an "owner" relationship instead of true
+  // modal blocking), it cannot reach the overlay's onClick and tear down
+  // the settings panel.
+  const [nativeDialogActive, _setNativeDialogActive] = useState(false)
+  const setNativeDialogActive = useCallback((v: boolean) => {
+    nativeDialogActiveRef.current = v
+    _setNativeDialogActive(v)
+  }, [])
+  // Diagnostic IPC: forwards UI state transitions to the backend log file.
+  // Skipped entirely in production builds — no IPC overhead, no log noise.
+  const debugToTerminal = useCallback((scope: string, msg: string) => {
+    if (!import.meta.env.DEV) return
+    invoke('debug_log', { scope, msg }).catch(() => {})
+  }, [])
+  const isSettingsPickerBlockingClose = useCallback(
+    () =>
+      settingsPickerOpenRef.current ||
+      nativeDialogActiveRef.current ||
+      Date.now() < settingsPickerCloseGraceUntilRef.current,
+    [],
+  )
+  useEffect(() => {
+    debugToTerminal('state', `settingsMode=${settingsMode}`)
+  }, [settingsMode, debugToTerminal])
+  useEffect(() => {
+    debugToTerminal('state', `showSettingsOverlay=${showSettingsOverlay}`)
+  }, [showSettingsOverlay, debugToTerminal])
+  useEffect(() => {
+    debugToTerminal('state', `settingsTransitioning=${settingsTransitioning}`)
+  }, [settingsTransitioning, debugToTerminal])
+  useEffect(() => {
+    debugToTerminal('state', `hiding=${hiding}`)
+  }, [hiding, debugToTerminal])
+  useEffect(() => {
+    debugToTerminal(
+      'dialog',
+      `nativeDialogActive=${nativeDialogActive} settingsMode=${settingsModeRef.current} transitioning=${settingsTransitioningRef.current}`,
+    )
+  }, [nativeDialogActive, debugToTerminal])
+  useEffect(() => {
+    // Safety net: if any close path leaves `hiding` stuck true while settings
+    // is already fully closed, force the mascot tree visible again.
+    if (hiding && !settingsMode && !showSettingsOverlay && !settingsTransitioning) {
+      debugToTerminal('state', 'recover hiding=false (settings fully closed)')
+      setHiding(false)
+    }
+  }, [hiding, settingsMode, showSettingsOverlay, settingsTransitioning, debugToTerminal])
+  const [settingsNav, setSettingsNav] = useState<'pairing' | 'settings'>('pairing')
+  const [isCreateModalOpen, _setIsCreateModalOpen] = useState(false)
+  const isCreateModalOpenRef = useRef(false)
+  const setIsCreateModalOpen = (v: boolean) => {
+    isCreateModalOpenRef.current = v
+    _setIsCreateModalOpen(v)
+  }
+  // ─── Pet / Nurture mode state ───
+  const [appMode, setAppMode] = useState<AppMode | null>(null)
+  const appModeRef = useRef<AppMode | null>(null)
+  const [showOnboarding, setShowOnboarding] = useState(false)
+  const [petData, setPetData] = useState<PetData>(defaultPetData())
+  const petDataRef = useRef<PetData>(defaultPetData())
+  petDataRef.current = petData
+  const [currentPetAction, setCurrentPetAction] = useState<PetAction>('idle')
+  const currentPetActionRef = useRef<PetAction>('idle')
+  currentPetActionRef.current = currentPetAction
+  const [walkFlipped, setWalkFlipped] = useState(false)
+  const walkTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const walkAutoRef = useRef(false)
+  // When true, auto-walk heads straight to a screen edge (no flipping)
+  const walkToEdgeRef = useRef(false)
+  // 'left' = peeking from left edge (video flipped), 'right' = right edge
+  const peekEdgeRef = useRef<'left' | 'right'>('right')
+  const [pomodoro, setPomodoro] = useState<PomodoroState | null>(null)
+  const pomodoroRef = useRef<PomodoroState | null>(null)
+  pomodoroRef.current = pomodoro
+  const pomodoroIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const petTickIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const activityTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const [petContextMenuOpen, setPetContextMenuOpen] = useState(false)
+  const petContextMenuOpenRef = useRef(false)
+  const petContextMenuTransitionRef = useRef(false)
+  const [petMenuSide, setPetMenuSide] = useState<'left' | 'right'>('left')
+  // Pet-mode window inner width when the right-side menu is NOT open.
+  // The mascot anchors to `left: petBaseWinW - mascotW` so its on-screen
+  // position stays put even when the window widens for the menu. On
+  // high-DPI Windows the actual window is wider than `mascotW + 180`
+  // (because of `win_ui_scale`), so we cannot hard-code 180 here.
+  const [petBaseWinW, setPetBaseWinW] = useState<number | null>(null)
+  const petBaseWinWRef = useRef<number | null>(null)
+  useEffect(() => { petBaseWinWRef.current = petBaseWinW }, [petBaseWinW])
+
+  // Food rain effect (lives outside context menu so it persists after menu closes)
+  interface FoodRainDrop { id: number; emoji: string; x: number; delay: number; duration: number; size: number }
+  const [foodRainDrops, setFoodRainDrops] = useState<FoodRainDrop[]>([])
+  const foodRainIdRef = useRef(0)
+
+  // Capture the pet-mode window's "no-menu" inner width. The mascot's
+  // CSS `left:` is derived from this so it stays put when the right-side
+  // context menu temporarily widens the window.
+  useEffect(() => {
+    if (!(appMode === 'pet' && largeMascot)) {
+      setPetBaseWinW(null)
+      return
+    }
+    const update = () => {
+      if (petContextMenuOpenRef.current || petContextMenuTransitionRef.current) return
+      const w = window.innerWidth || 0
+      if (w > 0) setPetBaseWinW(w)
+    }
+    const id1 = requestAnimationFrame(() => requestAnimationFrame(update))
+    const id2 = window.setTimeout(update, 200)
+    window.addEventListener('resize', update)
+    return () => {
+      cancelAnimationFrame(id1)
+      window.clearTimeout(id2)
+      window.removeEventListener('resize', update)
+    }
+  }, [appMode, largeMascot])
+
+
+  const [pinned, setPinned] = useState(false)
+  const pinnedRef = useRef(false)
+  const [viewMode, _setViewMode] = useState<'island' | 'efficiency'>('efficiency')
+  const viewModeRef = useRef<'island' | 'efficiency'>('efficiency')
+  const expandedRef = useRef(false)
+  const expandedWindowModeRef = useRef<'island' | 'efficiency' | null>(null)
+  // showIdleSessions removed — all sessions visible, important ones sorted to top
+  const collapsingRef = useRef(false)
+  const customPosRef = useRef<{ x: number; y: number } | null>(null)
+  const [moveMode, _setMoveMode] = useState(false)
+  const moveModeRef = useRef(false)
+  const moveModeActivatedAtRef = useRef(0)
+  const mascotDragActiveRef = useRef(false)
+  // Mirror of mascotDragActiveRef for React-driven UI (e.g. suppressing the
+  // sprite's hover-jump while dragging so walkDir → run-left/run-right
+  // actually shows). Keep both in sync via setMascotDragActive below.
+  const [mascotDragActive, _setMascotDragActive] = useState(false)
+  const [resizeHandleHovered, setResizeHandleHovered] = useState(false)
+  const setMascotDragActive = useCallback((v: boolean) => {
+    mascotDragActiveRef.current = v
+    _setMascotDragActive(v)
+  }, [])
+  // Pending focus-driven auto-expand timer. The Windows window-focus
+  // listener defers expand() into this timer so a click landing on the
+  // mascot can cancel it and let handleMascotPointerDown decide between
+  // drag and expand instead.
+  const focusExpandTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const cancelFocusExpand = useCallback(() => {
+    if (focusExpandTimerRef.current) {
+      clearTimeout(focusExpandTimerRef.current)
+      focusExpandTimerRef.current = null
+    }
+  }, [])
+  const setMoveMode = (v: boolean) => {
+    moveModeRef.current = v
+    if (v) moveModeActivatedAtRef.current = Date.now()
+    _setMoveMode(v)
+  }
+
+  const { t, i18n } = useTranslation()
+  const [updateModalOpen, setUpdateModalOpen] = useState(false)
+  const updateModalOpenRef = useRef(false)
+  const pendingUpdateInfoRef = useRef<UpdateModalInfo | null>(null)
+  const updateModalRunOwnedRef = useRef(false)
+  const [updateModalPhase, setUpdateModalPhase] = useState<UpdateModalPhase>('available')
+  const [updateModalInfo, setUpdateModalInfo] = useState<UpdateModalInfo | null>(null)
+  const [updateModalProgress, setUpdateModalProgress] = useState<number | null>(null)
+  const [updateModalProgressStage, setUpdateModalProgressStage] = useState('preparing')
+  // Server-driven UI config (latest.json `ui` block). The codex pet hub
+  // URL is sourced from `ui.petdex.url`. We deliberately do NOT fall
+  // back to a hardcoded value — when the fetch fails or the field is
+  // missing, PetPicker shows a "network error" message so users
+  // understand why the link is unavailable rather than us silently
+  // routing them to a possibly-stale URL.
+  const [petdexUrl, setPetdexUrl] = useState<string | null>(null)
+  const [petdexFailed, setPetdexFailed] = useState(false)
+
+  // Load mini character from store
+  const loadMiniChar = useCallback(async () => {
+    const store = await load('settings.json', { defaults: {}, autoSave: true })
+    await store.reload()
+    const miniCharName = ((await store.get('mini_character')) as string) || ''
+    const chars = (await store.get('characters')) as CharacterMeta[] | null
+    if (miniCharName && chars) {
+      const found = chars.find((c) => c.name === miniCharName)
+      if (found) {
+        setMiniChar(found)
+        return
+      }
+    }
+    if (chars) {
+      const fallback = chars.find((c) => c.miniActions && Object.keys(c.miniActions).length > 0)
+      if (fallback) setMiniChar(fallback)
+    }
+  }, [])
+
+  // Load the user-selected mini pet. Falls back to the builtin default
+  // pet when nothing is saved. The full pet list is loaded on demand by
+  // the settings selector (a separate fetch that hits the cached manifest).
+  const loadMiniPet = useCallback(async () => {
+    try {
+      const savedId = await loadMiniPetId()
+      const picked = (savedId ? await loadCodexPetById(savedId) : null) ?? (await loadDefaultCodexPet())
+      if (picked) setMiniPet(picked)
+      // Load (or seed) the rotation queue alongside the main pet so the
+      // settings UI has something to show on first open. First-time
+      // users get the curated DEFAULT_PET_QUEUE_IDS list (10 builtins
+      // in manifest order) so different sessions immediately rotate
+      // through different mascots.
+      const store = await load('settings.json', { defaults: {}, autoSave: true })
+      const savedQueue = (await store.get('mini_pet_queue')) as string[] | null
+      if (savedQueue && savedQueue.length > 0) {
+        setPetQueue(savedQueue)
+      } else {
+        setPetQueue(DEFAULT_PET_QUEUE_IDS)
+      }
+    } catch (e) {
+      console.warn('[mini-pet] load failed:', e)
+    }
+  }, [])
+
+  useEffect(() => {
+    loadMiniChar()
+    loadMiniPet()
+    load('settings.json', { defaults: {}, autoSave: true }).then(async (store) => {
+      const nicks = (await store.get('session_nicknames')) as Record<string, string> | null
+      if (nicks) setSessionNicknames(nicks)
+    })
+    const unlisten = listen('character-changed', () => loadMiniChar())
+    return () => {
+      unlisten.then((fn) => fn())
+    }
+  }, [loadMiniChar])
+
+  // Pet mode data loaded inside main init effect below (no separate effect)
+
+  // React to hunger changes (e.g. from Dev slider) — switch to/from hungry
+  useEffect(() => {
+    if (appMode !== 'pet') return
+    if (petData.hunger < 30 && petActionPriority(currentPetAction) < petActionPriority('hungry')) {
+      setCurrentPetAction('hungry')
+      currentPetActionRef.current = 'hungry'
+    } else if (petData.hunger >= 30 && currentPetAction === 'hungry') {
+      setCurrentPetAction('idle')
+      currentPetActionRef.current = 'idle'
+    }
+  }, [appMode, petData.hunger])
+
+  // Pet mode: periodic tick for hunger/affection decay (every 5 min)
+  useEffect(() => {
+    if (appMode !== 'pet') return
+    const tick = async () => {
+      const ticked = tickPetData(petDataRef.current)
+      setPetData(ticked)
+      petDataRef.current = ticked
+      await savePetData(ticked)
+      // Auto-select hungry animation when hunger drops (overrides lower-priority actions)
+      if (ticked.hunger < 30 && petActionPriority(currentPetActionRef.current) < petActionPriority('hungry')) {
+        setCurrentPetAction('hungry')
+        currentPetActionRef.current = 'hungry'
+      }
+    }
+    petTickIntervalRef.current = setInterval(tick, 5 * 60 * 1000)
+    return () => {
+      if (petTickIntervalRef.current) clearInterval(petTickIntervalRef.current)
+    }
+  }, [appMode])
+
+  // Pet mode always forces large mascot
+  useEffect(() => {
+    if (appMode === 'pet' && !largeMascot) {
+      setLargeMascot(true)
+      largeMascotRef.current = true
+      load('settings.json', { defaults: {}, autoSave: true }).then(async (store) => {
+        await store.set('large_mascot', true)
+        await store.save()
+      })
+    }
+  }, [appMode, largeMascot])
+
+  // Pet mode: check system idle time → rest (5min no activity & no media) or idle
+  const idleCheckRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  // Shared now-playing cache/lock for pet-mode polling.
+  // We have two loops querying media state (2s media auto-detect + 10s idle check).
+  // Without a shared busy guard, slow backend responses can overlap and pile up,
+  // which can cause noticeable startup stutter on macOS.
+  const nowPlayingBusyRef = useRef(false)
+  const nowPlayingCachedRef = useRef<'none' | 'music' | 'video'>('none')
+  const nowPlayingCachedAtRef = useRef(0)
+  const getNowPlayingSafe = useCallback(async (maxAgeMs: number): Promise<'none' | 'music' | 'video'> => {
+    const now = Date.now()
+    if (maxAgeMs > 0 && now - nowPlayingCachedAtRef.current <= maxAgeMs) {
+      return nowPlayingCachedRef.current
+    }
+    if (nowPlayingBusyRef.current) {
+      return nowPlayingCachedRef.current
+    }
+    nowPlayingBusyRef.current = true
+    try {
+      const media = await invoke<string>('get_now_playing')
+      const normalized: 'none' | 'music' | 'video' =
+        media === 'video' ? 'video' : media === 'music' ? 'music' : 'none'
+      nowPlayingCachedRef.current = normalized
+      nowPlayingCachedAtRef.current = Date.now()
+      return normalized
+    } catch {
+      return nowPlayingCachedRef.current
+    } finally {
+      nowPlayingBusyRef.current = false
+    }
+  }, [])
+  useEffect(() => {
+    if (idleCheckRef.current) { clearInterval(idleCheckRef.current); idleCheckRef.current = null }
+    if (appMode !== 'pet') return
+    const check = async () => {
+      const cur = currentPetActionRef.current
+      if (petActionPriority(cur) >= petActionPriority('hungry')) return
+      if (TRANSIENT_PET_ACTIONS.includes(cur)) return
+      if (cur === 'walk' || cur === 'peek' || cur === 'walkout' || cur === 'grasp') return
+      try {
+        const [idleSec, media] = await Promise.all([
+          invoke<number>('get_system_idle_time'),
+          getNowPlayingSafe(4_000),
+        ])
+        const hasMedia = media === 'music' || media === 'video'
+        const userInactive = idleSec >= 300 && !hasMedia
+        if (userInactive && cur !== 'rest') {
+          setCurrentPetAction('rest')
+          currentPetActionRef.current = 'rest'
+        } else if (!userInactive && cur === 'rest') {
+          setCurrentPetAction('idle')
+          currentPetActionRef.current = 'idle'
+        }
+      } catch {}
+    }
+    check()
+    idleCheckRef.current = setInterval(check, 10_000)
+    return () => { if (idleCheckRef.current) clearInterval(idleCheckRef.current) }
+  }, [appMode, getNowPlayingSafe])
+
+  // Pet mode: while idle, randomly trigger weighted actions on a user-tunable
+  // interval (default 2 min, range 0.5–30 min). Keep spin out of the random
+  // pool; spin is reserved for high-affection click.
+  const idleAutoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => {
+    if (idleAutoTimerRef.current) {
+      clearTimeout(idleAutoTimerRef.current)
+      idleAutoTimerRef.current = null
+    }
+    if (appMode !== 'pet' || currentPetAction !== 'idle' || petActionPriority(currentPetAction) > 0) return
+    const intervalMs = Math.max(30_000, Math.round(petIdleIntervalMin * 60_000))
+    idleAutoTimerRef.current = setTimeout(() => {
+      if (currentPetActionRef.current !== 'idle' || petActionPriority(currentPetActionRef.current) > 0) return
+      const weightedIdleActions: PetAction[] = ['walk', 'milktea', 'dance', 'dance']
+      let next = weightedIdleActions[Math.floor(Math.random() * weightedIdleActions.length)]
+      if (next === 'walk' && !canWalk(petDataRef.current)) {
+        next = 'milktea'
+      }
+      if (next === 'walk') {
+        walkAutoRef.current = true
+        walkToEdgeRef.current = Math.random() > 0.5
+      }
+      setCurrentPetAction(next)
+      currentPetActionRef.current = next
+    }, intervalMs)
+    return () => {
+      if (idleAutoTimerRef.current) clearTimeout(idleAutoTimerRef.current)
+    }
+  }, [appMode, currentPetAction, petIdleIntervalMin])
+
+  // Pet mode: safety timeout for transient actions (recover from stuck states)
+  const transientTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => {
+    if (transientTimeoutRef.current) { clearTimeout(transientTimeoutRef.current); transientTimeoutRef.current = null }
+    if (appMode !== 'pet' || !TRANSIENT_PET_ACTIONS.includes(currentPetAction)) return
+    transientTimeoutRef.current = setTimeout(() => {
+      if (appModeRef.current === 'pet' && TRANSIENT_PET_ACTIONS.includes(currentPetActionRef.current)) {
+        console.warn('[pet] transient action timed out:', currentPetActionRef.current)
+        const d = petDataRef.current
+        const next: PetAction = d.hunger < 30 ? 'hungry' : 'idle'
+        setCurrentPetAction(next)
+        currentPetActionRef.current = next
+      }
+    }, 15_000)
+    return () => { if (transientTimeoutRef.current) clearTimeout(transientTimeoutRef.current) }
+  }, [appMode, currentPetAction])
+
+  // Pet mode always uses the builtin mascot character assets.
+  const PET_BUILTIN_BASE = '/assets/builtin/香企鹅'
+  const preferWebmLarge = typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows')
+  const largeFolder = preferWebmLarge ? 'webm' : 'mov'
+  const largeExt = preferWebmLarge ? 'webm' : 'mov'
+  const petBuiltinLargeActions = useMemo<Record<string, string>>(() => ({
+    idle: `${PET_BUILTIN_BASE}/large/${largeFolder}/idle.${largeExt}`,
+    hungry: `${PET_BUILTIN_BASE}/large/${largeFolder}/hungry.${largeExt}`,
+    eat: `${PET_BUILTIN_BASE}/large/${largeFolder}/eat.${largeExt}`,
+    walk: `${PET_BUILTIN_BASE}/large/${largeFolder}/walk.${largeExt}`,
+    walkout: `${PET_BUILTIN_BASE}/large/${largeFolder}/walkout.${largeExt}`,
+    peek: `${PET_BUILTIN_BASE}/large/${largeFolder}/peek.${largeExt}`,
+    headpat: `${PET_BUILTIN_BASE}/large/${largeFolder}/headpat.${largeExt}`,
+    grasp: `${PET_BUILTIN_BASE}/large/${largeFolder}/grasp.${largeExt}`,
+    angry: `${PET_BUILTIN_BASE}/large/${largeFolder}/angry.${largeExt}`,
+    question: `${PET_BUILTIN_BASE}/large/${largeFolder}/question.${largeExt}`,
+    farewell: `${PET_BUILTIN_BASE}/large/${largeFolder}/farewell.${largeExt}`,
+    watch: `${PET_BUILTIN_BASE}/large/${largeFolder}/watch.${largeExt}`,
+    music: `${PET_BUILTIN_BASE}/large/${largeFolder}/music.${largeExt}`,
+    dance: `${PET_BUILTIN_BASE}/large/${largeFolder}/dance.${largeExt}`,
+    study: `${PET_BUILTIN_BASE}/large/${largeFolder}/study.${largeExt}`,
+    work: `${PET_BUILTIN_BASE}/large/${largeFolder}/work.${largeExt}`,
+    rest: `${PET_BUILTIN_BASE}/large/${largeFolder}/rest.${largeExt}`,
+    milktea: `${PET_BUILTIN_BASE}/large/${largeFolder}/milktea.${largeExt}`,
+    spin: `${PET_BUILTIN_BASE}/large/${largeFolder}/spin.${largeExt}`,
+  }), [PET_BUILTIN_BASE, largeExt, largeFolder])
+
+  // Pet mode: play audio SFX mapped to pet actions via audio.json
+  const petAudioRef = useRef<HTMLAudioElement | null>(null)
+  const petAudioMapRef = useRef<Record<string, string> | null>(null)
+  useEffect(() => {
+    const jsonUrl = appMode === 'pet'
+      ? `${PET_BUILTIN_BASE}/audio.json`
+      : (() => {
+          if (!miniChar?.largeActions) return ''
+          const sampleUrl = Object.values(miniChar.largeActions)[0]
+          if (!sampleUrl) return ''
+          const baseDir = sampleUrl.replace(/\/large\/.*$/, '')
+          return `${baseDir}/audio.json`
+        })()
+    if (!jsonUrl) return
+    console.log('[pet-audio] fetching audio.json from:', jsonUrl)
+    fetch(jsonUrl)
+      .then(r => {
+        console.log('[pet-audio] fetch status:', r.status, r.ok)
+        return r.ok ? r.json() : null
+      })
+      .then((map: Record<string, string> | null) => {
+        if (!map) { console.warn('[pet-audio] audio.json empty or failed'); return }
+        const resolved: Record<string, string> = {}
+        const baseDir = jsonUrl.replace(/\/audio\.json$/, '')
+        for (const [action, file] of Object.entries(map)) {
+          resolved[action] = `${baseDir}/audio/${file}`
+        }
+        console.log('[pet-audio] loaded audioMap:', resolved)
+        petAudioMapRef.current = resolved
+      })
+      .catch(e => console.error('[pet-audio] fetch error:', e))
+  }, [miniChar, appMode])
+
+  const petSfxPlayingRef = useRef(false)
+  // Throttle grasp/drag audio: at most one play per 10s window so rapid
+  // re-grabs of the mascot don't spam the angry voice clip.
+  const lastGraspAudioAtRef = useRef(0)
+  const GRASP_AUDIO_THROTTLE_MS = 10_000
+  const playPetAudio = useCallback((action: PetAction) => {
+    if (appModeRef.current !== 'pet') return
+    if (!petSfxEnabledRef.current) return
+    if (action === 'grasp') {
+      const now = Date.now()
+      if (now - lastGraspAudioAtRef.current < GRASP_AUDIO_THROTTLE_MS) return
+      lastGraspAudioAtRef.current = now
+    }
+    const FALLBACK_AUDIO: Record<string, string> = {
+      angry: '/assets/builtin/香企鹅/audio/angry.mp3',
+      grasp: '/assets/builtin/香企鹅/audio/angry.mp3',
+      headpat: '/assets/builtin/香企鹅/audio/cute.mp3',
+      farewell: '/assets/builtin/香企鹅/audio/cute.mp3',
+      spin: '/assets/builtin/香企鹅/audio/happy.mp3',
+      walkout: '/assets/builtin/香企鹅/audio/happy.mp3',
+      eat: '/assets/builtin/香企鹅/audio/happy.mp3',
+    }
+    const map = petAudioMapRef.current || FALLBACK_AUDIO
+    const src = map[action]
+    if (!src) return
+    if (petAudioRef.current) {
+      petAudioRef.current.pause()
+      petAudioRef.current.currentTime = 0
+    }
+    const audio = new Audio(src)
+    audio.volume = 0.6
+    petAudioRef.current = audio
+    petSfxPlayingRef.current = true
+    audio.addEventListener('ended', () => { petSfxPlayingRef.current = false })
+    audio.addEventListener('pause', () => { petSfxPlayingRef.current = false })
+    audio.addEventListener('error', () => { petSfxPlayingRef.current = false })
+    audio.play().catch(() => { petSfxPlayingRef.current = false })
+  }, [])
+
+  // Pet mode: activity affection gain (watch/music: +1 per 10 min)
+  useEffect(() => {
+    if (appMode !== 'pet') return
+    if (currentPetAction !== 'watch' && currentPetAction !== 'music') {
+      if (activityTimerRef.current) clearInterval(activityTimerRef.current)
+      activityTimerRef.current = null
+      return
+    }
+    activityTimerRef.current = setInterval(async () => {
+      const d = { ...petDataRef.current }
+      d.affection = Math.min(AFFECTION_MAX, d.affection + AFFECTION_ACTIVITY_PER_10MIN)
+      d.hunger = Math.max(HUNGER_OFFLINE_FLOOR, d.hunger - HUNGER_ACTIVITY_PER_HOUR / 6)
+      setPetData(d)
+      petDataRef.current = d
+      await savePetData(d)
+    }, 10 * 60 * 1000)
+    return () => {
+      if (activityTimerRef.current) clearInterval(activityTimerRef.current)
+    }
+  }, [appMode, currentPetAction])
+
+  // Pet mode: randomly trigger dance during music (avg every ~5 min)
+  const musicDanceTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const danceFromMusicRef = useRef(false)
+  useEffect(() => {
+    if (musicDanceTimerRef.current) {
+      clearInterval(musicDanceTimerRef.current)
+      musicDanceTimerRef.current = null
+    }
+    if (appMode !== 'pet' || currentPetAction !== 'music') return
+    musicDanceTimerRef.current = setInterval(() => {
+      if (currentPetActionRef.current !== 'music') return
+      if (Math.random() < 0.1) {
+        danceFromMusicRef.current = true
+        setCurrentPetAction('dance')
+        currentPetActionRef.current = 'dance'
+      }
+    }, 30_000)
+    return () => {
+      if (musicDanceTimerRef.current) clearInterval(musicDanceTimerRef.current)
+    }
+  }, [appMode, currentPetAction])
+
+  // Walk animation: move the window and flip direction every 3 seconds.
+  // In "walk to edge" mode, walk straight to the nearest screen edge → peek.
+  useEffect(() => {
+    if (walkTimerRef.current) {
+      clearInterval(walkTimerRef.current)
+      walkTimerRef.current = null
+    }
+    if (currentPetAction !== 'walk') {
+      setWalkFlipped(false)
+      updateWalkDir(0)
+      return
+    }
+    // Walk physically moves the native window via `move_mini_by`. Anything
+    // rendered inside that same window (settings overlay, expanded panel,
+    // update / onboarding modals) would visually slide along with it,
+    // which is jarring. Pause walking while any of those are visible, and
+    // skip entirely outside pet mode.
+    if (
+      appMode !== 'pet' ||
+      settingsMode ||
+      settingsTransitioning ||
+      expanded ||
+      showSettingsOverlay ||
+      updateModalOpen ||
+      showOnboarding ||
+      isCreateModalOpen
+    ) {
+      setWalkFlipped(false)
+      updateWalkDir(0)
+      return
+    }
+    const WALK_SPEED = 2
+    const WALK_INTERVAL = 30
+    const FLIP_AFTER = 3000
+    const AUTO_WALK_DURATION = 6000
+    const isAuto = walkAutoRef.current
+    const isToEdge = walkToEdgeRef.current
+    walkAutoRef.current = false
+    walkToEdgeRef.current = false
+    let elapsed = 0
+    let totalElapsed = 0
+    let direction = -1
+    let edgeDirection = 0
+    let edgeCheckCounter = 0
+    setWalkFlipped(false)
+
+    if (isToEdge) {
+      // Determine which edge is closer, then walk toward it
+      Promise.all([
+        invoke('get_mini_origin'),
+        invoke('get_mini_monitor_rect'),
+      ]).then(([pos, rect]) => {
+        const [x] = pos as [number, number]
+        const [monitorX, , monitorW] = rect as [number, number, number, number]
+        const monitorLeft = monitorX
+        const monitorRight = monitorX + monitorW
+        const baseWinW = petBaseWinWRef.current ?? window.innerWidth ?? 300
+        const mascotW = largeMascotRef.current
+          ? MASCOT_BASE_SIZE * mascotScaleRef.current * largeMascotScaleRef.current
+          : MASCOT_BASE_SIZE * mascotScaleRef.current
+        const mascotLeft = x + baseWinW - mascotW
+        const mascotRight = x + baseWinW
+        const distLeft = mascotLeft - monitorLeft
+        const distRight = monitorRight - mascotRight
+        edgeDirection = distLeft <= distRight ? -1 : 1
+        setWalkFlipped(edgeDirection === 1)
+      }).catch(() => {})
+    }
+
+    walkTimerRef.current = setInterval(() => {
+      elapsed += WALK_INTERVAL
+      totalElapsed += WALK_INTERVAL
+
+      if (isToEdge) {
+        // Walk straight toward the edge without flipping
+        const dir = (edgeDirection || -1) as -1 | 1
+        updateWalkDir(dir)
+        invoke('move_mini_by', { dx: dir * WALK_SPEED, dy: 0 }).catch(() => {})
+      } else {
+        // Normal oscillating walk
+        if (isAuto && totalElapsed >= AUTO_WALK_DURATION) {
+          if (walkTimerRef.current) clearInterval(walkTimerRef.current)
+          walkTimerRef.current = null
+          updateWalkDir(0)
+          const d = petDataRef.current
+          const next: PetAction = d.hunger < 30 ? 'hungry' : 'idle'
+          setCurrentPetAction(next)
+          currentPetActionRef.current = next
+          return
+        }
+        if (elapsed >= FLIP_AFTER) {
+          elapsed = 0
+          direction *= -1
+          setWalkFlipped(prev => !prev)
+        }
+        updateWalkDir(direction as -1 | 1)
+        invoke('move_mini_by', { dx: direction * WALK_SPEED, dy: 0 }).catch(() => {})
+      }
+
+      // Check screen edge every ~300ms
+      edgeCheckCounter += WALK_INTERVAL
+      if (edgeCheckCounter >= 300) {
+        edgeCheckCounter = 0
+        Promise.all([
+          invoke('get_mini_origin'),
+          invoke('get_mini_monitor_rect'),
+        ]).then(([pos, rect]) => {
+          const [x] = pos as [number, number]
+          const [monitorX, , monitorW] = rect as [number, number, number, number]
+          const monitorLeft = monitorX
+          const monitorRight = monitorX + monitorW
+          const baseWinW = petBaseWinWRef.current ?? window.innerWidth ?? 300
+          const mascotW = largeMascotRef.current
+            ? MASCOT_BASE_SIZE * mascotScaleRef.current * largeMascotScaleRef.current
+            : MASCOT_BASE_SIZE * mascotScaleRef.current
+          const mascotRight = x + baseWinW
+          const mascotLeft = x + baseWinW - mascotW
+          if (mascotLeft <= monitorLeft + EDGE_THRESHOLD) {
+            if (walkTimerRef.current) clearInterval(walkTimerRef.current)
+            walkTimerRef.current = null
+            updateWalkDir(0)
+            peekEdgeRef.current = 'left'
+            setCurrentPetAction('peek')
+            currentPetActionRef.current = 'peek'
+            snapToPeekEdge('left', x, monitorLeft, monitorRight)
+          } else if (mascotRight >= monitorRight - EDGE_THRESHOLD) {
+            if (walkTimerRef.current) clearInterval(walkTimerRef.current)
+            walkTimerRef.current = null
+            updateWalkDir(0)
+            peekEdgeRef.current = 'right'
+            setCurrentPetAction('peek')
+            currentPetActionRef.current = 'peek'
+            snapToPeekEdge('right', x, monitorLeft, monitorRight)
+          }
+        }).catch(() => {})
+      }
+    }, WALK_INTERVAL)
+    return () => {
+      if (walkTimerRef.current) clearInterval(walkTimerRef.current)
+      updateWalkDir(0)
+    }
+  }, [
+    currentPetAction,
+    appMode,
+    settingsMode,
+    settingsTransitioning,
+    expanded,
+    showSettingsOverlay,
+    updateModalOpen,
+    showOnboarding,
+    isCreateModalOpen,
+    updateWalkDir,
+  ])
+
+  // Pet mode: auto-detect music/video from frontmost app
+  useEffect(() => {
+    if (appMode !== 'pet') return
+    const poll = async () => {
+      if (petSfxPlayingRef.current) return
+      const cur = currentPetActionRef.current
+      // Don't interrupt user-initiated movement or transient animations.
+      // Without this guard, e.g. clicking "walk" while a video is playing
+      // gets clobbered back to "watch" within 2s, causing the mascot to
+      // walk-in-place / stutter and occasionally overshoot the screen edge.
+      // Higher-priority actions (study/work/grasp/peek/walkout/hungry) are
+      // already filtered by the priority check below.
+      if (cur === 'walk' || TRANSIENT_PET_ACTIONS.includes(cur)) return
+      const curPri = petActionPriority(cur)
+      if (curPri >= petActionPriority('hungry')) return
+      try {
+        const media = await getNowPlayingSafe(0)
+        if (media === 'video' && cur !== 'watch') {
+          setCurrentPetAction('watch')
+          currentPetActionRef.current = 'watch'
+        } else if (media === 'music' && cur !== 'music') {
+          setCurrentPetAction('music')
+          currentPetActionRef.current = 'music'
+        } else if (media === 'none' && (cur === 'music' || cur === 'watch')) {
+          const d = petDataRef.current
+          const next: PetAction = d.hunger < 30 ? 'hungry' : 'idle'
+          setCurrentPetAction(next)
+          currentPetActionRef.current = next
+        }
+      } catch {}
+    }
+    poll()
+    const id = setInterval(poll, 2000)
+    return () => clearInterval(id)
+  }, [appMode, getNowPlayingSafe])
+
+  const handleSelectAppMode = useCallback(async (mode: AppMode) => {
+    appModeRef.current = mode
+    await saveAppMode(mode)
+    // Record the onboarding version so we don't re-prompt this user until
+    // we bump APP_MODE_ONBOARDING_VERSION again.
+    await saveAppModeVersion(APP_MODE_ONBOARDING_VERSION)
+    if (mode === 'pet') {
+      largeMascotRef.current = true
+      const store = await load('settings.json', { defaults: {}, autoSave: true })
+      await store.set('large_mascot', true)
+      await store.save()
+      const data = await loadPetData()
+      const ticked = tickPetData(data)
+      petDataRef.current = ticked
+      await savePetData(ticked)
+      // When switching mode from inside Settings, keep the settings-sized
+      // window completely untouched. Any native resize/move call (even a
+      // theoretically idempotent set_mini_size) can produce a visible
+      // jump of the fixed-position settings overlay on macOS, so just
+      // update React state and let exitSettings handle the real layout
+      // when the user closes the panel.
+      if (settingsModeRef.current || settingsTransitioningRef.current) {
+        setAppMode(mode)
+        setShowOnboarding(false)
+        setLargeMascot(true)
+        setPetData(ticked)
+        return
+      }
+      // Hide window content before resizing to avoid flashing the
+      // onboarding modal at the wrong window dimensions.
+      document.documentElement.style.opacity = '0'
+      // Reposition window, then update React state, then fade in
+      await invoke('set_mini_expanded', { expanded: false, position: mascotPositionRef.current, efficiency: true, mascotScale: mascotScaleRef.current, largeMascot: true, largeMascotScale: largeMascotScaleRef.current }).catch(() => {})
+      await invoke('set_pet_mode_window', { active: true, mascotScale: mascotScaleRef.current, largeMascotScale: largeMascotScaleRef.current }).catch(() => {})
+      setAppMode(mode)
+      setShowOnboarding(false)
+      setLargeMascot(true)
+      setPetData(ticked)
+      // Wait for React to render the mascot and chroma key canvas to draw, then reveal.
+      // Windows needs extra frames for the canvas chroma key loop to process the first frame.
+      const reveal = () => { document.documentElement.style.opacity = '1' }
+      if (isWindowsPlatform) {
+        setTimeout(reveal, 150)
+      } else {
+        requestAnimationFrame(reveal)
+      }
+    } else {
+      setAppMode(mode)
+      setShowOnboarding(false)
+      // First time entering coding mode (no persisted preference): default
+      // to the large mascot so new users see it out of the box. Existing
+      // users who have explicitly toggled the size are left alone.
+      setLargeMascot(true)
+      largeMascotRef.current = true
+      // When switching mode from inside Settings, keep the settings window
+      // completely untouched. enterSettings already disabled pet pass-
+      // through, and any extra native resize/move call (even an
+      // "idempotent" set_mini_size) can visibly jump the fixed-position
+      // settings overlay on macOS. exitSettings will switch back to the
+      // correct collapsed/pet layout when the user closes the panel.
+      if (settingsModeRef.current || settingsTransitioningRef.current) {
+        return
+      }
+      // Leaving pet mode (not from settings): stop the pass-through poll first.
+      await invoke('set_pet_mode_window', { active: false, mascotScale: mascotScaleRef.current, largeMascotScale: largeMascotScaleRef.current }).catch(() => {})
+      // Restore window back to collapsed mascot size
+      try {
+        await invoke('set_mini_size', { restore: true, position: mascotPositionRef.current, mascotScale: mascotScaleRef.current, largeMascot: true, largeMascotScale: largeMascotScaleRef.current })
+      } catch {}
+    }
+  }, [])
+
+  const handleUpdatePetData = useCallback(async (data: PetData) => {
+    setPetData(data)
+    petDataRef.current = data
+    await savePetData(data)
+  }, [])
+
+  const handleSetPetAction = useCallback((action: PetAction) => {
+    // During pomodoro only allow 'study' or explicit stop (which sets 'idle')
+    if (pomodoroRef.current?.active && action !== 'study' && action !== 'idle') return
+    if (action === 'walk') {
+      walkToEdgeRef.current = true
+    }
+    setCurrentPetAction(action)
+    currentPetActionRef.current = action
+  }, [])
+
+  // Check if the mascot is at a screen edge and switch to peek if so.
+  // Snaps window to a fixed position so the character protrudes by a
+  // consistent amount (PEEK_VISIBLE_FRACTION of the mascot width).
+  const PEEK_VISIBLE_FRACTION = 0.95
+  const EDGE_THRESHOLD = 30
+
+  const snapToPeekEdge = useCallback((edge: 'left' | 'right', currentX: number, monitorLeft: number, monitorRight: number) => {
+    const baseWinW = petBaseWinWRef.current ?? window.innerWidth ?? 300
+    const mascotW = MASCOT_BASE_SIZE * mascotScaleRef.current * largeMascotScaleRef.current
+    const visibleW = mascotW * PEEK_VISIBLE_FRACTION
+    let targetX: number
+    if (edge === 'right') {
+      targetX = monitorRight - visibleW - baseWinW + mascotW
+    } else {
+      targetX = monitorLeft + visibleW - baseWinW
+    }
+    const dx = targetX - currentX
+    if (Math.abs(dx) > 1) {
+      invoke('move_mini_by', { dx: Math.round(dx), dy: 0 }).catch(() => {})
+    }
+  }, [])
+
+  const checkEdgeAndSetPeek = useCallback(() => {
+    Promise.all([
+      invoke('get_mini_origin'),
+      invoke('get_mini_monitor_rect'),
+    ]).then(([pos, rect]) => {
+      const [x] = pos as [number, number]
+      const [monitorX, , monitorW] = rect as [number, number, number, number]
+      const monitorLeft = monitorX
+      const monitorRight = monitorX + monitorW
+      const baseWinW = petBaseWinWRef.current ?? window.innerWidth ?? 300
+      const mascotW = MASCOT_BASE_SIZE * mascotScaleRef.current * largeMascotScaleRef.current
+      const mascotRight = x + baseWinW
+      const mascotLeft = x + baseWinW - mascotW
+      if (mascotLeft <= monitorLeft + EDGE_THRESHOLD) {
+        peekEdgeRef.current = 'left'
+        setCurrentPetAction('peek')
+        currentPetActionRef.current = 'peek'
+        snapToPeekEdge('left', x, monitorLeft, monitorRight)
+      } else if (mascotRight >= monitorRight - EDGE_THRESHOLD) {
+        peekEdgeRef.current = 'right'
+        setCurrentPetAction('peek')
+        currentPetActionRef.current = 'peek'
+        snapToPeekEdge('right', x, monitorLeft, monitorRight)
+      } else {
+        const d = petDataRef.current
+        const action: PetAction = d.hunger < 30 ? 'hungry' : 'idle'
+        setCurrentPetAction(action)
+        currentPetActionRef.current = action
+      }
+    }).catch(() => {
+      const d = petDataRef.current
+      const action: PetAction = d.hunger < 30 ? 'hungry' : 'idle'
+      setCurrentPetAction(action)
+      currentPetActionRef.current = action
+    })
+  }, [snapToPeekEdge])
+
+  const handleStartPomodoro = useCallback(async (minutes: number) => {
+    const state: PomodoroState = {
+      active: true,
+      duration: minutes * 60,
+      remaining: minutes * 60,
+      startedAt: Date.now(),
+    }
+    setPomodoro(state)
+    pomodoroRef.current = state
+    setCurrentPetAction('study')
+    currentPetActionRef.current = 'study'
+
+    if (pomodoroIntervalRef.current) clearInterval(pomodoroIntervalRef.current)
+    pomodoroIntervalRef.current = setInterval(async () => {
+      const p = pomodoroRef.current
+      if (!p?.active) return
+      const elapsed = (Date.now() - p.startedAt) / 1000
+      const left = Math.max(0, p.duration - elapsed)
+      const earnedMinutes = Math.floor(elapsed / 60)
+      const prevEarned = petDataRef.current.pomodoroCoins
+      if (earnedMinutes > prevEarned) {
+        const d = { ...petDataRef.current }
+        const newCoins = earnedMinutes - prevEarned
+        d.coins += newCoins * POMODORO_COINS_PER_MIN
+        d.pomodoroCoins = earnedMinutes
+        setPetData(d)
+        petDataRef.current = d
+        await savePetData(d)
+      }
+      if (left <= 0) {
+        // Pomodoro complete
+        if (pomodoroIntervalRef.current) clearInterval(pomodoroIntervalRef.current)
+        pomodoroIntervalRef.current = null
+        // Play a cute completion cue for pet mode pomodoro.
+        playPetAudio('headpat')
+        setPomodoro(null)
+        pomodoroRef.current = null
+        setCurrentPetAction('idle')
+        currentPetActionRef.current = 'idle'
+        const d = { ...petDataRef.current, pomodoroCoins: 0 }
+        setPetData(d)
+        petDataRef.current = d
+        await savePetData(d)
+      }
+    }, 1000)
+  }, [])
+
+  const handleStopPomodoro = useCallback(async () => {
+    if (pomodoroIntervalRef.current) clearInterval(pomodoroIntervalRef.current)
+    pomodoroIntervalRef.current = null
+    setPomodoro(null)
+    pomodoroRef.current = null
+    setCurrentPetAction('idle')
+    currentPetActionRef.current = 'idle'
+    const d = { ...petDataRef.current, pomodoroCoins: 0 }
+    setPetData(d)
+    petDataRef.current = d
+    await savePetData(d)
+  }, [])
+
+  // Sync pomodoro-active flag to the native pass-through poll. While a
+  // pomodoro is running, the bottom-anchored stop button sits in the
+  // mascot's pass-through inset region; the backend needs to know to keep
+  // the whole window interactive so clicks don't leak to apps behind.
+  useEffect(() => {
+    const active = !!pomodoro?.active
+    invoke('set_pet_pomodoro_active', { active }).catch(() => {})
+  }, [pomodoro?.active])
+
+  const closePetContextMenu = useCallback(async () => {
+    if (!petContextMenuOpenRef.current || petContextMenuTransitionRef.current) return
+    petContextMenuTransitionRef.current = true
+    try {
+      setPetContextMenuOpen(false)
+      petContextMenuOpenRef.current = false
+      await invoke('set_pet_context_menu', { open: false }).catch(() => {})
+    } finally {
+      petContextMenuTransitionRef.current = false
+    }
+  }, [])
+
+  const triggerFoodRain = useCallback((emoji: string) => {
+    const drops: FoodRainDrop[] = Array.from({ length: 12 }, () => {
+      foodRainIdRef.current += 1
+      return {
+        id: foodRainIdRef.current,
+        emoji,
+        x: Math.random() * 100,
+        delay: Math.random() * 0.6,
+        duration: 1.2 + Math.random() * 0.8,
+        size: 18 + Math.random() * 14,
+      }
+    })
+    setFoodRainDrops(prev => [...prev, ...drops])
+    setTimeout(() => {
+      setFoodRainDrops(prev => prev.filter(d => !drops.includes(d)))
+    }, 2500)
+  }, [])
+
+
+  useEffect(() => {
+    load('settings.json', { defaults: {}, autoSave: true }).then(async (store) => {
+      _setViewMode('efficiency')
+      viewModeRef.current = 'efficiency'
+      const storedPosition = (await store.get('mascot_position')) as string | null
+      const initialMascotPosition = storedPosition === 'left' || storedPosition === 'right' ? storedPosition : 'right'
+      const storedMascotScale = await store.get('mascot_scale')
+      const initialMascotScale = typeof storedMascotScale === 'number' ? clampMascotScale(storedMascotScale) : 1
+      const storedLargeMascotScale = await store.get('large_mascot_scale')
+      const initialLargeMascotScale = typeof storedLargeMascotScale === 'number' ? Math.min(6, Math.max(1, storedLargeMascotScale)) : 5
+      const existingMode = await loadAppMode()
+      // Avoid startup flicker: decide large/small mascot from the persisted mode
+      // BEFORE applying initial React/native window state. Otherwise we briefly
+      // render the stored small mascot and then switch to large in pet mode.
+      // Default to large mascot for both pet and coding modes when the user
+      // has no explicit preference yet; respect the stored boolean otherwise.
+      const initialLargeMascot = true
+      setMascotPosition(initialMascotPosition)
+      setMascotScale(initialMascotScale)
+      setLargeMascot(initialLargeMascot)
+      setLargeMascotScale(initialLargeMascotScale)
+      mascotPositionRef.current = initialMascotPosition
+      mascotScaleRef.current = initialMascotScale
+      largeMascotRef.current = initialLargeMascot
+      largeMascotScaleRef.current = initialLargeMascotScale
+
+      const existingModeVersion = await loadAppModeVersion()
+      // Force re-onboarding when the stored version is missing or older
+      // than APP_MODE_ONBOARDING_VERSION (e.g. after we ship changes that
+      // require users to re-confirm their mode choice).
+      const onboardingStale = isAppModeOnboardingStale(existingModeVersion)
+      if (!onboardingStale && (existingMode === 'pet' || existingMode === 'coding')) {
+        setAppMode(existingMode)
+        appModeRef.current = existingMode
+        setShowOnboarding(false)
+        if (existingMode === 'pet') {
+          const data = await loadPetData()
+          const ticked = tickPetData(data)
+          setPetData(ticked)
+          petDataRef.current = ticked
+          await savePetData(ticked)
+          // Keep persisted setting aligned with pet mode for next startup.
+          await store.set('large_mascot', true)
+        }
+        await invoke('set_mini_expanded', {
+          expanded: false,
+          position: initialMascotPosition,
+          efficiency: true,
+          mascotScale: initialMascotScale,
+          largeMascot: true,
+          largeMascotScale: initialLargeMascotScale,
+        }).catch(() => {})
+        if (existingMode === 'pet') {
+          await invoke('set_pet_mode_window', {
+            active: true,
+            mascotScale: initialMascotScale,
+            largeMascotScale: initialLargeMascotScale,
+          }).catch(() => {})
+        } else {
+          invoke('set_pet_mode_window', {
+            active: false,
+            mascotScale: initialMascotScale,
+            largeMascotScale: initialLargeMascotScale,
+          }).catch(() => {})
+        }
+      } else {
+        // First launch (or mode not chosen yet): show mode onboarding.
+        setAppMode(null)
+        appModeRef.current = null
+        try {
+          await invoke('set_mini_size', {
+            restore: false,
+            position: initialMascotPosition,
+            keepOnTop: true,
+            mascotScale: initialMascotScale,
+          })
+        } catch {}
+        // `set_mini_size` schedules its NSWindow resize on the main thread
+        // and returns immediately, so the modal would otherwise render
+        // inside the still-collapsed 96x96 frame and clip its own
+        // contents (clicks effectively land outside the visible area).
+        // A short delay lets the resize land before React mounts the
+        // modal at a sane size.
+        await new Promise<void>((r) => setTimeout(r, 120))
+        setShowOnboarding(true)
+      }
+
+      await store.set('view_mode', 'efficiency')
+      // Force-reset mascot custom position to avoid off-screen placement.
+      // Keep collapsed default placement controlled by `set_mini_expanded`.
+      customPosRef.current = null
+      await store.set('mini_custom_pos', null)
+      await store.save()
+    })
+  }, [])
+
+  const fetchAgents = useCallback(async () => {
+    // Skip polling while settings page is open — snapshot comparison would
+    // detect the config change prematurely, consuming it before the user exits
+    // settings, which means exitSettings' call wouldn't show the loading overlay.
+    if (settingsModeRef.current) return
+
+    try {
+      const chars = await loadCharacters()
+      setCharacters(chars)
+      await loadMiniChar()
+      const store0 = await load('settings.json', { defaults: {}, autoSave: true })
+      const q = (await store0.get('char_queue')) as string[] | null
+      if (q && q.length) setCharQueue(q)
+    } catch (e) {
+      console.warn('[fetchAgents] loadCharacters failed:', e)
+    }
+    try {
+      const store = await load('settings.json', { defaults: {}, autoSave: true })
+      const connections = await loadOcConnections()
+      setHasConfiguredOpenClaw(connections.some((conn) => connToOcParams(conn) !== null))
+
+      // Detect connection config changes — show loading overlay if changed
+      const snapshot = JSON.stringify(connections.map((c) => ({ id: c.id, type: c.type, host: c.host, user: c.user })))
+      const configChanged = lastConnSnapshotRef.current !== '' && snapshot !== lastConnSnapshotRef.current
+      lastConnSnapshotRef.current = snapshot
+      if (configChanged) {
+        setAgents([])
+        setAllSessions([])
+        setRefreshingAgents(true)
+        if (refreshTimeoutRef.current) clearTimeout(refreshTimeoutRef.current)
+        refreshTimeoutRef.current = setTimeout(() => setRefreshingAgents(false), 45000)
+      }
+
+      const newConnMap = new Map<string, OcParams>()
+      const newRealIdMap = new Map<string, string>()
+      const newSourceLabels: Record<string, string> = {}
+      const allAgents: AgentInfo[] = []
+      const multi = connections.length > 1
+      await Promise.all(
+        connections.map(async (conn) => {
+          try {
+            const oc = connToOcParams(conn)
+            if (!oc) return // skip incomplete remote connections
+            const agents = (await invoke('get_agents', oc)) as AgentInfo[]
+            const prefix = multi ? `${conn.id.slice(0, 8)}:` : ''
+            const label = conn.type === 'local' ? t('mini.local') : conn.host || t('mini.remote')
+            for (const a of agents) {
+              const qualifiedId = prefix + a.id
+              newConnMap.set(qualifiedId, oc)
+              newRealIdMap.set(qualifiedId, a.id)
+              if (multi) newSourceLabels[qualifiedId] = label
+              allAgents.push({ ...a, id: qualifiedId })
+            }
+          } catch (e) {
+            console.warn('[fetchAgents] connection failed:', conn.id, e)
+          }
+        }),
+      )
+
+      agentConnMapRef.current = newConnMap
+      agentRealIdMapRef.current = newRealIdMap
+      setAgentSourceLabels(newSourceLabels)
+      const charMap = (await store.get('agent_char_map')) as Record<string, string> | null
+      setAgents(allAgents)
+      setAgentCharMap(charMap || {})
+      // Clear loading overlay — data is now fresh
+      setRefreshingAgents(false)
+      if (refreshTimeoutRef.current) {
+        clearTimeout(refreshTimeoutRef.current)
+        refreshTimeoutRef.current = null
+      }
+    } catch (e) {
+      console.warn('[fetchAgents] get_agents failed:', e)
+      setRefreshingAgents(false)
+      if (refreshTimeoutRef.current) {
+        clearTimeout(refreshTimeoutRef.current)
+        refreshTimeoutRef.current = null
+      }
+    }
+  }, [loadMiniChar, t])
+
+  const playDefaultSound = useCallback(() => {
+    if (navigator.userAgent.includes('Windows')) {
+      new Audio('/audio/glass.mp3').play().catch(() => {})
+    } else {
+      invoke('play_sound', { name: 'Purr' }).catch(() => {})
+    }
+  }, [])
+
+  const lastOcSoundRef = useRef(0)
+  const playOcCompletionSound = useCallback((source: string) => {
+    console.log('[OC-SOUND] triggered from', source, 'soundEnabled:', soundEnabledRef.current)
+    if (!soundEnabledRef.current) return
+    const now = Date.now()
+    if (now - lastOcSoundRef.current < 5000) {
+      console.log('[OC-SOUND] deduped, last played', now - lastOcSoundRef.current, 'ms ago')
+      return
+    }
+    lastOcSoundRef.current = now
+    console.log('[OC-SOUND] PLAYING sound:', notifySoundRef.current)
+    if (notifySoundRef.current === 'manbo') {
+      new Audio('/audio/manbo.m4a').play().catch(() => {})
+    } else {
+      playDefaultSound()
+    }
+  }, [])
+
+  const prevHealthRef = useRef<Record<string, boolean>>({})
+  const prevSessionHealthRef = useRef<Record<string, boolean>>({})
+  // Prevent concurrent pollHealth calls — if a remote SSH call takes > 1s,
+  // the 1s interval would stack requests, overwhelming the SSH socket and
+  // causing repeated "stale socket" failures.
+  const pollHealthBusyRef = useRef(false)
+  const pollHealth = useCallback(async () => {
+    if (pollHealthBusyRef.current) return
+    pollHealthBusyRef.current = true
+    try {
+      const connections = await loadOcConnections()
+      // Start with previous data — only overwrite for connections that succeed
+      const hMap: Record<string, boolean> = { ...prevHealthRef.current }
+      const sMap: Record<string, boolean> = { ...prevSessionHealthRef.current }
+      const freshKeys = new Set<string>() // session keys that got fresh data this round
+      await Promise.all(
+        connections.map(async (conn) => {
+          const prefix = connections.length > 1 ? `${conn.id.slice(0, 8)}:` : ''
+          try {
+            const oc = connToOcParams(conn)
+            if (!oc) {
+              // Incomplete remote connection — still clear stale health data for
+              // this prefix so the mascot/status doesn't stay "busy" from the
+              // previous (now-removed) connection's data.
+              for (const k of Object.keys(hMap)) {
+                if (prefix === '' || k.startsWith(prefix)) delete hMap[k]
+              }
+              for (const k of Object.keys(sMap)) {
+                if (prefix === '' || k.startsWith(prefix)) delete sMap[k]
+              }
+              return
+            }
+            const health = (await invoke('get_health', oc)) as { agents: AgentHealth[]; gatewayAlive?: boolean }
+            // Gateway dead (local OpenClaw process not running) — remove this
+            // connection from settings so the character cleanly goes idle instead
+            // of flickering between stale "working" and "idle" states.
+            if (health.gatewayAlive === false) {
+              console.warn('[pollHealth] gateway dead, removing connection:', conn.id)
+              const remaining = connections.filter((c) => c.id !== conn.id)
+              saveOcConnections(remaining)
+              for (const k of Object.keys(hMap)) {
+                if (prefix === '' || k.startsWith(prefix)) delete hMap[k]
+              }
+              for (const k of Object.keys(sMap)) {
+                if (prefix === '' || k.startsWith(prefix)) delete sMap[k]
+              }
+              return
+            }
+            // Clear old entries for this connection, then fill fresh data
+            for (const k of Object.keys(hMap)) {
+              if (prefix === '' || k.startsWith(prefix)) delete hMap[k]
+            }
+            for (const k of Object.keys(sMap)) {
+              if (prefix === '' || k.startsWith(prefix)) delete sMap[k]
+            }
+            health.agents.forEach((a) => {
+              hMap[prefix + a.agentId] = a.active
+              if (a.sessions) {
+                a.sessions.forEach((s) => {
+                  const sk = `${prefix}${a.agentId}:${s.key}`
+                  sMap[sk] = s.active
+                  freshKeys.add(sk)
+                })
+              }
+            })
+          } catch {
+            /* SSH/invoke failed — previous data preserved */
+          }
+        }),
+      )
+
+      // Detect session active→inactive transitions (only for fresh data)
+      // Skip sub-agent sessions — their key contains ":subagent:" (from OpenClaw session key format)
+      const prev = prevSessionHealthRef.current
+      if (freshKeys.size > 0) {
+        const anyBecameInactive = Array.from(freshKeys).some((k) => prev[k] === true && sMap[k] === false && !k.includes(':subagent:'))
+        if (anyBecameInactive) {
+          console.log('[pollHealth] session became inactive, prev:', prev, 'curr:', sMap)
+          playOcCompletionSound('pollHealth')
+        }
+      }
+      prevSessionHealthRef.current = sMap
+
+      const anyActive = Object.values(sMap).some((v) => v)
+      setAnySessionActive(anyActive)
+
+      prevHealthRef.current = hMap
+      setHealthMap(hMap)
+    } catch {
+      /* ignore */
+    }
+    pollHealthBusyRef.current = false
+  }, [playOcCompletionSound])
+
+  const previewCacheRef = useRef<Map<string, { active: boolean; lastUserMsg?: string; lastAssistantMsg?: string; fetchedAt: number }>>(new Map())
+  const previewQueueRef = useRef<string[]>([])
+  const previewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const sessionFileMapRef = useRef<Map<string, string>>(new Map())
+  const sessionAgentMapRef = useRef<Map<string, string>>(new Map()) // sessionCompositeKey → qualifiedAgentId
+  const fetchingSessionsRef = useRef(false)
+
+  const fetchAllSessions = useCallback(async () => {
+    if (agents.length === 0) {
+      setAllSessions([])
+      return
+    }
+    if (fetchingSessionsRef.current) return
+    fetchingSessionsRef.current = true
+    const results: MiniSessionInfo[] = []
+    await Promise.all(
+      agents.map(async (agent) => {
+        try {
+          const oc = agentConnMapRef.current.get(agent.id) || {}
+          const realId = agentRealIdMapRef.current.get(agent.id) || agent.id
+          const s = (await invoke('get_agent_sessions', { agentId: realId, ...oc })) as MiniSessionInfo[]
+          // Tag sessions with the qualified agent ID
+          results.push(...s.map((ss) => ({ ...ss, agentId: agent.id })))
+        } catch {
+          /* ignore */
+        }
+      }),
+    )
+    console.log('[fetchAllSessions] raw results:', results.length, results)
+    // Keep previous data if all fetches failed (SSH backoff etc.)
+    if (results.length === 0 && previewCacheRef.current.size > 0) {
+      console.log('[fetchAllSessions] empty results, keeping cache')
+      fetchingSessionsRef.current = false
+      return
+    }
+    const seen = new Set<string>()
+    const deduped = results.filter((s) => {
+      const k = `${s.agentId}:${s.key}`
+      if (seen.has(k)) return false
+      seen.add(k)
+      return true
+    })
+    const filtered = deduped.filter((s) => {
+      const key = `${s.agentId}:${s.key}`
+      const dismissedAt = dismissedSessionsRef.current.get(key)
+      if (dismissedAt !== undefined && s.updatedAt > dismissedAt) {
+        dismissedSessionsRef.current.delete(key)
+      }
+      return !dismissedSessionsRef.current.has(key)
+    })
+    filtered.sort((a, b) => b.updatedAt - a.updatedAt)
+    const top = filtered.slice(0, MAX_SLOTS)
+
+    // Merge cached preview data into sessions
+    const merged = top
+      .map((s) => {
+        const k = `${s.agentId}:${s.key}`
+        const cached = previewCacheRef.current.get(k)
+        if (cached) {
+          return { ...s, active: cached.active, lastUserMsg: cached.lastUserMsg, lastAssistantMsg: cached.lastAssistantMsg }
+        }
+        return s
+      })
+      // Filter out OpenClaw sub-agent sessions (key contains ":subagent:")
+      .filter((s) => !s.key.includes(':subagent:'))
+    merged.sort((a, b) => (b.active ? 1 : 0) - (a.active ? 1 : 0) || b.updatedAt - a.updatedAt)
+    console.log('[fetchAllSessions] final merged:', merged.length, merged)
+    setAllSessions(merged)
+
+    // Build session file lookup and queue preview fetches
+    const queue: string[] = []
+    for (const s of top) {
+      const k = `${s.agentId}:${s.key}`
+      if (s.sessionFile) sessionFileMapRef.current.set(k, s.sessionFile)
+      sessionAgentMapRef.current.set(k, s.agentId)
+      const cached = previewCacheRef.current.get(k)
+      const staleTime = cached?.active ? 8000 : 15000 // poll active sessions faster
+      const stale = !cached || Date.now() - cached.fetchedAt > staleTime
+      if (stale) queue.push(k)
+    }
+    // Prioritize active sessions first
+    queue.sort((a, b) => {
+      const ca = previewCacheRef.current.get(a)
+      const cb = previewCacheRef.current.get(b)
+      return (cb?.active ? 1 : 0) - (ca?.active ? 1 : 0)
+    })
+    previewQueueRef.current = queue
+    fetchingSessionsRef.current = false
+  }, [agents])
+
+  useEffect(() => {
+    if (appMode !== 'coding') return
+    fetchAgents()
+    pollHealth()
+    const a = setInterval(fetchAgents, 5000)
+    const h = setInterval(pollHealth, 1000)
+    return () => {
+      clearInterval(a)
+      clearInterval(h)
+    }
+  }, [fetchAgents, pollHealth, appMode])
+
+  // Update allSessions active states from pollHealth session data
+  const syncSessionActiveStates = useCallback(() => {
+    const sMap = prevSessionHealthRef.current
+    if (Object.keys(sMap).length === 0) return
+    setAllSessions((prev) => {
+      let changed = false
+      const updated = prev.map((s) => {
+        const key = `${s.agentId}:${s.key}`
+        const isActive = !!sMap[key]
+        if (s.active !== isActive) {
+          changed = true
+          return { ...s, active: isActive }
+        }
+        return s
+      })
+      if (!changed) return prev
+      updated.sort((a, b) => (b.active ? 1 : 0) - (a.active ? 1 : 0) || b.updatedAt - a.updatedAt)
+      return updated
+    })
+  }, [])
+
+  useEffect(() => {
+    syncSessionActiveStates()
+    const t = setInterval(syncSessionActiveStates, 2000)
+    return () => clearInterval(t)
+  }, [syncSessionActiveStates])
+
+  const drainPreviewQueue = useCallback(async () => {
+    if (previewTimerRef.current) {
+      clearTimeout(previewTimerRef.current)
+      previewTimerRef.current = null
+    }
+    const queue = [...previewQueueRef.current]
+    if (queue.length === 0) return
+    const processNext = (idx: number) => {
+      if (idx >= queue.length) return
+      const k = queue[idx]
+      const sessionFile = sessionFileMapRef.current.get(k)
+      if (!sessionFile) {
+        console.warn('[drainPreview] no sessionFile for', k, 'map size:', sessionFileMapRef.current.size)
+        previewTimerRef.current = setTimeout(() => processNext(idx + 1), 200)
+        return
+      }
+      const agentId = sessionAgentMapRef.current.get(k) || k.split(':')[0]
+      const oc = agentConnMapRef.current.get(agentId) || {}
+      invoke('get_session_preview', { sessionFile, ...oc })
+        .then((preview) => {
+          const p = preview as SessionPreview
+          previewCacheRef.current.set(k, { ...p, fetchedAt: Date.now() })
+          setAllSessions((prev) =>
+            prev.map((s) => {
+              if (`${s.agentId}:${s.key}` === k) {
+                return { ...s, active: p.active, lastUserMsg: p.lastUserMsg, lastAssistantMsg: p.lastAssistantMsg }
+              }
+              return s
+            }),
+          )
+        })
+        .catch(() => {
+          /* ignore */
+        })
+        .finally(() => {
+          if (idx + 1 < queue.length) {
+            previewTimerRef.current = setTimeout(() => processNext(idx + 1), 1500)
+          }
+        })
+    }
+    processNext(0)
+  }, [playOcCompletionSound])
+
+  useEffect(() => {
+    if (!expanded || appMode !== 'coding') return
+    fetchAllSessions().then(() => drainPreviewQueue())
+    const t1 = setInterval(() => {
+      fetchAllSessions().then(() => drainPreviewQueue())
+    }, 5000)
+    return () => {
+      clearInterval(t1)
+      if (previewTimerRef.current) {
+        clearTimeout(previewTimerRef.current)
+        previewTimerRef.current = null
+      }
+    }
+  }, [expanded, fetchAllSessions, drainPreviewQueue, appMode])
+
+  // Load feature toggles
+  useEffect(() => {
+    ;(async () => {
+      const store = await load('settings.json', { defaults: {}, autoSave: true })
+      const cc = await store.get('enable_claudecode')
+      if (typeof cc === 'boolean') setEnableClaudeCode(cc)
+      const ccDesktop = await store.get('enable_claude_desktop')
+      const ccDesktopEnabled = typeof ccDesktop === 'boolean' ? ccDesktop : true
+      setEnableClaudeDesktop(ccDesktopEnabled)
+      const cod = await store.get('enable_codex')
+      const codEnabled = cod !== false
+      setEnableCodex(codEnabled)
+      // Hook script is shared between CC CLI and CC Desktop, so install when
+      // any of the Claude listeners are on.
+      if (cc !== false || ccDesktopEnabled) invoke('install_claude_hooks').catch(() => {})
+      if (codEnabled) invoke('install_codex_hooks').catch(() => {})
+      const cur = await store.get('enable_cursor')
+      const curEnabled = cur !== false
+      setEnableCursor(curEnabled)
+      if (curEnabled) invoke('install_cursor_hooks').catch(() => {})
+      const gem = await store.get('enable_gemini')
+      const gemEnabled = gem !== false
+      setEnableGemini(gemEnabled)
+      if (gemEnabled) invoke('install_gemini_hooks').catch(() => {})
+      const oc = await store.get('enable_opencode')
+      const ocEnabled = oc !== false
+      setEnableOpencode(ocEnabled)
+      if (ocEnabled) invoke('install_opencode_hooks').catch(() => {})
+      // Hermes plugin install is user-triggered only (restarts gateway).
+      // Enablement now follows whether any connection is configured.
+      const hermConns = await store.get('hermes_connections') as { id: string; type: 'local' | 'remote'; host?: string; user?: string }[] | null
+      if (hermConns) setHermesConns(hermConns)
+      const snd = await store.get('sound_enabled')
+      if (typeof snd === 'boolean') setSoundEnabled(snd)
+      const codsnd = await store.get('codex_sound_enabled')
+      if (typeof codsnd === 'boolean') setCodexSoundEnabled(codsnd)
+      const csnd = await store.get('cursor_sound_enabled')
+      if (typeof csnd === 'boolean') setCursorSoundEnabled(csnd)
+      const gsnd = await store.get('gemini_sound_enabled')
+      if (typeof gsnd === 'boolean') setGeminiSoundEnabled(gsnd)
+      const ocsnd = await store.get('opencode_sound_enabled')
+      if (typeof ocsnd === 'boolean') setOpencodeSoundEnabled(ocsnd)
+      const hsnd = await store.get('hermes_sound_enabled')
+      if (typeof hsnd === 'boolean') setHermesSoundEnabled(hsnd)
+      const ns = (await store.get('notify_sound')) as string
+      if (ns === 'default' || ns === 'manbo') setNotifySound(ns)
+      const ws = await store.get('waiting_sound')
+      if (typeof ws === 'boolean') setWaitingSound(ws)
+      const acc = await store.get('auto_close_completion')
+      if (typeof acc === 'boolean') setAutoCloseCompletion(acc)
+      const psfx = await store.get('pet_sfx_enabled')
+      if (typeof psfx === 'boolean') { setPetSfxEnabled(psfx); petSfxEnabledRef.current = psfx }
+      const piim = await store.get('pet_idle_interval_min')
+      if (typeof piim === 'number' && Number.isFinite(piim)) {
+        const clamped = Math.min(30, Math.max(0.5, piim))
+        setPetIdleIntervalMin(clamped)
+        petIdleIntervalMinRef.current = clamped
+      }
+      const aet = await store.get('auto_expand_on_task')
+      if (typeof aet === 'boolean') {
+        setAutoExpandOnTask(aet)
+        autoExpandOnTaskRef.current = aet
+      }
+      const lm = await store.get('large_mascot')
+      if (typeof lm === 'boolean' && appModeRef.current !== 'pet') {
+        setLargeMascot(lm)
+        largeMascotRef.current = lm
+      }
+      const lms = await store.get('large_mascot_scale')
+      if (typeof lms === 'number') {
+        const clamped = Math.min(6, Math.max(1, lms))
+        setLargeMascotScale(clamped)
+        largeMascotScaleRef.current = clamped
+      }
+      const pmh = await store.get('panel_max_height')
+      if (typeof pmh === 'number' && pmh >= 200 && pmh <= 500) setPanelMaxHeight(pmh)
+      const hd = await store.get('hover_delay')
+      if (typeof hd === 'number' && hd >= 0 && hd <= 2) {
+        setHoverDelay(hd)
+        hoverDelayRef.current = hd
+      }
+      const ms = await store.get('mascot_scale')
+      if (typeof ms === 'number') {
+        const nextMascotScale = clampMascotScale(ms)
+        setMascotScale(nextMascotScale)
+        mascotScaleRef.current = nextMascotScale
+      }
+      const mp = (await store.get('mascot_position')) as string
+      if (mp === 'left' || mp === 'right') {
+        setMascotPosition(mp)
+        mascotPositionRef.current = mp
+      }
+      const bg = (await store.get('island_bg')) as string
+      if (bg) setIslandBg(bg)
+      const bp = (await store.get('island_bg_pos')) as { x: number; y: number }
+      if (bp) setBgPos(bp)
+      const queue = (await store.get('char_queue')) as string[] | null
+      if (queue && queue.length) setCharQueue(queue)
+      invoke('get_ui_scale')
+        .then((s) => {
+          if (typeof s === 'number' && s > 0) setUiScale(s)
+        })
+        .catch(() => {})
+    })()
+  }, [])
+
+  // Poll Claude/Codex/Cursor sessions
+  useEffect(() => {
+    if (appMode !== 'coding') { setClaudeSessions([]); return }
+    if (!(enableClaudeCode || enableClaudeDesktop || enableCodex || enableCursor || enableGemini || enableOpencode || enableHermes)) {
+      setClaudeSessions([])
+      return
+    }
+    const seenCompletions = new Set<string>(shownCompletionsRef.current)
+    // Track previously logged session statuses so we only emit a backend log
+    // line when something actually changes — keeps oc-claw.log readable.
+    const lastLoggedStatus = new Map<string, string>()
+    const poll = async () => {
+      try {
+        const sessions = (await invoke('get_claude_sessions')) as any[]
+        // Diagnostic (dev only): log the state of every claude session on
+        // each poll change so we can correlate stuck-mascot reports with
+        // backend session state. Only logs on transitions to keep log
+        // volume sane.
+        if (import.meta.env.DEV) {
+          try {
+            const summary = sessions.map((s) => ({
+              id: String(s.sessionId).slice(0, 8),
+              src: s.source,
+              host: s.hostTerminal,
+              st: s.status,
+              tool: s.tool,
+              updAt: s.updatedAt,
+            }))
+            const seenIds = new Set<string>()
+            let changed = false
+            for (const s of sessions) {
+              seenIds.add(s.sessionId)
+              const prev = lastLoggedStatus.get(s.sessionId)
+              const next = `${s.status}|${s.source}|${s.hostTerminal || ''}`
+              if (prev !== next) {
+                lastLoggedStatus.set(s.sessionId, next)
+                changed = true
+              }
+            }
+            for (const id of Array.from(lastLoggedStatus.keys())) {
+              if (!seenIds.has(id)) {
+                lastLoggedStatus.delete(id)
+                changed = true
+              }
+            }
+            if (changed) {
+              invoke('debug_log', { scope: 'poll', msg: `sessions=${sessions.length} ${JSON.stringify(summary)}` }).catch(() => {})
+            }
+          } catch {}
+        }
+        // In efficiency mode, auto-expand panel when a session just completed
+        // with an AI response (lastResponse appeared for the first time).
+        // Mark all newly completed sessions as seen, but only auto-expand
+        // if the session's terminal tab is not currently active AND the user
+        // is not actively typing (keyboard idle > 3s to avoid interruption).
+        const newCompletions: any[] = []
+        for (const s of sessions) {
+          if (s.lastResponse && s.status === 'stopped' && !seenCompletions.has(s.sessionId) && s.source !== 'hermes') {
+            seenCompletions.add(s.sessionId)
+            newCompletions.push(s)
+          }
+        }
+        // Decide whether to pop the completion popup, but DO NOT commit
+        // setCompletionSessionId yet. We need to batch it with
+        // setClaudeSessions(sessions) below so the panel's first frame
+        // already has both the new session list and the new filter state.
+        // Otherwise React renders once with new completionSessionId + stale
+        // claudeSessions (lastResponse not yet present) → user sees the
+        // full session list (image 2) flash before it collapses to the
+        // single completed session (image 1).
+        let completionCandidate: any = null
+        if (newCompletions.length > 0) {
+          let shouldExpand = autoExpandOnTaskRef.current &&
+            !updateModalOpenRef.current &&
+            viewModeRef.current === 'efficiency' &&
+            !expandedRef.current &&
+            !expandingRef.current &&
+            !collapsingRef.current
+          if (shouldExpand) {
+            try {
+              const kbIdle = await invoke('get_keyboard_idle_secs') as number
+              if (kbIdle < 3) shouldExpand = false
+            } catch {}
+          }
+          if (shouldExpand) {
+            const candidate = newCompletions.find(s => !s.isActiveTab) || newCompletions[0]
+            if (candidate && !candidate.isActiveTab) {
+              completionCandidate = candidate
+            }
+          }
+        }
+        // Keep seenCompletions in sync: remove sessions that no longer have
+        // lastResponse (user started a new turn), so the NEXT completion in
+        // the same session can trigger the popup again.
+        for (const sid of seenCompletions) {
+          if (!sessions.find((s: any) => s.sessionId === sid && s.lastResponse)) {
+            seenCompletions.delete(sid)
+            shownCompletionsRef.current.delete(sid)
+          }
+        }
+        // Filter out local Hermes sessions if no local connection is configured
+        const hasLocalHermes = hermesConns.some(c => c.type === 'local')
+        if (!hasLocalHermes) {
+          for (let i = sessions.length - 1; i >= 0; i--) {
+            if (sessions[i].source === 'hermes' && !sessions[i].sessionId?.startsWith('ssh:')) {
+              sessions.splice(i, 1)
+            }
+          }
+        }
+        // Merge remote Hermes sessions from SSH connections
+        const remoteHermesConns = hermesConns.filter(c => c.type === 'remote' && c.host && c.user)
+        if (enableHermes && remoteHermesConns.length > 0) {
+          try {
+            const remoteResults = await Promise.allSettled(
+              remoteHermesConns.map(c => invoke('get_hermes_remote_sessions', { sshHost: c.host, sshUser: c.user }) as Promise<any[]>)
+            )
+            for (let ci = 0; ci < remoteResults.length; ci++) {
+              const r = remoteResults[ci]
+              if (r.status !== 'fulfilled' || !Array.isArray(r.value)) continue
+              const conn = remoteHermesConns[ci]
+              const label = `${conn.user}@${conn.host}`
+              for (const rs of r.value) {
+                if (!rs.active && !rs.updatedAt && !rs.startedAt) continue
+                // Respect frontend dismissal for remote sessions (backend
+                // dismissed never sees these). Revive only when newer activity
+                // arrives after the dismiss time.
+                const sshSid = `ssh:${conn.host}:${rs.sessionId}`
+                const remoteDismissedAt = remoteDismissedRef.current.get(sshSid)
+                if (remoteDismissedAt !== undefined) {
+                  const rsMs = rs.updatedAt ? Date.parse(rs.updatedAt) : (rs.startedAt ? rs.startedAt * 1000 : 0)
+                  if (rsMs > remoteDismissedAt) {
+                    remoteDismissedRef.current.delete(sshSid)
+                  } else {
+                    continue
+                  }
+                }
+                const userPrompt = rs.userPrompt || (rs.messageCount ? `${rs.messageCount} msgs` : '')
+                // Prefer explicit status from remote (distinguishes waiting from stopped),
+                // fall back to active flag for older remote scripts.
+                const remoteStatus: string = rs.status || (rs.active ? 'processing' : 'stopped')
+                sessions.push({
+                  sessionId: sshSid,
+                  status: remoteStatus,
+                  source: 'hermes',
+                  platform: rs.platform || '',
+                  cwd: '',
+                  tool: '',
+                  model: rs.model || '',
+                  hostTerminal: label,
+                  updatedAt: rs.startedAt ? new Date(rs.startedAt * 1000).toISOString() : rs.updatedAt || '',
+                  // Set both shapes: backend Rust uses camelCase via serde rename,
+                  // but a few frontend sites still read snake_case for fallback titles.
+                  userPrompt,
+                  user_prompt: userPrompt,
+                  lastResponse: rs.lastResponse || '',
+                  isActiveTab: false,
+                })
+              }
+            }
+          } catch (e) {
+            console.warn('[hermes-remote] poll error:', e)
+          }
+        }
+
+        // If the completion popup's session disappeared from the poll results,
+        // clear it so the UI doesn't fall back to the full session list.
+        const cid = completionSessionIdRef.current
+        if (cid && !sessions.find((s: any) => s.sessionId === cid && s.lastResponse && s.status === 'stopped')) {
+          completionSessionIdRef.current = null
+          _setCompletionSessionId(null)
+          setEffListCollapsed(false)
+          if (hoverExpandedRef.current) {
+            hoverExpandedRef.current = false
+            collapseFnRef.current?.()
+          }
+        }
+        // Commit sessions + completion popup state in the same sync block so
+        // React batches them: the panel's first render after expand already
+        // has the filtered single-session view, no full-list flash.
+        setClaudeSessions(sessions)
+        if (completionCandidate) {
+          shownCompletionsRef.current.add(completionCandidate.sessionId)
+          hoverExpandedRef.current = true
+          setCompletionSessionId(completionCandidate.sessionId)
+          expandFnRef.current?.()
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+    poll()
+    const t = setInterval(poll, 2000)
+    return () => clearInterval(t)
+  }, [enableClaudeCode, enableClaudeDesktop, enableCodex, enableCursor, enableGemini, enableOpencode, enableHermes, hermesConns, appMode])
+
+  // Listen for Claude/Codex/Cursor task completion → play sound
+  const soundEnabledRef = useRef(soundEnabled)
+  soundEnabledRef.current = soundEnabled
+  const codexSoundEnabledRef = useRef(codexSoundEnabled)
+  codexSoundEnabledRef.current = codexSoundEnabled
+  const cursorSoundEnabledRef = useRef(cursorSoundEnabled)
+  cursorSoundEnabledRef.current = cursorSoundEnabled
+  const geminiSoundEnabledRef = useRef(geminiSoundEnabled)
+  geminiSoundEnabledRef.current = geminiSoundEnabled
+  const opencodeSoundEnabledRef = useRef(opencodeSoundEnabled)
+  opencodeSoundEnabledRef.current = opencodeSoundEnabled
+  const hermesSoundEnabledRef = useRef(hermesSoundEnabled)
+  hermesSoundEnabledRef.current = hermesSoundEnabled
+  const notifySoundRef = useRef(notifySound)
+  notifySoundRef.current = notifySound
+  const waitingSoundRef = useRef(waitingSound)
+  waitingSoundRef.current = waitingSound
+  const autoCloseCompletionRef = useRef(autoCloseCompletion)
+  autoCloseCompletionRef.current = autoCloseCompletion
+  const autoExpandOnTaskRef = useRef(autoExpandOnTask)
+  autoExpandOnTaskRef.current = autoExpandOnTask
+  const autoCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Refs to keep the listener stable while we still respect live toggle changes.
+  const enableClaudeCodeRef = useRef(enableClaudeCode)
+  enableClaudeCodeRef.current = enableClaudeCode
+  const enableClaudeDesktopRef = useRef(enableClaudeDesktop)
+  enableClaudeDesktopRef.current = enableClaudeDesktop
+  useEffect(() => {
+    if (appMode !== 'coding') return
+    if (!(enableClaudeCode || enableClaudeDesktop || enableCodex || enableCursor || enableGemini || enableOpencode || enableHermes)) return
+    const unlisten = listen('claude-task-complete', (ev: any) => {
+      const currentSession = claudeSessionsRef.current.find((s) => s.sessionId === ev.payload?.sessionId)
+      const isCursor = ev.payload?.source === 'cursor' || currentSession?.source === 'cursor'
+      const isCodex = ev.payload?.source === 'codex' || currentSession?.source === 'codex'
+      const isGemini = ev.payload?.source === 'gemini' || currentSession?.source === 'gemini'
+      const isOpencode = ev.payload?.source === 'opencode' || currentSession?.source === 'opencode'
+      const isHermes = ev.payload?.source === 'hermes' || currentSession?.source === 'hermes'
+      const hostTerminal = ev.payload?.hostTerminal || currentSession?.hostTerminal
+      const isClaudeDesktop = !isCursor && !isCodex && !isGemini && !isOpencode && !isHermes && hostTerminal === 'Claude Desktop'
+      const isClaudeCli = !isCursor && !isCodex && !isGemini && !isOpencode && !isHermes && !isClaudeDesktop
+      // Drop the event entirely if the matching listener toggle is off, so
+      // muted streams never trigger auto-expand or completion popups either.
+      if (isClaudeDesktop && !enableClaudeDesktopRef.current) return
+      if (isClaudeCli && !enableClaudeCodeRef.current) return
+      if (ev.payload?.waiting && viewModeRef.current === 'efficiency' && autoExpandOnTaskRef.current) {
+        // Optimistically mark the session as waiting in the same React event
+        // tick as the expand/collapse, so the panel's first frame already
+        // renders the permission popup instead of briefly flashing the full
+        // session list before the async session refetch lands.
+        const sid = ev.payload?.sessionId
+        if (sid) {
+          setClaudeSessions((prev) => prev.map((s) => s.sessionId === sid ? { ...s, status: 'waiting' } : s))
+        }
+        setEffListCollapsed(true)
+        if (!expandedRef.current && expandFnRef.current) {
+          expandFnRef.current()
+        }
+      }
+      const shouldSound = isCursor ? cursorSoundEnabledRef.current : isCodex ? codexSoundEnabledRef.current : isGemini ? geminiSoundEnabledRef.current : isOpencode ? opencodeSoundEnabledRef.current : isHermes ? hermesSoundEnabledRef.current : soundEnabledRef.current
+      if (!shouldSound) return
+      if (ev.payload?.waiting && !waitingSoundRef.current) return
+      if (notifySoundRef.current === 'manbo') {
+        new Audio('/audio/manbo.m4a').play().catch(() => {})
+      } else {
+        playDefaultSound()
+      }
+    })
+    return () => {
+      unlisten.then((fn) => fn())
+    }
+  }, [enableClaudeCode, enableClaudeDesktop, enableCodex, enableCursor, enableGemini, enableOpencode, enableHermes, appMode])
+
+  // Fetch OpenClaw session messages when selected
+  useEffect(() => {
+    if (!selectedSessionKey) {
+      setSessionMessages([])
+      return
+    }
+    let cancelled = false
+    const fetchMsgs = async () => {
+      try {
+        const oc = agentConnMapRef.current.get(selectedSessionKey.agentId) || {}
+        const realId = agentRealIdMapRef.current.get(selectedSessionKey.agentId) || selectedSessionKey.agentId
+        const msgs = (await invoke('get_session_messages', { agentId: realId, sessionKey: selectedSessionKey.key, ...oc })) as any[]
+        if (!cancelled) setSessionMessages(msgs)
+      } catch {
+        if (!cancelled) setSessionMessages([])
+      }
+    }
+    fetchMsgs()
+    const t = setInterval(fetchMsgs, 3000)
+    return () => {
+      cancelled = true
+      clearInterval(t)
+    }
+  }, [selectedSessionKey])
+
+  // Fetch Claude conversation when selected
+  useEffect(() => {
+    if (!selectedClaudeSession) {
+      setClaudeConversation([])
+      return
+    }
+    let cancelled = false
+    const fetch = async () => {
+      try {
+        const msgs = (await invoke('get_claude_conversation', { sessionId: selectedClaudeSession })) as any[]
+        if (!cancelled) setClaudeConversation(msgs)
+      } catch {
+        if (!cancelled) setClaudeConversation([])
+      }
+    }
+    fetch()
+    const t = setInterval(fetch, 3000)
+    return () => {
+      cancelled = true
+      clearInterval(t)
+    }
+  }, [selectedClaudeSession])
+
+  // Fetch agent metrics when selected
+  useEffect(() => {
+    if (!selectedAgentId) {
+      setMetrics(null)
+      setExtraInfo(null)
+      return
+    }
+    let cancelled = false
+    const realId = agentRealIdMapRef.current.get(selectedAgentId) || selectedAgentId
+    const fetchMetrics = async () => {
+      try {
+        const oc = agentConnMapRef.current.get(selectedAgentId) || {}
+        const m = (await invoke('get_agent_metrics', { agentId: realId, ...oc })) as AgentMetrics
+        if (!cancelled) setMetrics(m)
+      } catch {
+        if (!cancelled) setMetrics(null)
+      }
+    }
+    const fetchExtra = async () => {
+      const oc = agentConnMapRef.current.get(selectedAgentId) || {}
+      try {
+        const e = (await invoke('get_agent_extra_info', { agentId: realId, ...oc })) as any
+        if (!cancelled) setExtraInfo(e)
+      } catch {
+        if (!cancelled) setExtraInfo(null)
+      }
+    }
+    fetchMetrics()
+    fetchExtra()
+    const i1 = setInterval(fetchMetrics, 2000)
+    const i2 = setInterval(fetchExtra, 10000)
+    return () => {
+      cancelled = true
+      clearInterval(i1)
+      clearInterval(i2)
+    }
+  }, [selectedAgentId])
+
+  // Build character slots (OpenClaw + Claude Code)
+  const ocSlots: SessionSlot[] = allSessions.slice(0, MAX_SLOTS).map((s, i) => {
+    const agent = agents.find((a) => a.id === s.agentId) || { id: s.agentId }
+    const charName = agentCharMap[s.agentId]
+    const char = characters.find((c) => c.name === charName) || DEFAULT_CHAR
+    return { agentId: s.agentId, sessionIdx: i, agent, char, isWorking: s.active }
+  })
+  // Sessions belonging to a disabled stream (CC CLI / CC Desktop / Codex /
+  // Cursor) must not affect mascot state, slot visualization, or the
+  // task-list views — otherwise a stale "processing" session in a muted
+  // stream keeps the mascot in working state forever.
+  const visibleClaudeSessions = claudeSessions.filter((cs) => {
+    if (cs.source === 'cursor') return enableCursor
+    if (cs.source === 'codex') return enableCodex
+    if (cs.source === 'gemini') return enableGemini
+    if (cs.source === 'opencode') return enableOpencode
+    if (cs.source === 'hermes') return enableHermes
+    const isDesktop = cs.hostTerminal === 'Claude Desktop'
+    return isDesktop ? enableClaudeDesktop : enableClaudeCode
+  })
+  const claudeSlots: SessionSlot[] = visibleClaudeSessions.map((cs, i) => {
+    const isWaiting = cs.status === 'waiting'
+    const isCompacting = cs.status === 'compacting'
+    const isActive = cs.status === 'processing' || cs.status === 'tool_running'
+    const qName = charQueue[i % charQueue.length]
+    const char = characters.find((c) => c.name === qName) || DEFAULT_CHAR
+    const petState: PetState = isWaiting ? 'waiting' : isCompacting ? 'compacting' : isActive ? 'working' : 'idle'
+    return {
+      agentId: `claude:${cs.sessionId}`,
+      sessionIdx: ocSlots.length + i,
+      agent: { id: `claude:${cs.sessionId}`, identityName: 'Claude', identityEmoji: '🤖' },
+      char,
+      isWorking: isActive || isCompacting || isWaiting,
+      petState,
+    }
+  })
+  const sessionSlots = [...ocSlots, ...claudeSlots].slice(0, MAX_SLOTS)
+
+  const expandingRef = useRef(false)
+  const expandFnRef = useRef<(() => void) | null>(null)
+  const hoverExpandedRef = useRef(false)
+  // Track which session triggered auto-expand on completion, so we can
+  // show only that session's completion popup and collapse the rest.
+  // State drives re-render; ref allows reads from async callbacks.
+  const [completionSessionId, _setCompletionSessionId] = useState<string | null>(null)
+  const completionSessionIdRef = useRef<string | null>(null)
+  const [effListCollapsed, setEffListCollapsed] = useState(false)
+  const collapseFnRef = useRef<(() => void) | null>(null)
+  const shownCompletionsRef = useRef(new Set<string>())
+  // Sessions whose permission/clarify popup the user dismissed via "稍后处理".
+  // The session itself stays in the waiting state, but we hide the action
+  // buttons until it leaves waiting and re-enters (next request).
+  const [dismissedWaitingIds, setDismissedWaitingIds] = useState<Set<string>>(new Set())
+  // Clear dismissals once the session is no longer waiting, so the next
+  // permission/clarify cycle re-shows the buttons.
+  useEffect(() => {
+    if (dismissedWaitingIds.size === 0) return
+    const stillWaiting = new Set(
+      claudeSessions.filter((s: any) => s.status === 'waiting').map((s: any) => s.sessionId)
+    )
+    let changed = false
+    const next = new Set(dismissedWaitingIds)
+    for (const id of dismissedWaitingIds) {
+      if (!stillWaiting.has(id)) {
+        next.delete(id)
+        changed = true
+      }
+    }
+    if (changed) setDismissedWaitingIds(next)
+  }, [claudeSessions, dismissedWaitingIds])
+  const setCompletionSessionId = useCallback((id: string | null) => {
+    completionSessionIdRef.current = id
+    _setCompletionSessionId(id)
+    if (id) setEffListCollapsed(true)
+    if (!id) setEffListCollapsed(false)
+    if (autoCloseTimerRef.current) {
+      clearTimeout(autoCloseTimerRef.current)
+      autoCloseTimerRef.current = null
+    }
+    if (id && autoCloseCompletionRef.current) {
+      autoCloseTimerRef.current = setTimeout(() => {
+        completionSessionIdRef.current = null
+        _setCompletionSessionId(null)
+        setEffListCollapsed(false)
+        autoCloseTimerRef.current = null
+        if (hoverExpandedRef.current) {
+          hoverExpandedRef.current = false
+          collapseFnRef.current?.()
+        }
+      }, 5000)
+    }
+  }, [])
+  const hoverCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const hoverOpenTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const syncExpandedWindowLayout = useCallback(async (mode: 'island' | 'efficiency' = viewModeRef.current) => {
+    await invoke('set_mini_expanded', {
+      expanded: true,
+      position: mascotPositionRef.current,
+      efficiency: mode === 'efficiency',
+      maxHeight: panelMaxHeightRef.current,
+      mascotScale: mascotScaleRef.current,
+    })
+    expandedWindowModeRef.current = mode
+  }, [])
+  const expand = useCallback(async () => {
+    if (collapsingRef.current || expandingRef.current) return
+    expandingRef.current = true
+    setHiding(true)
+    // The native window has to be resized + repositioned before the
+    // expanded panel can render correctly. During that transition both
+    // Windows DWM and macOS WindowServer keep compositing the previous
+    // frame, so the collapsed mascot briefly appears at the new (notch-
+    // area) window location before the webview supplies a fresh frame.
+    // Hide the entire document during the transition and reveal it
+    // once the expanded panel has rendered. (Originally a Windows-only
+    // workaround; macOS exhibits the same ghost when hover-opening the
+    // panel from the notch.)
+    document.documentElement.style.opacity = '0'
+    try {
+      await new Promise<void>((r) => setTimeout(r, 50))
+      await syncExpandedWindowLayout(viewModeRef.current)
+      setExpanded(true)
+      expandedRef.current = true
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          setShowPanel(true)
+          document.documentElement.style.opacity = '1'
+        })
+      })
+    } catch (e) {
+      console.warn('[mini] expand failed:', e)
+      setShowPanel(false)
+      setExpanded(false)
+      expandedRef.current = false
+      expandedWindowModeRef.current = null
+      document.documentElement.style.opacity = '1'
+    } finally {
+      setHiding(false)
+      expandingRef.current = false
+    }
+  }, [syncExpandedWindowLayout])
+  expandFnRef.current = expand
+
+  // Coding-mode multi-mascot: a tap on any extra mascot window broadcasts
+  // `extra-mascot-activate`; mirror the primary mascot's click by expanding the
+  // main session panel. No-op in pet mode (no panel) or when already expanded.
+  useEffect(() => {
+    const unlisten = listen('extra-mascot-activate', () => {
+      if (appModeRef.current === 'pet') return
+      if (expandedRef.current || expandingRef.current) return
+      void expandFnRef.current?.()
+    })
+    return () => {
+      unlisten.then((fn) => fn())
+    }
+  }, [])
+
+  // Keep the extra mascot windows in sync with the persisted list. Coding mode
+  // respawns the saved mascots (closing any stale ones first) ONLY when
+  // multi-mascot mode is on; pet mode (or multi-mascot off) tears them all down
+  // so single-mascot mode never shows leftover extras.
+  useEffect(() => {
+    if (appMode == null) return
+    let cancelled = false
+    ;(async () => {
+      const multi = await loadMultiMascotMode()
+      if (appMode === 'coding' && multi) {
+        const configs = await loadExtraMascots()
+        await invoke('close_extra_mascots').catch(() => {})
+        for (const cfg of configs) {
+          if (cancelled) return
+          await invoke('spawn_extra_mascot', {
+            petId: cfg.petId,
+            statusUrl: cfg.statusUrl?.trim() ? cfg.statusUrl.trim() : null,
+          }).catch(() => {})
+        }
+      } else {
+        await invoke('close_extra_mascots').catch(() => {})
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [appMode])
+
+  // Mirror the primary mascot exactly: while the session panel is expanded the
+  // primary mascot is replaced by the panel, so the extra (multi-pet) mascots
+  // must hide too — and reappear when it collapses. Pet mode has none.
+  useEffect(() => {
+    if (appMode !== 'coding') return
+    invoke('set_extra_mascots_hidden', { hidden: expanded }).catch(() => {})
+  }, [expanded, appMode])
+
+  const updateModalWindowAdjustedRef = useRef(false)
+  const updateModalPrevExpandedRef = useRef(false)
+
+  const ensureUpdateModalWindow = useCallback(async () => {
+    if (settingsModeRef.current) return
+    if (updateModalWindowAdjustedRef.current) return
+    updateModalWindowAdjustedRef.current = true
+    updateModalPrevExpandedRef.current = expandedRef.current
+    expandedWindowModeRef.current = null
+    try {
+      await invoke('set_mini_size', { restore: false, position: mascotPositionRef.current, keepOnTop: true, mascotScale: mascotScaleRef.current })
+      await new Promise<void>((r) => setTimeout(r, 80))
+    } catch {
+      updateModalWindowAdjustedRef.current = false
+    }
+  }, [])
+
+  const restoreCollapsedMascotPosition = useCallback(async () => {
+    const pos = customPosRef.current
+    if (!pos) return
+    try {
+      await invoke('set_mini_origin', { x: pos.x, y: pos.y })
+    } catch (e) {
+      console.warn('[mini] restore custom mascot position failed:', e)
+    }
+  }, [])
+
+  const restoreWindowAfterUpdateModal = useCallback(async () => {
+    if (!updateModalWindowAdjustedRef.current) return
+    const wasExpanded = updateModalPrevExpandedRef.current
+    updateModalWindowAdjustedRef.current = false
+    if (settingsModeRef.current) return
+    try {
+      if (wasExpanded) {
+        await syncExpandedWindowLayout(viewModeRef.current)
+        setExpanded(true)
+        expandedRef.current = true
+        setShowPanel(true)
+      } else {
+        await invoke('set_mini_size', { restore: true, position: mascotPositionRef.current, mascotScale: mascotScaleRef.current, largeMascot: true, largeMascotScale: largeMascotScaleRef.current })
+        await restoreCollapsedMascotPosition()
+        setExpanded(false)
+        expandedRef.current = false
+        expandedWindowModeRef.current = null
+        setShowPanel(false)
+      }
+    } catch {}
+  }, [restoreCollapsedMascotPosition, syncExpandedWindowLayout])
+
+  const openAvailableUpdateModal = useCallback(
+    async (info: UpdateModalInfo) => {
+      if (settingsModeRef.current || settingsTransitioningRef.current || isCreateModalOpenRef.current) {
+        pendingUpdateInfoRef.current = info
+        return
+      }
+      setUpdateModalInfo(info)
+      setUpdateModalPhase('available')
+      setUpdateModalProgress(null)
+      setUpdateModalProgressStage('preparing')
+      hoverExpandedRef.current = false
+      if (hoverCloseTimerRef.current) {
+        clearTimeout(hoverCloseTimerRef.current)
+        hoverCloseTimerRef.current = null
+      }
+      setEffListCollapsed(true)
+      await ensureUpdateModalWindow()
+      updateModalOpenRef.current = true
+      setUpdateModalOpen(true)
+    },
+    [ensureUpdateModalWindow],
+  )
+
+  const closeUpdateModal = useCallback(() => {
+    updateModalRunOwnedRef.current = false
+    updateModalOpenRef.current = false
+    setUpdateModalOpen(false)
+    void restoreWindowAfterUpdateModal()
+  }, [restoreWindowAfterUpdateModal])
+
+  const skipCurrentUpdateVersion = useCallback(async () => {
+    if (!updateModalInfo?.latest) return
+    const store = await load('settings.json', { defaults: {}, autoSave: true })
+    await store.set('skipped_update_version', updateModalInfo.latest)
+    await store.save()
+    updateModalRunOwnedRef.current = false
+    updateModalOpenRef.current = false
+    setUpdateModalOpen(false)
+    void restoreWindowAfterUpdateModal()
+  }, [restoreWindowAfterUpdateModal, updateModalInfo?.latest])
+
+  const runUpdateFromModal = useCallback(async () => {
+    if (!updateModalInfo?.url) return
+    setUpdateModalPhase('downloading')
+    setUpdateModalProgress(0)
+    setUpdateModalProgressStage('preparing')
+    updateModalRunOwnedRef.current = true
+    hoverExpandedRef.current = false
+    if (hoverCloseTimerRef.current) {
+      clearTimeout(hoverCloseTimerRef.current)
+      hoverCloseTimerRef.current = null
+    }
+    setEffListCollapsed(true)
+    await ensureUpdateModalWindow()
+    updateModalOpenRef.current = true
+    setUpdateModalOpen(true)
+    try {
+      await invoke('run_update', { dmgUrl: updateModalInfo.url })
+    } catch (e) {
+      console.warn('[update modal] run_update failed:', e)
+      setUpdateModalPhase('available')
+    }
+  }, [ensureUpdateModalWindow, updateModalInfo?.url])
+
+  const restartFromModal = useCallback(() => {
+    invoke('exit_app').catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    const checkForUpdates = async () => {
+      try {
+        // Always fetch — we want the `ui` block (e.g. petdex url) even
+        // when the modal cadence gate skips showing the update prompt.
+        const info = (await invoke('check_for_update', {
+          lang: i18n.language,
+        })) as UpdateModalInfo & { ui?: { petdex?: { url?: string } } | null }
+        if (cancelled) return
+        const remoteUrl = info?.ui?.petdex?.url
+        if (typeof remoteUrl === 'string' && /^https?:\/\//i.test(remoteUrl)) {
+          setPetdexUrl(remoteUrl)
+          setPetdexFailed(false)
+        } else {
+          // Server reachable but field missing/invalid: still treat as
+          // an error from the user's POV so the picker explains itself.
+          setPetdexFailed(true)
+        }
+        // Modal display is still rate-limited to once per day so we
+        // don't pester the user with the "new version" prompt on every
+        // app launch.
+        const store = await load('settings.json', { defaults: {}, autoSave: true })
+        const now = Date.now()
+        const lastCheckedAt = Number((await store.get('update_last_check_at')) ?? 0)
+        if (lastCheckedAt > 0 && now - lastCheckedAt < 86_400_000) return
+        await store.set('update_last_check_at', now)
+        await store.save()
+        if (!info?.hasUpdate) return
+        const skippedVersion = ((await store.get('skipped_update_version')) as string) || ''
+        if (skippedVersion && skippedVersion === info.latest) return
+        openAvailableUpdateModal(info)
+      } catch {
+        // Fetch failed entirely (offline, DNS, server down, etc.).
+        // Surface this to the petdex section via the "failed" flag so
+        // it can show a network error instead of silently breaking.
+        if (!cancelled) setPetdexFailed(true)
+      }
+    }
+    void checkForUpdates()
+    const timer = setInterval(() => {
+      void checkForUpdates()
+    }, 86_400_000)
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+    }
+  }, [i18n.language, openAvailableUpdateModal])
+
+  useEffect(() => {
+    const unlisten = listen<UpdateProgressPayload>('update-progress', (event) => {
+      if (!updateModalOpenRef.current && !updateModalRunOwnedRef.current) return
+      const payload = event.payload
+      const stage = payload.stage || 'downloading'
+      setUpdateModalProgress(typeof payload.progress === 'number' ? payload.progress : null)
+      setUpdateModalProgressStage(stage)
+      if (stage === 'ready_to_restart') {
+        setUpdateModalPhase('ready_to_restart')
+      } else if (stage === 'preparing' || stage === 'downloading' || stage === 'downloaded') {
+        setUpdateModalPhase('downloading')
+      }
+      if (!updateModalOpenRef.current) {
+        void (async () => {
+          await ensureUpdateModalWindow()
+          updateModalOpenRef.current = true
+          setUpdateModalOpen(true)
+        })()
+      }
+    })
+    return () => {
+      unlisten.then((fn) => fn())
+    }
+  }, [ensureUpdateModalWindow])
+
+  useEffect(() => {
+    if (updateModalOpenRef.current) return
+    if (settingsMode || settingsTransitioning || isCreateModalOpen) return
+    const pending = pendingUpdateInfoRef.current
+    if (!pending) return
+    pendingUpdateInfoRef.current = null
+    void openAvailableUpdateModal(pending)
+  }, [isCreateModalOpen, openAvailableUpdateModal, settingsMode, settingsTransitioning])
+
+  useEffect(() => {
+    if (!updateModalOpen || updateModalPhase !== 'available' || !updateModalInfo?.hasUpdate) return
+    let cancelled = false
+    ;(async () => {
+      try {
+        const latest = (await invoke('check_for_update', { lang: i18n.language })) as UpdateModalInfo
+        if (cancelled) return
+        if (latest?.hasUpdate && latest.latest === updateModalInfo.latest) {
+          setUpdateModalInfo(latest)
+        }
+      } catch {
+        /* ignore */
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [i18n.language, updateModalInfo?.hasUpdate, updateModalInfo?.latest, updateModalOpen, updateModalPhase])
+
+  useEffect(() => {
+    return () => {
+      if (largeActionTimerRef.current) clearTimeout(largeActionTimerRef.current)
+    }
+  }, [])
+
+  const handleMascotContextMenu = useCallback((e: React.MouseEvent) => {
+    e.preventDefault()
+  }, [])
+
+  const applyLargeMascotScale = useCallback(async (value: number, persist = true) => {
+    const clamped = clampLargeMascotScale(value)
+    setLargeMascotScale(clamped)
+    largeMascotScaleRef.current = clamped
+    emit('mascot-visual-size', {
+      size: Math.round(MASCOT_BASE_SIZE * mascotScaleRef.current) * clamped,
+    }).catch(() => {})
+
+    if (appModeRef.current === 'pet') {
+      await invoke('set_pet_mode_window', {
+        active: true,
+        mascotScale: mascotScaleRef.current,
+        largeMascotScale: clamped,
+      }).catch(() => {})
+    } else {
+      await invoke('set_mini_expanded', {
+        expanded: false,
+        position: mascotPositionRef.current,
+        efficiency: true,
+        keepPosition: true,
+        mascotScale: mascotScaleRef.current,
+        largeMascot: true,
+        largeMascotScale: clamped,
+      }).catch(() => {})
+    }
+
+    if (persist) {
+      const store = await load('settings.json', { defaults: {}, autoSave: true })
+      await store.set('large_mascot_scale', clamped)
+      await store.save()
+    }
+  }, [])
+
+  useEffect(() => {
+    const unlisten = listen<{ scale?: number }>('mascot-scale-change', (ev) => {
+      const scale = ev.payload?.scale
+      if (typeof scale === 'number') {
+        applyLargeMascotScale(scale, true).catch(() => {})
+      }
+    })
+    return () => {
+      unlisten.then((fn) => fn())
+    }
+  }, [applyLargeMascotScale])
+
+  const handleMascotResizePointerDown = useCallback((e: React.PointerEvent) => {
+    if (e.button !== 0 || e.ctrlKey || collapsingRef.current || expandedRef.current) return
+    if (settingsModeRef.current || settingsTransitioningRef.current) return
+    e.preventDefault()
+    e.stopPropagation()
+    setMascotDragActive(true)
+
+    const startX = e.screenX
+    const startY = e.screenY
+    const startScale = largeMascotScaleRef.current
+    const startSize = Math.round(MASCOT_BASE_SIZE * mascotScaleRef.current) * startScale
+    const baseSize = Math.max(1, Math.round(MASCOT_BASE_SIZE * mascotScaleRef.current))
+    const aspect = 208 / 192
+    const pid = e.pointerId
+    let rafId: number | null = null
+    let latestScale = startScale
+    let applying = false
+    let dirty = false
+
+    const flush = () => {
+      rafId = null
+      if (applying) {
+        dirty = true
+        return
+      }
+      applying = true
+      applyLargeMascotScale(latestScale, false)
+        .finally(() => {
+          applying = false
+          if (dirty) {
+            dirty = false
+            schedule()
+          }
+        })
+    }
+
+    const schedule = () => {
+      if (rafId !== null) return
+      rafId = requestAnimationFrame(flush)
+    }
+
+    const onMove = (ev: PointerEvent) => {
+      if (ev.pointerId !== pid) return
+      const dx = ev.screenX - startX
+      const dy = ev.screenY - startY
+      const targetSize = startSize + Math.max(dx, dy / aspect)
+      latestScale = clampLargeMascotScale(targetSize / baseSize)
+      schedule()
+    }
+
+    const cleanup = async () => {
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId)
+        rafId = null
+      }
+      setMascotDragActive(false)
+      updateWalkDir(0)
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onCancel)
+      await applyLargeMascotScale(latestScale, true)
+    }
+
+    const onUp = (ev: PointerEvent) => {
+      if (ev.pointerId !== pid) return
+      cleanup().catch(() => {})
+    }
+
+    const onCancel = (ev: PointerEvent) => {
+      if (ev.pointerId !== pid) return
+      cleanup().catch(() => {})
+    }
+
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp, { once: true })
+    window.addEventListener('pointercancel', onCancel, { once: true })
+  }, [applyLargeMascotScale])
+
+
+  const handleMascotPointerDown = useCallback(
+    (e: React.PointerEvent) => {
+      // Pet mode: right-click / ctrl+click toggles context menu
+      const isRightClick = e.button === 2 || (e.button === 0 && e.ctrlKey)
+      if (isRightClick && appModeRef.current === 'pet' && largeMascotRef.current) {
+        e.preventDefault()
+        e.stopPropagation()
+        if (petContextMenuTransitionRef.current) return
+        if (!petContextMenuOpenRef.current) {
+          petContextMenuTransitionRef.current = true
+          const winW = petBaseWinWRef.current ?? window.innerWidth ?? 300
+          const mascotW = MASCOT_BASE_SIZE * mascotScaleRef.current * largeMascotScaleRef.current
+          Promise.all([
+            invoke('get_mini_origin'),
+            invoke('get_mini_monitor_rect'),
+          ]).then(async ([pos, rect]) => {
+            const [x] = pos as [number, number]
+            const [monitorX, , monitorW] = rect as [number, number, number, number]
+            const monitorMid = monitorX + monitorW / 2
+            const mascotLeft = x + winW - mascotW
+            const side = mascotLeft < monitorMid ? 'right' : 'left'
+            setPetMenuSide(side)
+            setPetContextMenuOpen(true)
+            petContextMenuOpenRef.current = true
+            await invoke('set_pet_context_menu', { open: true, side }).catch(() => {})
+          }).catch(() => {}).finally(() => {
+            petContextMenuTransitionRef.current = false
+          })
+        } else {
+          void closePetContextMenu()
+        }
+        return
+      }
+      // Coding mode collapsed mascot: drag to reposition, click (no movement)
+      // to expand the panel. Drag direction is mirrored into the codex
+      // sprite via updateWalkDir so the pet visibly runs while moving.
+      if (!moveModeRef.current && appModeRef.current !== 'pet') {
+        if (e.button !== 0 || e.ctrlKey || collapsingRef.current) return
+        // On macOS the cursor poll in lib.rs (efficiency_hover_poll) drives
+        // the drag itself via translate_mini_frame + mini-mascot-walk events.
+        // Letting the webview path also call move_mini_by would double the
+        // motion, so swallow the pointerdown here and rely on the Rust
+        // poll for translation + walk-dir + persistence.
+        if (!isWindowsPlatform) {
+          e.preventDefault()
+          return
+        }
+        // The window-focus auto-expand fires slightly before pointerdown
+        // when clicking an unfocused mini window. Cancel it so this click
+        // path is the single source of truth for expand vs drag —
+        // otherwise a quick wiggle ends up dragging the auto-expanded
+        // panel.
+        cancelFocusExpand()
+        e.preventDefault()
+        setMascotDragActive(true)
+        const startScreenX = e.screenX
+        const startScreenY = e.screenY
+        let lastScreenX = e.screenX
+        let dragging = false
+        const pid = e.pointerId
+        const DRAG_THRESHOLD = 3
+
+        // Capture the window's logical origin once at pointerdown so we can
+        // drive the drag with absolute positioning. The previous `move_mini_by`
+        // path read `outer_position()` on every event, dividing by scale
+        // factor to convert physical→logical and then re-multiplying inside
+        // Tauri to set the new position. Repeated rounding plus the chance
+        // that a fast burst of events would read a stale (not-yet-applied)
+        // position made the window drift away from the cursor on high-DPI
+        // monitors. Absolute positioning side-steps both problems.
+        let originX = 0
+        let originY = 0
+        let originLoaded = false
+        invoke<[number, number]>('get_mini_origin')
+          .then(([x, y]) => {
+            originX = x
+            originY = y
+            originLoaded = true
+          })
+          .catch(() => {})
+
+        const onMove = (ev: PointerEvent) => {
+          if (ev.pointerId !== pid) return
+          const dxTotal = ev.screenX - startScreenX
+          const dyTotal = ev.screenY - startScreenY
+          if (!dragging) {
+            if (Math.abs(dxTotal) + Math.abs(dyTotal) >= DRAG_THRESHOLD) {
+              dragging = true
+            } else {
+              return
+            }
+          }
+          if (!originLoaded) return
+          // confine=false so the user can drag the mascot across to a
+          // neighbouring monitor without hitting the per-monitor clamp.
+          invoke('set_mini_origin', { x: originX + dxTotal, y: originY + dyTotal, confine: false }).catch(() => {})
+          const dxStep = ev.screenX - lastScreenX
+          lastScreenX = ev.screenX
+          if (dxStep !== 0) updateWalkDir(dxStep > 0 ? 1 : -1)
+        }
+
+        const cleanup = () => {
+          setMascotDragActive(false)
+          updateWalkDir(0)
+          window.removeEventListener('pointermove', onMove)
+          window.removeEventListener('pointerup', onUp)
+          window.removeEventListener('pointercancel', onCancel)
+        }
+
+        const onCancel = (ev: PointerEvent) => {
+          if (ev.pointerId !== pid) return
+          cleanup()
+        }
+
+        const onUp = (ev: PointerEvent) => {
+          if (ev.pointerId !== pid) return
+          cleanup()
+          if (!dragging) {
+            // macOS opens the panel via notch hover (efficiency_hover_poll),
+            // so a tap on the mascot stays a no-op there. Windows has no
+            // notch detection, so a tap is the only way to open the panel.
+            if (isWindowsPlatform) {
+              hoverExpandedRef.current = false
+              setCompletionSessionId(null)
+              expand()
+            }
+          } else {
+            invoke('get_mini_origin').then(async (pos) => {
+              const [x, y] = pos as [number, number]
+              customPosRef.current = { x, y }
+              const store = await load('settings.json', { defaults: {}, autoSave: true })
+              await store.set('mini_custom_pos', { x, y })
+              await store.save()
+            }).catch(() => {})
+          }
+        }
+
+        window.addEventListener('pointermove', onMove)
+        window.addEventListener('pointerup', onUp, { once: true })
+        window.addEventListener('pointercancel', onCancel, { once: true })
+        return
+      }
+      if (e.button !== 0 || e.ctrlKey || collapsingRef.current) return
+      const isMoveMode = moveModeRef.current
+      const target = e.currentTarget as HTMLElement
+      // Keep large mascot visual size unchanged, but shrink the effective hitbox.
+      // Apply the same hitbox rule to peek as well; otherwise peek ends up with
+      // an oversized full-rect click area that can trigger without touching the pet.
+      if (!isMoveMode && largeMascotRef.current) {
+        const visualSize = MASCOT_BASE_SIZE * mascotScaleRef.current * largeMascotScaleRef.current
+        const isPeek = currentPetActionRef.current === 'peek'
+        // During peek the character only pokes out a thin slice at one edge,
+        // so use a narrower side-aligned hitbox instead of the centered one.
+        // PEEK_HIT_WIDTH_RATIO mirrors the visual cursor strip width.
+        const hitWidth = isPeek
+          ? visualSize * PEEK_HIT_WIDTH_RATIO
+          : MASCOT_BASE_SIZE * mascotScaleRef.current * (LARGE_MASCOT_HITBOX_WIDTH_MULTIPLIER / 3 * largeMascotScaleRef.current)
+        const hitHeight = MASCOT_BASE_SIZE * mascotScaleRef.current * (LARGE_MASCOT_HITBOX_HEIGHT_MULTIPLIER / 3 * largeMascotScaleRef.current)
+        const insetY = Math.max(0, (visualSize - hitHeight) / 2)
+        const rect = target.getBoundingClientRect()
+        const localX = e.clientX - rect.left
+        const localY = e.clientY - rect.top
+        let hitLeft: number
+        let hitRight: number
+        if (isPeek) {
+          if (peekEdgeRef.current === 'left') {
+            hitLeft = 0
+            hitRight = hitWidth
+          } else {
+            hitLeft = visualSize - hitWidth
+            hitRight = visualSize
+          }
+        } else {
+          const insetX = Math.max(0, (visualSize - hitWidth) / 2)
+          hitLeft = insetX
+          hitRight = visualSize - insetX
+        }
+        if (localX < hitLeft || localX > hitRight || localY < insetY || localY > visualSize - insetY) return
+      }
+
+      // Large mascot normal mode: drag to move window, click for angry/spin
+      // Block drag and clicks during pomodoro
+      if (!isMoveMode && largeMascotRef.current && pomodoroRef.current?.active) return
+      if (!isMoveMode && largeMascotRef.current) {
+        e.preventDefault()
+        setMascotDragActive(true)
+        let lastX = e.screenX
+        let lastY = e.screenY
+        let dragging = false
+        const pid = e.pointerId
+
+        const onMove = (ev: PointerEvent) => {
+          if (ev.pointerId !== pid) return
+          if (!dragging) {
+            if (Math.abs(ev.screenX - lastX) + Math.abs(ev.screenY - lastY) >= 3) {
+              dragging = true
+              setLargePetAction('grasp')
+              largePetActionRef.current = 'grasp'
+              playPetAudio('grasp')
+              if (appModeRef.current === 'pet') {
+                setCurrentPetAction('grasp')
+                currentPetActionRef.current = 'grasp'
+              }
+            } else return
+          }
+          const dx = ev.screenX - lastX
+          const dy = ev.screenY - lastY
+          lastX = ev.screenX
+          lastY = ev.screenY
+          if (dx !== 0 || dy !== 0) invoke('move_mini_by', { dx, dy })
+        }
+
+        const cleanup = () => {
+          setMascotDragActive(false)
+          if (largePetActionRef.current === 'grasp') {
+            setLargePetAction(null)
+            largePetActionRef.current = null
+            if (appModeRef.current === 'pet') {
+              checkEdgeAndSetPeek()
+            }
+          }
+          window.removeEventListener('pointermove', onMove)
+          window.removeEventListener('pointerup', onUp)
+          window.removeEventListener('pointercancel', onCancelLarge)
+        }
+
+        const onCancelLarge = (ev: PointerEvent) => {
+          if (ev.pointerId !== pid) return
+          cleanup()
+        }
+
+        const onUp = (ev: PointerEvent) => {
+          if (ev.pointerId !== pid) return
+          cleanup()
+          if (dragging) {
+            invoke('get_mini_origin').then(async (pos) => {
+              const [x, y] = pos as [number, number]
+              customPosRef.current = { x, y }
+              const store = await load('settings.json', { defaults: {}, autoSave: true })
+              await store.set('mini_custom_pos', { x, y })
+              await store.save()
+            })
+          } else {
+            if (appModeRef.current === 'pet') {
+              if (currentPetActionRef.current === 'peek') {
+                handleSetPetAction('walkout')
+                playPetAudio('walkout')
+              } else {
+                // Pet mode click: headpat based on affection tier
+                const tier = getAffectionTier(petDataRef.current.affection)
+                if (tier === 'angry') {
+                  handleSetPetAction('angry')
+                  playPetAudio('angry')
+                } else if (tier === 'shy') {
+                  const updated = applyHeadpat(petDataRef.current)
+                  handleUpdatePetData(updated)
+                  handleSetPetAction('spin')
+                  playPetAudio('spin')
+                } else {
+                  const updated = applyHeadpat(petDataRef.current)
+                  handleUpdatePetData(updated)
+                  handleSetPetAction('headpat')
+                  playPetAudio('headpat')
+                }
+              }
+            } else if (isWindowsPlatform) {
+              // Coding mode: tap-to-open is Windows-only. macOS uses the
+              // notch-hover poll instead so the click stays a no-op.
+              hoverExpandedRef.current = false
+              setCompletionSessionId(null)
+              expand()
+            }
+          }
+        }
+
+        window.addEventListener('pointermove', onMove)
+        window.addEventListener('pointerup', onUp, { once: true })
+        window.addEventListener('pointercancel', onCancelLarge, { once: true })
+        return
+      }
+
+      // Normal mode (small mascot): click to expand (coding mode only)
+      if (!isMoveMode) {
+        if (appModeRef.current === 'pet') return // no panel in pet mode
+        hoverExpandedRef.current = false
+        setCompletionSessionId(null)
+        expand()
+        return
+      }
+
+      // Move mode: drag to reposition, click to exit.
+      // Listen on `window` instead of the element so that pointer events
+      // keep arriving even when macOS blurs/refocuses the webview during
+      // a native window move (which kills pointer capture and fires
+      // lostpointercapture, aborting the first drag attempt).
+      e.preventDefault()
+      setMascotDragActive(true)
+
+      let lastX = e.screenX
+      let lastY = e.screenY
+      let dragging = false
+      const pid = e.pointerId
+
+      const onMove = (ev: PointerEvent) => {
+        if (ev.pointerId !== pid) return
+        if (!dragging) {
+          if (Math.abs(ev.screenX - lastX) + Math.abs(ev.screenY - lastY) >= MOVE_DRAG_THRESHOLD) {
+            dragging = true
+            if (largeMascotRef.current) {
+              setLargePetAction('grasp')
+              largePetActionRef.current = 'grasp'
+              if (appModeRef.current === 'pet') {
+                setCurrentPetAction('grasp')
+                currentPetActionRef.current = 'grasp'
+              }
+            }
+          } else return
+        }
+        const dx = ev.screenX - lastX
+        const dy = ev.screenY - lastY
+        lastX = ev.screenX
+        lastY = ev.screenY
+        if (dx !== 0 || dy !== 0) {
+          invoke('move_mini_by', { dx, dy })
+          if (dx !== 0) updateWalkDir(dx > 0 ? 1 : -1)
+        }
+      }
+
+      const cleanup = () => {
+        setMascotDragActive(false)
+        updateWalkDir(0)
+        if (largeMascotRef.current && largePetActionRef.current === 'grasp') {
+          setLargePetAction(null)
+          largePetActionRef.current = null
+          if (appModeRef.current === 'pet') {
+            checkEdgeAndSetPeek()
+          }
+        }
+        window.removeEventListener('pointermove', onMove)
+        window.removeEventListener('pointerup', onUp)
+        window.removeEventListener('pointercancel', onCancel)
+      }
+
+      const onCancel = (ev: PointerEvent) => {
+        if (ev.pointerId !== pid) return
+        cleanup()
+      }
+
+      const onUp = (ev: PointerEvent) => {
+        if (ev.pointerId !== pid) return
+        cleanup()
+        if (!dragging) {
+          // Ignore accidental click-up right after entering move mode.
+          if (Date.now() - moveModeActivatedAtRef.current < 700) return
+          setMoveMode(false)
+          document.body.style.cursor = 'pointer'
+          requestAnimationFrame(() => {
+            document.body.style.cursor = ''
+          })
+        } else {
+          invoke('get_mini_origin').then(async (pos) => {
+            const [x, y] = pos as [number, number]
+            customPosRef.current = { x, y }
+            const store = await load('settings.json', { defaults: {}, autoSave: true })
+            await store.set('mini_custom_pos', { x, y })
+            await store.save()
+          })
+        }
+      }
+
+      window.addEventListener('pointermove', onMove)
+      window.addEventListener('pointerup', onUp)
+      window.addEventListener('pointercancel', onCancel)
+    },
+    [expand, updateWalkDir, cancelFocusExpand],
+  )
+
+  const collapse = useCallback(async () => {
+    if (collapsingRef.current) return
+    // Defense in depth: while a native folder picker is in flight (or its
+    // post-close grace window is still active), don't tear down the
+    // expanded/settings UI underneath it.
+    if (isSettingsPickerBlockingClose()) {
+      debugToTerminal('close', 'collapse blocked: settings picker active')
+      return
+    }
+    // The enter/exit-settings transition resizes the native window which
+    // can momentarily steal focus → onBlur → collapse. Skip collapse
+    // while we're mid-transition so the UI we're building isn't torn
+    // down before it appears.
+    if (settingsTransitioningRef.current) return
+    debugToTerminal('close', 'collapse proceed')
+    collapsingRef.current = true
+    hoverExpandedRef.current = false
+    // Intentionally DO NOT clear completionSessionId / effListCollapsed here.
+    // While the panel fades out (opacity 1 → 0 over panelChromeTransition),
+    // the content is still mounted. Clearing the popup state mid-fade would
+    // re-render the panel back to the full session list under the fading
+    // overlay — visible as a "list flash" before the panel actually goes
+    // away. We reset both inside the setTimeout below, after setExpanded
+    // unmounts the panel content.
+    if (hoverCloseTimerRef.current) {
+      clearTimeout(hoverCloseTimerRef.current)
+      hoverCloseTimerRef.current = null
+    }
+    setIsCreateModalOpen(false)
+    setShowPanel(false)
+    setSelectedAgentId(null)
+    setSelectedClaudeSession(null)
+    setSelectedSessionKey(null)
+    setShowClaudeStats(false)
+    const wasSettings = settingsModeRef.current
+    if (wasSettings) {
+      setShowSettingsOverlay(false)
+      setSettingsTransitioning(true)
+    }
+    const delay = isWindowsPlatform ? 150 : wasSettings ? 280 : 480
+    setTimeout(async () => {
+      debugToTerminal('close', `collapse timeout fired (wasSettings=${wasSettings})`)
+      settingsPickerOpenRef.current = false
+      settingsModeRef.current = false
+      setSettingsMode(false)
+      setShowSettingsOverlay(false)
+      if (wasSettings) {
+        setSettingsNav('pairing')
+        // Keep outside-click close behavior consistent with clicking "X":
+        // re-sync feature toggles from store immediately.
+        try {
+          const store = await load('settings.json', { defaults: {}, autoSave: true })
+          const cc = await store.get('enable_claudecode')
+          setEnableClaudeCode(cc !== false)
+          const ccDesktop = await store.get('enable_claude_desktop')
+          setEnableClaudeDesktop(ccDesktop !== false)
+          const cod = await store.get('enable_codex')
+          setEnableCodex(cod !== false)
+          const cur = await store.get('enable_cursor')
+          setEnableCursor(cur !== false)
+          const gem = await store.get('enable_gemini')
+          setEnableGemini(gem !== false)
+          const oc = await store.get('enable_opencode')
+          setEnableOpencode(oc !== false)
+          const hcn = await store.get('hermes_connections') as { id: string; type: 'local' | 'remote'; host?: string; user?: string }[] | null
+          if (hcn) setHermesConns(hcn)
+        } catch {}
+        // Trigger immediate refresh so config changes are reflected right away.
+        fetchAgents()
+      }
+      setHiding(true)
+      // Unmount the expanded React tree before shrinking/repositioning the
+      // native Tauri window. Otherwise the last frames of the expanded panel
+      // can render inside the collapsed window geometry and look like a flicker.
+      setExpanded(false)
+      expandedRef.current = false
+      expandedWindowModeRef.current = null
+      // Now that the expanded panel is unmounted, it's safe to clear the
+      // completion popup state (which also resets effListCollapsed → false).
+      // Doing it earlier would cause the fading panel to flash the full
+      // session list before going away.
+      setCompletionSessionId(null)
+      // Hide the entire document during the resize→reposition pair below.
+      // `set_mini_expanded(expanded:false)` first parks the window at the
+      // default collapsed slot (right-near-notch); only the follow-up
+      // set_mini_origin moves it to the saved customPos. Without this
+      // mask, both Windows DWM and macOS WindowServer keep compositing
+      // the in-flight frame, which the user sees as the mascot flashing
+      // at the notch position before snapping to its real spot.
+      document.documentElement.style.opacity = '0'
+      try {
+        await new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())))
+        if (wasSettings && appModeRef.current === 'pet' && largeMascotRef.current) {
+          await invoke('set_mini_expanded', { expanded: false, position: mascotPositionRef.current, efficiency: true, mascotScale: mascotScaleRef.current, largeMascot: true, largeMascotScale: largeMascotScaleRef.current }).catch(() => {})
+          await invoke('set_pet_mode_window', { active: true, mascotScale: mascotScaleRef.current, largeMascotScale: largeMascotScaleRef.current }).catch(() => {})
+          if (petOriginBeforeSettingsRef.current) {
+            const [x, y] = petOriginBeforeSettingsRef.current
+            await invoke('set_mini_origin', { x, y }).catch(() => {})
+            petOriginBeforeSettingsRef.current = null
+          }
+        } else if (wasSettings) {
+          await invoke('set_mini_size', { restore: true, position: mascotPositionRef.current, mascotScale: mascotScaleRef.current, largeMascot: true, largeMascotScale: largeMascotScaleRef.current })
+          await restoreCollapsedMascotPosition()
+        } else {
+          await invoke('set_mini_expanded', {
+            expanded: false,
+            position: mascotPositionRef.current,
+            efficiency: viewModeRef.current === 'efficiency',
+            mascotScale: mascotScaleRef.current,
+            largeMascot: true,
+            largeMascotScale: largeMascotScaleRef.current,
+          })
+          await restoreCollapsedMascotPosition()
+        }
+      } catch {
+        /* ensure hiding is always cleared */
+      }
+      // Even if the native resize invoke fails, always clear the hiding shell so
+      // the mascot becomes visible again instead of getting stuck transparent.
+      setHiding(false)
+      setSettingsTransitioning(false)
+      // One more rAF after setHiding(false) so React commits the
+      // collapsed mascot tree at the new (correct) window geometry
+      // before we lift the document mask. Lifting too early flashes
+      // the empty webview through the transparent window.
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          document.documentElement.style.opacity = '1'
+        })
+      })
+      // Brief cooldown to prevent focus event from immediately re-expanding
+      setTimeout(() => {
+        collapsingRef.current = false
+        settingsTransitioningRef.current = false
+      }, 300)
+    }, delay)
+  }, [fetchAgents, restoreCollapsedMascotPosition, debugToTerminal, isSettingsPickerBlockingClose])
+  collapseFnRef.current = collapse
+
+  // ── Efficiency-mode notch hover tracking (native cursor polling) ──
+  // On macOS the mini window sits in the menu-bar / notch area where the
+  // system intercepts mouse events, so web-level onMouseEnter never fires.
+  // A Rust-side 50ms poll of NSEvent.mouseLocation emits "efficiency-hover"
+  // events which we handle here to open / close the panel on hover.
+  useEffect(() => {
+    if (appMode === 'pet') {
+      invoke('set_efficiency_hover_tracking', { active: false }).catch(() => {})
+    } else if (viewMode === 'efficiency' && !moveMode && !updateModalOpen && !settingsMode && !settingsTransitioning) {
+      invoke('set_efficiency_hover_tracking', { active: true }).catch(() => {})
+    } else {
+      invoke('set_efficiency_hover_tracking', { active: false }).catch(() => {})
+    }
+    return () => {
+      invoke('set_efficiency_hover_tracking', { active: false }).catch(() => {})
+    }
+  }, [viewMode, moveMode, updateModalOpen, settingsMode, settingsTransitioning, appMode])
+
+  // Bridge the Rust cursor poll's `mini-mascot-hover` event to local state
+  // so the codex sprite can play its jump animation on hover even before
+  // the user has focused the mini window. macOS does not deliver
+  // mouseEntered to non-key floating windows, which is why webview-only
+  // hover handling alone leaves the mascot frozen until first click.
+  useEffect(() => {
+    if (appMode === 'pet') return
+    const unlisten = listen<boolean>('mini-mascot-hover', (event) => {
+      setMascotHover(!!event.payload)
+    })
+    return () => {
+      unlisten.then((fn) => fn())
+    }
+  }, [appMode])
+
+  // Mirror the run-left/run-right sprite state during a Rust-driven drag.
+  // The poll thread emits walk-dir = -1 / 1 / 0 as the user drags the
+  // mascot horizontally so the sprite matches the drag direction.
+  useEffect(() => {
+    if (appMode === 'pet') return
+    const unlisten = listen<number>('mini-mascot-walk', (event) => {
+      const dir = event.payload
+      if (dir === 1 || dir === -1 || dir === 0) {
+        updateWalkDir(dir)
+      }
+    })
+    return () => {
+      unlisten.then((fn) => fn())
+    }
+  }, [appMode, updateWalkDir])
+
+  // Persist the mascot's new origin after a Rust-driven drag finishes so
+  // the position survives across collapsed/expanded mode switches.
+  useEffect(() => {
+    if (appMode === 'pet') return
+    const unlisten = listen('mini-mascot-drag-end', async () => {
+      try {
+        const pos = (await invoke('get_mini_origin')) as [number, number]
+        const [x, y] = pos
+        customPosRef.current = { x, y }
+        const store = await load('settings.json', { defaults: {}, autoSave: true })
+        await store.set('mini_custom_pos', { x, y })
+        await store.save()
+      } catch {
+        /* ignore */
+      }
+    })
+    return () => {
+      unlisten.then((fn) => fn())
+    }
+  }, [appMode])
+
+  useEffect(() => {
+    if (viewMode !== 'efficiency' || appMode === 'pet') return
+    const unlisten = listen<boolean>('efficiency-hover', (event) => {
+      if (settingsModeRef.current || settingsTransitioningRef.current) {
+        return
+      }
+      if (updateModalOpenRef.current) {
+        if (hoverCloseTimerRef.current) {
+          clearTimeout(hoverCloseTimerRef.current)
+          hoverCloseTimerRef.current = null
+        }
+        return
+      }
+      if (event.payload) {
+        if (hoverCloseTimerRef.current) {
+          clearTimeout(hoverCloseTimerRef.current)
+          hoverCloseTimerRef.current = null
+        }
+        if (!expandedRef.current && !collapsingRef.current && !expandingRef.current && !moveModeRef.current && !hoverOpenTimerRef.current) {
+          const delayMs = Math.round(hoverDelayRef.current * 1000)
+          if (delayMs <= 0) {
+            hoverExpandedRef.current = true
+            expandFnRef.current?.()
+          } else {
+            hoverOpenTimerRef.current = setTimeout(() => {
+              hoverOpenTimerRef.current = null
+              if (!expandedRef.current && !collapsingRef.current && !expandingRef.current && !moveModeRef.current) {
+                hoverExpandedRef.current = true
+                expandFnRef.current?.()
+              }
+            }, delayMs)
+          }
+        }
+      } else {
+        if (hoverOpenTimerRef.current) {
+          clearTimeout(hoverOpenTimerRef.current)
+          hoverOpenTimerRef.current = null
+        }
+        if (expandedRef.current && hoverExpandedRef.current && !pinnedRef.current) {
+          hoverCloseTimerRef.current = setTimeout(() => {
+            hoverExpandedRef.current = false
+            hoverCloseTimerRef.current = null
+            collapse()
+          }, 300)
+        }
+      }
+    })
+    return () => {
+      unlisten.then((fn) => fn())
+      if (hoverOpenTimerRef.current) {
+        clearTimeout(hoverOpenTimerRef.current)
+        hoverOpenTimerRef.current = null
+      }
+    }
+  }, [viewMode, collapse, appMode])
+
+  const petOriginBeforeSettingsRef = useRef<[number, number] | null>(null)
+
+  const enterSettings = useCallback(async () => {
+    if (settingsModeRef.current || settingsTransitioningRef.current) return
+    settingsPickerOpenRef.current = false
+    hoverExpandedRef.current = false
+    settingsTransitioningRef.current = true
+    setSelectedAgentId(null)
+    setSelectedClaudeSession(null)
+    setSelectedSessionKey(null)
+    setShowClaudeStats(false)
+    setSettingsNav(appModeRef.current === 'pet' ? 'settings' : 'pairing')
+    // Save pet mode window origin so we can restore it exactly
+    if (appModeRef.current === 'pet') {
+      try {
+        const pos = await invoke('get_mini_origin') as [number, number]
+        petOriginBeforeSettingsRef.current = pos
+      } catch {}
+    }
+    setShowSettingsOverlay(false)
+    setSettingsTransitioning(true)
+    // Stop pet passthrough poll before resizing to settings mode
+    if (appModeRef.current === 'pet') {
+      await invoke('set_pet_mode_window', { active: false, mascotScale: mascotScaleRef.current, largeMascotScale: largeMascotScaleRef.current }).catch(() => {})
+    }
+    await new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())))
+    try {
+      await invoke('set_mini_size', { restore: false, position: mascotPositionRef.current, mascotScale: mascotScaleRef.current })
+    } catch {}
+    settingsModeRef.current = true
+    setSettingsMode(true)
+    setShowSettingsOverlay(true)
+    setSettingsTransitioning(false)
+    settingsTransitioningRef.current = false
+  }, [])
+
+  // `force` is set when the close path is a trusted, in-app user action
+  // (e.g. clicking the ✕ button). Untrusted paths (blur / backdrop click)
+  // still go through the picker-grace guard so macOS-synthesised events
+  // can't tear settings down right after a native dialog closes.
+  const exitSettings = useCallback(async (force = false) => {
+    if (!settingsModeRef.current || settingsTransitioningRef.current) return
+    if (!force && isSettingsPickerBlockingClose()) {
+      debugToTerminal('close', 'exitSettings blocked: settings picker active')
+      return
+    }
+    if (force) {
+      // The X button click is the user explicitly asking to close.
+      // Drop any lingering picker grace so subsequent blurs / outside
+      // clicks during the close animation don't double-fire spurious
+      // collapses on the now-closed settings panel.
+      settingsPickerOpenRef.current = false
+      settingsPickerCloseGraceUntilRef.current = 0
+      if (nativeDialogActiveRef.current) {
+        setNativeDialogActive(false)
+      }
+    }
+    debugToTerminal('close', `exitSettings proceed force=${force}`)
+    setIsCreateModalOpen(false)
+    settingsTransitioningRef.current = true
+    setShowSettingsOverlay(false)
+    try {
+      await new Promise<void>((r) => setTimeout(r, 220))
+      setSettingsTransitioning(true)
+      settingsModeRef.current = false
+      setSettingsMode(false)
+      setSettingsNav('pairing')
+      // Always return to collapsed visual state when leaving settings.
+      // Hide the collapsed mascot tree until the native window has been
+      // resized + repositioned. Without this guard React would render the
+      // collapsed mascot inside the still-large settings window, briefly
+      // showing it centred in the old (settings) frame before Rust snaps
+      // the window back — visually that looks like the mascot teleports.
+      setHiding(true)
+      setShowPanel(false)
+      setExpanded(false)
+      expandedRef.current = false
+      expandedWindowModeRef.current = null
+      if (appModeRef.current === 'pet' && largeMascotRef.current) {
+        // Pet mode: restore pet-sized window directly, skip syncExpandedWindowLayout
+        await invoke('set_mini_expanded', { expanded: false, position: mascotPositionRef.current, efficiency: true, mascotScale: mascotScaleRef.current, largeMascot: true, largeMascotScale: largeMascotScaleRef.current }).catch(() => {})
+        await invoke('set_pet_mode_window', { active: true, mascotScale: mascotScaleRef.current, largeMascotScale: largeMascotScaleRef.current }).catch(() => {})
+        // Restore exact window position saved before entering settings
+        if (petOriginBeforeSettingsRef.current) {
+          const [x, y] = petOriginBeforeSettingsRef.current
+          await invoke('set_mini_origin', { x, y }).catch(() => {})
+          petOriginBeforeSettingsRef.current = null
+        }
+      } else {
+        // Coding mode: re-sync feature toggles and restore the COLLAPSED
+        // mascot window, matching React's `setExpanded(false)` above.
+        // Previously this called `syncExpandedWindowLayout`, which sized
+        // the window for the expanded panel (600x350 top-center). The
+        // collapsed mascot React tree then rendered flex-centered at the
+        // top of that big window — visually the mascot teleported under
+        // the notch on macOS.
+        const store = await load('settings.json', { defaults: {}, autoSave: true })
+        const cc = await store.get('enable_claudecode')
+        setEnableClaudeCode(cc !== false)
+        const ccDesktop = await store.get('enable_claude_desktop')
+        setEnableClaudeDesktop(ccDesktop !== false)
+        const cod = await store.get('enable_codex')
+        setEnableCodex(cod !== false)
+        const cur = await store.get('enable_cursor')
+        setEnableCursor(cur !== false)
+        const gem = await store.get('enable_gemini')
+        setEnableGemini(gem !== false)
+        const oc = await store.get('enable_opencode')
+        setEnableOpencode(oc !== false)
+        const hcn2 = await store.get('hermes_connections') as { id: string; type: 'local' | 'remote'; host?: string; user?: string }[] | null
+        if (hcn2) setHermesConns(hcn2)
+        fetchAgents()
+        try {
+          await invoke('set_mini_size', {
+            restore: true,
+            position: mascotPositionRef.current,
+            mascotScale: mascotScaleRef.current,
+            largeMascot: true,
+            largeMascotScale: largeMascotScaleRef.current,
+          })
+          await restoreCollapsedMascotPosition()
+        } catch {}
+      }
+    } finally {
+      // Always clear transition/hiding guards so mascot can't get stuck invisible.
+      settingsPickerOpenRef.current = false
+      setSettingsTransitioning(false)
+      settingsTransitioningRef.current = false
+      setHiding(false)
+      debugToTerminal('close', 'exitSettings finished')
+    }
+  }, [fetchAgents, restoreCollapsedMascotPosition, debugToTerminal, isSettingsPickerBlockingClose, setNativeDialogActive])
+
+  // Click outside to collapse (only when not pinned)
+  useEffect(() => {
+    if (!expanded || pinned || settingsMode || settingsTransitioning || updateModalOpen) return
+    const onClick = (e: MouseEvent) => {
+      if (isCreateModalOpenRef.current) return
+      if (isSettingsPickerBlockingClose()) {
+        debugToTerminal('outside', 'window mousedown ignored: settings picker active')
+        return
+      }
+      if (!(e.target as HTMLElement).closest('#mini-panel')) {
+        debugToTerminal('outside', 'window mousedown outside mini-panel -> collapse')
+        collapse()
+      }
+    }
+    window.addEventListener('mousedown', onClick)
+    return () => window.removeEventListener('mousedown', onClick)
+  }, [expanded, pinned, settingsMode, settingsTransitioning, updateModalOpen, collapse, debugToTerminal, isSettingsPickerBlockingClose])
+
+  // Windows: an auto-expanded completion popup never takes OS focus, so the
+  // window-blur close path never fires and clicking another app won't close
+  // the panel. A Rust-side global mouse watcher emits `mini-outside-click`
+  // when the user clicks outside the mini window — collapse on that.
+  useEffect(() => {
+    if (!isWindowsPlatform) return
+    if (!expanded || pinned || settingsMode || settingsTransitioning || updateModalOpen) {
+      invoke('set_outside_click_watch', { active: false }).catch(() => {})
+      return
+    }
+    invoke('set_outside_click_watch', { active: true }).catch(() => {})
+    const unlisten = listen('mini-outside-click', () => {
+      if (pinnedRef.current || settingsModeRef.current) return
+      if (isCreateModalOpenRef.current) return
+      if (filePickerOpenRef.current) return
+      if (isSettingsPickerBlockingClose()) return
+      debugToTerminal('outside', 'mini-outside-click -> collapse')
+      collapse()
+    })
+    return () => {
+      invoke('set_outside_click_watch', { active: false }).catch(() => {})
+      unlisten.then((fn) => fn())
+    }
+  }, [expanded, pinned, settingsMode, settingsTransitioning, updateModalOpen, collapse, debugToTerminal, isSettingsPickerBlockingClose])
+
+  // Window blur: collapse when user clicks outside the app (when not pinned, or in settings mode)
+  // Skip blur when a file picker dialog is open
+  useEffect(() => {
+    if (updateModalOpen) return
+    // In pet mode settings, expanded stays false; still need blur handling
+    // so clicking desktop can close settings via exitSettings.
+    if (!expanded && !settingsMode) return
+    if (pinned && !settingsMode) return
+    const onClickCapture = (e: MouseEvent) => {
+      const el = e.target as HTMLElement
+      if (el instanceof HTMLInputElement && el.type === 'file') {
+        filePickerOpenRef.current = true
+        debugToTerminal('blur', 'clickCapture mark filePickerOpen=true (input[type=file])')
+      }
+      if (el.closest('a[target="_blank"]')) {
+        filePickerOpenRef.current = true
+        debugToTerminal('blur', 'clickCapture mark filePickerOpen=true (target=_blank)')
+      }
+    }
+    const onFocus = () => {
+      filePickerOpenRef.current = false
+      debugToTerminal('blur', 'window focus -> filePickerOpen=false')
+      // We're back in front. Re-assert always-on-top here too: macOS can
+      // sometimes demote the level silently before our blur listener
+      // observes it, leaving the settings panel sitting at normal level
+      // when focus returns. This is cheap and idempotent.
+      if (isSettingsPickerBlockingClose() || settingsModeRef.current) {
+        invoke('reassert_floating').catch(() => {})
+      }
+    }
+    const onBlur = () => {
+      if (filePickerOpenRef.current) {
+        debugToTerminal('blur', 'ignore blur: filePickerOpen=true')
+        return
+      }
+      if (isSettingsPickerBlockingClose()) {
+        debugToTerminal('blur', 'ignore blur: settings picker active')
+        // Re-assert always-on-top whenever we lose focus while a native
+        // dialog is open. Both Windows and macOS will demote our floating
+        // mini window back to a normal level when another app (or the
+        // dialog itself) becomes active, which makes the settings panel +
+        // picker visually disappear behind other windows. Pinging Rust
+        // here pulls the window back up to status level immediately.
+        invoke('reassert_floating').catch(() => {})
+        return
+      }
+      // Resizing the native window via `set_mini_size` during the
+      // enter/exit-settings transition can momentarily steal focus from
+      // the webview. Without this guard, the resulting blur tears the
+      // half-built settings UI back down via `collapse()`, leaving the
+      // user staring at an empty mascot ("设置页出不来"). Skip blur while
+      // either transition is in flight.
+      if (settingsTransitioningRef.current) {
+        debugToTerminal('blur', 'ignore blur: settingsTransitioning=true')
+        return
+      }
+      // When settings is open, use the dedicated close path so pet mode
+      // restores window geometry/state consistently.
+      if (settingsModeRef.current) {
+        debugToTerminal('blur', 'blur -> exitSettings')
+        exitSettings()
+        return
+      }
+      debugToTerminal('blur', 'blur -> collapse')
+      collapse()
+    }
+    window.addEventListener('click', onClickCapture, true)
+    window.addEventListener('blur', onBlur)
+    window.addEventListener('focus', onFocus)
+    return () => {
+      window.removeEventListener('click', onClickCapture, true)
+      window.removeEventListener('blur', onBlur)
+      window.removeEventListener('focus', onFocus)
+    }
+  }, [expanded, pinned, settingsMode, updateModalOpen, collapse, exitSettings, debugToTerminal, isSettingsPickerBlockingClose])
+
+  useEffect(() => {
+    if (expanded || moveMode || updateModalOpen) return
+    // Auto-expand on window focus is Windows-only. macOS opens the panel
+    // through the notch-hover poll, and clicking the mascot will focus the
+    // mini window — auto-expanding here would re-introduce the popup that
+    // we explicitly suppressed in the pointerdown handler.
+    if (!isWindowsPlatform) return
+    const onFocus = () => {
+      if (appModeRef.current === 'pet') return // no auto-expand in pet mode
+      if (collapsingRef.current || moveModeRef.current || mascotDragActiveRef.current) return
+      // Large mascot uses long-press to expand; auto-expand on focus
+      // would race with the pointerdown handler and steal the click.
+      if (largeMascotRef.current) return
+      // Defer expand by one tick so a pointerdown landing on the mascot
+      // can cancel it. Without this delay, clicking an unfocused mini
+      // window fires `focus` before `pointerdown`; the focus path opens
+      // the panel while the pointerdown path simultaneously starts the
+      // drag flow, dragging the freshly-opened panel along with the
+      // window. Cancellation lives in handleMascotPointerDown.
+      cancelFocusExpand()
+      focusExpandTimerRef.current = setTimeout(() => {
+        focusExpandTimerRef.current = null
+        if (collapsingRef.current || moveModeRef.current || mascotDragActiveRef.current) return
+        if (largeMascotRef.current) return
+        // The mini window is always-on-top, so Windows hands it focus when any
+        // other window is minimized. Only auto-expand when the cursor is
+        // actually over the mascot — i.e. a real click — not an incidental
+        // focus grab from minimizing another app.
+        invoke('cursor_over_mini_window')
+          .then((over) => {
+            if (!over) return
+            if (collapsingRef.current || moveModeRef.current || mascotDragActiveRef.current) return
+            if (largeMascotRef.current) return
+            expand()
+          })
+          .catch(() => {})
+      }, 80)
+    }
+    window.addEventListener('focus', onFocus)
+    return () => {
+      window.removeEventListener('focus', onFocus)
+      cancelFocusExpand()
+    }
+  }, [expanded, expand, moveMode, updateModalOpen, cancelFocusExpand])
+
+  // Exit move mode when clicking outside mascot or when window loses focus.
+  // Use a debounced blur so that programmatic window moves (which briefly
+  // blur + refocus the webview on macOS) don't cancel move mode.
+  useEffect(() => {
+    if (!moveMode) return
+    let blurTimer: ReturnType<typeof setTimeout> | null = null
+    const onBlur = () => {
+      if (mascotDragActiveRef.current) return
+      blurTimer = setTimeout(() => {
+        blurTimer = null
+        if (!mascotDragActiveRef.current) setMoveMode(false)
+      }, 300)
+    }
+    const onFocus = () => {
+      if (blurTimer) {
+        clearTimeout(blurTimer)
+        blurTimer = null
+      }
+    }
+    window.addEventListener('blur', onBlur)
+    window.addEventListener('focus', onFocus)
+    return () => {
+      window.removeEventListener('blur', onBlur)
+      window.removeEventListener('focus', onFocus)
+      if (blurTimer) clearTimeout(blurTimer)
+    }
+  }, [moveMode])
+
+  const claudeWaiting = visibleClaudeSessions.some((cs) => cs.status === 'waiting')
+  const claudeCompacting = visibleClaudeSessions.some((cs) => cs.status === 'compacting')
+  const claudeWorking = visibleClaudeSessions.some((cs) => cs.status === 'processing' || cs.status === 'tool_running')
+  const hasWorking = anySessionActive || Object.values(healthMap).some(Boolean) || claudeWorking || claudeCompacting || claudeWaiting
+  // Priority: waiting > compacting > working > idle
+  const mainPetState: PetState = claudeWaiting ? 'waiting' : claudeCompacting ? 'compacting' : hasWorking ? 'working' : 'idle'
+  // Sprite resting state for the main mascot. Walking direction (set by
+  // the walk timer) overrides the working/waiting/idle mapping so the pet
+  // visibly runs left/right while the native window is moving.
+  const mainSpriteState: CodexPetState = walkDir === 1
+    ? 'run-right'
+    : walkDir === -1
+      ? 'run-left'
+      : petStateToCodexState(mainPetState)
+  // Broadcast the resolved mascot state so dev-mode demo windows can
+  // mirror it. The main window owns the polling loops that derive
+  // working / waiting / idle (claude sessions every 2s, agents every
+  // 5s, health every 1s); demo windows have no business duplicating
+  // those polls. Emit on every change for low-latency mirroring, plus
+  // a 2s periodic re-emit so a freshly-spawned demo window catches
+  // the current state without waiting for the next change.
+  const mainPetStateRef = useRef<PetState>(mainPetState)
+  mainPetStateRef.current = mainPetState
+  // Diagnostic (dev only): emit a backend log line whenever the mascot state
+  // changes, including which claude sessions (and other inputs) are pinning
+  // it. Helps pinpoint stuck-mascot bugs without opening webview DevTools.
+  // We dedupe by message content because `visibleClaudeSessions` is a fresh
+  // array on every render — without dedupe this would log on every render.
+  const lastMascotLogRef = useRef<string>('')
+  useEffect(() => {
+    if (!import.meta.env.DEV) return
+    const culprits = visibleClaudeSessions
+      .filter((cs) => ['waiting', 'compacting', 'processing', 'tool_running'].includes(cs.status))
+      .map((cs) => `${String(cs.sessionId).slice(0, 8)}:${cs.source}:${cs.hostTerminal || 'noHost'}:${cs.status}`)
+    const summary = `state=${mainPetState} hasWorking=${hasWorking} ocActive=${anySessionActive} healthOn=${Object.values(healthMap).some(Boolean)} claude(P=${claudeWorking},W=${claudeWaiting},C=${claudeCompacting}) culprits=${JSON.stringify(culprits)}`
+    if (summary === lastMascotLogRef.current) return
+    lastMascotLogRef.current = summary
+    invoke('debug_log', { scope: 'mascot', msg: summary }).catch(() => {})
+  }, [mainPetState, hasWorking, anySessionActive, healthMap, claudeWorking, claudeWaiting, claudeCompacting, visibleClaudeSessions])
+  useEffect(() => {
+    if (appMode !== 'coding') return
+    emit('mini-pet-state', { state: mainPetState }).catch(() => {})
+  }, [mainPetState, appMode])
+  useEffect(() => {
+    if (appMode !== 'coding') return
+    const t = setInterval(() => {
+      emit('mini-pet-state', { state: mainPetStateRef.current }).catch(() => {})
+    }, 2000)
+    return () => clearInterval(t)
+  }, [appMode])
+
+  const fallbackLargeActions = useMemo(() => {
+    const c = characters.find((ch) => ch.largeActions && Object.keys(ch.largeActions).length > 0)
+    return c?.largeActions
+  }, [characters])
+  const largeCharForRender = (appMode === 'pet' || appMode === 'coding')
+    ? ({ name: '香企鹅', largeActions: petBuiltinLargeActions } as CharacterMeta)
+    : miniChar
+  // hasAnyLargeActions used to gate the legacy header toggle. Toggling is
+  // now driven from the pet picker (selecting 香企鹅 enters large-mascot
+  // mode), so the predicate itself is no longer referenced — but we keep
+  // the computation cheap in case future logic wants to read it.
+  const largeVideoBaseUrl = largeMascot
+    ? appMode === 'pet'
+      ? getLargeVideoPetMode(largeCharForRender ?? undefined, currentPetAction, fallbackLargeActions)
+      : getLargeVideo(largeCharForRender ?? undefined, mainPetState, largePetAction, fallbackLargeActions)
+    : undefined
+  const largeVideoUrl = largeVideoBaseUrl ? `${largeVideoBaseUrl}?rev=alpha-fix-2` : undefined
+  // Double-buffer video: two stacked <video> elements swap roles on each
+  // animation change. The old video stays visible until the new one's first
+  // frame is decoded (onLoadedData), eliminating blank-frame flicker.
+  // vid.load() clears the frame buffer immediately, so a single-element
+  // approach always flashes transparent between animations.
+  const largeVideoRefA = useRef<HTMLVideoElement>(null)
+  const largeVideoRefB = useRef<HTMLVideoElement>(null)
+  const largeVideoCanvasRef = useRef<HTMLCanvasElement>(null)
+  // Which buffer (0=A, 1=B) is currently the *front* (visible, playing) video
+  const activeBufferRef = useRef<0 | 1>(0)
+  const [activeBuffer, setActiveBuffer] = useState<0 | 1>(0)
+  const prevLargeVideoUrlRef = useRef<string | undefined>(undefined)
+  const useWindowsChromaKey = isWindowsPlatform && !!largeVideoBaseUrl && largeVideoBaseUrl.includes('/large/webm/')
+
+  useEffect(() => {
+    if (!largeVideoUrl) {
+      // No video to show — reset tracking so we load fresh when a URL
+      // appears (e.g. switching back to pet mode restores the same URL).
+      prevLargeVideoUrlRef.current = undefined
+      return
+    }
+
+    const frontIdx = activeBufferRef.current
+    const backIdx: 0 | 1 = frontIdx === 0 ? 1 : 0
+    const front = frontIdx === 0 ? largeVideoRefA.current : largeVideoRefB.current
+    const back = backIdx === 0 ? largeVideoRefA.current : largeVideoRefB.current
+    if (!front || !back) {
+      // Video elements not yet in the DOM (e.g. collapsed view hidden
+      // while panel is expanded for settings). Reset URL tracker so we
+      // retry loading when the elements remount.
+      prevLargeVideoUrlRef.current = undefined
+      return
+    }
+
+    if (prevLargeVideoUrlRef.current === largeVideoUrl) return
+
+    const allowAlternateFormatFallback = !(typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows'))
+
+    const isFirstLoad = prevLargeVideoUrlRef.current === undefined
+    prevLargeVideoUrlRef.current = largeVideoUrl
+
+    let cancelled = false
+    const listeners: Array<() => void> = []
+    const addOnce = (el: HTMLVideoElement, event: 'playing' | 'error', fn: () => void) => {
+      el.addEventListener(event, fn, { once: true })
+      listeners.push(() => el.removeEventListener(event, fn))
+    }
+    const clearListeners = () => {
+      for (const off of listeners) off()
+      listeners.length = 0
+    }
+    const finishSwap = (newFront: 0 | 1) => {
+      if (cancelled) return
+      activeBufferRef.current = newFront
+      setActiveBuffer(newFront)
+      // Only pause the old buffer — do NOT clear its src synchronously.
+      // setActiveBuffer triggers an async React render that sets visibility:hidden,
+      // but removeAttribute('src') + load() would clear the frame buffer
+      // *before* React hides the element, causing a blank flash.
+      // The stale content is safe: the old buffer is hidden, and loadWithFallback
+      // will replace its src before it becomes front again.
+      const old = newFront === 0 ? largeVideoRefB.current : largeVideoRefA.current
+      if (old) {
+        old.pause()
+      }
+    }
+    const loadWithFallback = (
+      target: HTMLVideoElement,
+      url: string,
+      allowFallback: boolean,
+      onReady: () => void,
+      onFailed: () => void,
+    ) => {
+      clearListeners()
+      const ready = () => {
+        clearListeners()
+        onReady()
+      }
+      const failed = () => {
+        clearListeners()
+        if (cancelled) return
+        if (allowFallback) {
+          const alt = getAlternateLargeVideoUrl(url)
+          if (alt && alt !== url) {
+            loadWithFallback(target, alt, false, onReady, onFailed)
+            return
+          }
+        }
+        onFailed()
+      }
+      addOnce(target, 'playing', ready)
+      addOnce(target, 'error', failed)
+      target.currentTime = 0
+      target.src = url
+      target.load()
+      target.play().catch(() => {})
+    }
+
+    if (isFirstLoad) {
+      loadWithFallback(front, largeVideoUrl, allowAlternateFormatFallback, () => {}, () => {})
+      return () => {
+        cancelled = true
+        clearListeners()
+      }
+    }
+
+    // Keep current front visible, preload next on back, swap only after next plays.
+    loadWithFallback(back, largeVideoUrl, allowAlternateFormatFallback, () => finishSwap(backIdx), () => {})
+    return () => {
+      cancelled = true
+      clearListeners()
+    }
+  // `hiding` gates the collapsed mascot view in JSX (along with `expanded`).
+  // Without it in deps, the effect runs while refs are null (hiding=true)
+  // and bails out, then never re-runs when hiding flips back to false and the
+  // <video> elements remount — leaving the mascot blank after closing a popup.
+  }, [largeVideoUrl, expanded, hiding])
+
+  const inAgentDetail = selectedAgentId !== null
+  const selectedAgent = agents.find((a) => a.id === selectedAgentId)
+  const inDetailPage = inAgentDetail || selectedClaudeSession !== null || selectedSessionKey !== null || showClaudeStats
+  const detailPageMaxHeight = typeof window !== 'undefined' ? Math.max(240, Math.floor(((window.screen?.availHeight || 800) * 0.75) / Math.max(uiScale, 0.01))) : 600
+
+  // Panel dimensions — CSS uses fixed base sizes; on Windows high-DPI screens
+  // the panel root applies `zoom: uiScale` so all content scales uniformly.
+  const panelW = viewMode === 'efficiency' ? 575 : 475
+  const closedNotchWidth = 44
+  const closedNotchHeight = 10
+  const openClipPath = 'inset(0 0 0 0 round 0 0 24px 24px)'
+  const closedClipPath = isWindowsPlatform
+    ? 'inset(0 0 100% 0)'
+    : `inset(0 calc(50% - ${closedNotchWidth / 2}px) calc(100% - ${closedNotchHeight}px) calc(50% - ${closedNotchWidth / 2}px) round 0 0 8px 8px)`
+  const panelClipTransition = isWindowsPlatform
+    ? 'clip-path 0.12s ease-out, box-shadow 0.12s ease-out'
+    : 'clip-path 0.42s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.32s cubic-bezier(0.16, 1, 0.3, 1)'
+  const panelChromeTransition = isWindowsPlatform
+    ? 'opacity 0.1s ease-out'
+    : 'opacity 0.28s cubic-bezier(0.16, 1, 0.3, 1)'
+  const panelRef = useRef<HTMLDivElement>(null)
+
+  const lastResizeHeightRef = useRef(0)
+  const resizeTweenFrameRef = useRef<number | null>(null)
+  const resizeTweenTargetRef = useRef(0)
+  const stopResizeTween = useCallback(() => {
+    if (resizeTweenFrameRef.current !== null) {
+      cancelAnimationFrame(resizeTweenFrameRef.current)
+      resizeTweenFrameRef.current = null
+    }
+  }, [])
+  const pushMiniHeight = useCallback((height: number, maxHeight: number) => {
+    invoke('resize_mini_height', { height, maxHeight, animate: false }).catch(() => {})
+  }, [])
+  const tweenMiniHeight = useCallback(
+    (from: number, to: number, maxHeight: number) => {
+      stopResizeTween()
+      resizeTweenTargetRef.current = to
+      const start = performance.now()
+      const duration = 240
+      const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3)
+      const step = (now: number) => {
+        const progress = Math.min((now - start) / duration, 1)
+        const value = from + (to - from) * easeOutCubic(progress)
+        lastResizeHeightRef.current = value
+        pushMiniHeight(value, maxHeight)
+        if (progress < 1 && resizeTweenTargetRef.current === to) {
+          resizeTweenFrameRef.current = requestAnimationFrame(step)
+          return
+        }
+        resizeTweenFrameRef.current = null
+        lastResizeHeightRef.current = to
+        pushMiniHeight(to, maxHeight)
+      }
+      resizeTweenFrameRef.current = requestAnimationFrame(step)
+    },
+    [pushMiniHeight, stopResizeTween],
+  )
+  useEffect(() => {
+    if (!expanded || settingsMode || settingsTransitioning || !showPanel) return
+    const el = panelRef.current
+    if (!el) return
+    let first = true
+    const ro = new ResizeObserver((entries) => {
+      const h = entries[0]?.contentRect.height
+      if (h && h > 0) {
+        const limit = inDetailPage ? detailPageMaxHeight : panelMaxHeight
+        const clamped = Math.min(h * uiScale, limit * uiScale)
+        const prev = lastResizeHeightRef.current || clamped
+        const delta = Math.abs(clamped - prev)
+        const shouldAnimate = !first && inDetailPage && delta > 10
+        first = false
+        if (shouldAnimate) {
+          tweenMiniHeight(prev, clamped, limit)
+          return
+        }
+        stopResizeTween()
+        lastResizeHeightRef.current = clamped
+        pushMiniHeight(clamped, limit)
+      }
+    })
+    ro.observe(el)
+    return () => {
+      ro.disconnect()
+      stopResizeTween()
+    }
+  }, [expanded, settingsMode, settingsTransitioning, showPanel, uiScale, panelMaxHeight, inDetailPage, detailPageMaxHeight, pushMiniHeight, stopResizeTween, tweenMiniHeight])
+
+  useEffect(() => {
+    if (!expanded || !showPanel || settingsMode || settingsTransitioning || updateModalOpen) return
+    if (expandedWindowModeRef.current === viewMode) return
+    syncExpandedWindowLayout(viewMode).catch((e) => {
+      console.warn('[mini] sync expanded window layout failed:', e)
+    })
+  }, [expanded, showPanel, settingsMode, settingsTransitioning, updateModalOpen, viewMode, syncExpandedWindowLayout])
+
+  const collapsedMascotSize = Math.round(MASCOT_BASE_SIZE * mascotScale)
+  const collapsedPlaceholderRadius = Math.round(10 * mascotScale)
+  const collapsedPlaceholderFontSize = Math.max(16, Math.round(16 * mascotScale))
+  const collapsedStatusSize = 5
+  const collapsedStatusBorder = 1.1
+  const largeMascotVisualSize = collapsedMascotSize * largeMascotScale
+
+  // Keep the coding-mode extra mascots scaled together with the primary one:
+  // broadcast the current visual size whenever the "Mascot Size" slider moves.
+  useEffect(() => {
+    if (appMode !== 'coding') return
+    emit('mascot-visual-size', { size: largeMascotVisualSize }).catch(() => {})
+  }, [largeMascotVisualSize, appMode])
+
+  useEffect(() => {
+    if (!useWindowsChromaKey || !largeMascot) return
+    const canvas = largeVideoCanvasRef.current
+    if (!canvas) return
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })
+    if (!ctx) return
+    let rafId = 0
+    let retryCount = 0
+    const draw = () => {
+      const front = activeBufferRef.current === 0 ? largeVideoRefA.current : largeVideoRefB.current
+      if (front && front.readyState >= 2 && front.videoWidth > 0 && front.videoHeight > 0) {
+        retryCount = 0
+        const targetSize = Math.max(1, Math.round(largeMascotVisualSize))
+        if (canvas.width !== targetSize || canvas.height !== targetSize) {
+          canvas.width = targetSize
+          canvas.height = targetSize
+        }
+        ctx.clearRect(0, 0, canvas.width, canvas.height)
+        ctx.drawImage(front, 0, 0, canvas.width, canvas.height)
+        const frame = ctx.getImageData(0, 0, canvas.width, canvas.height)
+        const data = frame.data
+        // Chroma key black-ish pixels to transparent as a Windows fallback
+        // when WebView2 drops VP9 alpha during decode.
+        for (let i = 0; i < data.length; i += 4) {
+          const maxRgb = Math.max(data[i], data[i + 1], data[i + 2])
+          if (maxRgb <= 12) {
+            data[i + 3] = 0
+          } else if (maxRgb < 28) {
+            const softAlpha = Math.round(((maxRgb - 12) / 16) * 255)
+            if (softAlpha < data[i + 3]) data[i + 3] = softAlpha
+          }
+        }
+        ctx.putImageData(frame, 0, 0)
+      } else if (front && front.src && front.paused) {
+        // Video has a source but isn't playing — kick-start it.
+        // This handles cases where play() was called while the element
+        // was hidden (e.g. during settingsTransitioning display:none) and
+        // WebView2 silently rejected or stalled decoding.
+        // Throttle retries to ~2/sec to avoid spamming play().
+        retryCount++
+        if (retryCount % 30 === 0) front.play().catch(() => {})
+      }
+      rafId = requestAnimationFrame(draw)
+    }
+    rafId = requestAnimationFrame(draw)
+    return () => {
+      cancelAnimationFrame(rafId)
+    }
+  // `expanded` and `hiding` are included so the rAF loop restarts when the
+  // collapsed view (re)mounts — the canvas element is only in the DOM when
+  // `!expanded && !hiding`. Missing `hiding` causes the same "mascot blank
+  // after closing a popup" symptom as the video loader effect above.
+  }, [useWindowsChromaKey, largeMascot, largeMascotVisualSize, activeBuffer, largeVideoUrl, expanded, hiding])
+
+  return (
+    <div
+      style={{
+        width: '100vw',
+        height: '100vh',
+        background: 'transparent',
+        overflow: (appMode === 'pet' && largeMascot) ? 'visible' : 'hidden',
+        userSelect: 'none',
+      }}
+    >
+      {/* Collapsed */}
+      {!expanded && !hiding && !updateModalOpen && !showOnboarding && (
+        <div
+          id="mini-panel"
+          onMouseEnter={() => {
+            // Hover expand disabled — efficiency mode only opens on click.
+          }}
+          style={{
+            width: '100%',
+            height: '100%',
+            position: 'relative',
+            display: (appMode === 'pet' && largeMascot) ? 'block' : 'flex',
+            alignItems: (appMode === 'pet' && largeMascot) ? undefined : 'center',
+            justifyContent: (appMode === 'pet' && largeMascot) ? undefined : 'center',
+            // No background. Used to be `rgba(0,0,0,0.01)` to coax macOS
+            // WKWebView into delivering hover events on transparent area,
+            // but mini-panel no longer uses panel-level hover/click
+            // handlers (children carry their own), and the 1% alpha was
+            // visible on light-colored desktops as a faint gray tint
+            // around the mascot.
+            background: undefined,
+            pointerEvents: 'auto',
+            cursor: 'default',
+          }}
+        >
+          <div
+            onPointerDown={handleMascotPointerDown}
+            onContextMenu={handleMascotContextMenu}
+            onMouseMove={undefined}
+            onMouseLeave={undefined}
+            style={{
+              position: (appMode === 'pet' && largeMascot) ? 'absolute' : 'relative',
+              bottom: (appMode === 'pet' && largeMascot) ? 0 : undefined,
+              // Anchor mascot to a fixed window-x equal to the pet-mode
+              // window's "no-menu" inner width minus mascot CSS width.
+              // This matches the previous `right: 0` visual position but
+              // stays constant when the right-side menu temporarily
+              // widens the window, avoiding any race between React CSS
+              // commit and native window resize.
+              // Fallback to `right: 0` until petBaseWinW has been measured.
+              left: (appMode === 'pet' && largeMascot && petBaseWinW != null)
+                ? Math.max(0, Math.round(petBaseWinW - largeMascotVisualSize))
+                : undefined,
+              right: (appMode === 'pet' && largeMascot && petBaseWinW == null)
+                ? 0
+                : undefined,
+              overflow: 'visible',
+              // During peek, the mascot box is full-width but the character only
+              // pokes out a thin slice at one edge. Don't paint a pointer cursor
+              // over the empty side — narrow cursor handling is delegated to the
+              // peek overlay below.
+              cursor: moveMode
+                ? 'grab'
+                : (currentPetAction === 'peek' ? 'default' : 'pointer'),
+              animation: moveMode ? 'movePulse 1.2s ease-in-out infinite' : 'none',
+              display: (appMode === 'pet' && (showSettingsOverlay || settingsTransitioning)) ? 'none' : undefined,
+              ...(moveMode
+                ? {
+                    borderRadius: 12,
+                    outline: '2px solid rgba(59,130,246,0.6)',
+                    outlineOffset: -2,
+                  }
+                : {}),
+            }}
+          >
+            {largeMascot && largeVideoUrl ? (
+              <div style={{ position: 'relative', width: largeMascotVisualSize, height: largeMascotVisualSize }}>
+              {currentPetAction === 'peek' && !moveMode && (() => {
+                // Narrow cursor:pointer strip aligned to the actual peeking side.
+                // The strip width is a small fraction of the mascot visual size to
+                // avoid the "cursor turns into hand even before reaching the pet" feel.
+                // pointer-events: 'auto' lets the cursor style apply; clicks bubble
+                // to the click handler on the parent div, which still enforces the
+                // shrunken hitbox check.
+                const stripW = Math.round(largeMascotVisualSize * PEEK_HIT_WIDTH_RATIO)
+                const isLeft = peekEdgeRef.current === 'left'
+                return (
+                  <div
+                    style={{
+                      position: 'absolute',
+                      top: 0,
+                      height: '100%',
+                      width: stripW,
+                      left: isLeft ? 0 : largeMascotVisualSize - stripW,
+                      cursor: 'pointer',
+                      pointerEvents: 'auto',
+                      background: 'transparent',
+                      zIndex: 2,
+                    }}
+                  />
+                )
+              })()}
+              {useWindowsChromaKey && (
+                <canvas
+                  ref={largeVideoCanvasRef}
+                  style={{
+                    position: 'absolute',
+                    inset: 0,
+                    width: '100%',
+                    height: '100%',
+                    pointerEvents: 'none',
+                    transform:
+                      (currentPetAction === 'walk' && walkFlipped) ? 'scaleX(-1)'
+                      : ((currentPetAction === 'peek' || currentPetAction === 'walkout') && peekEdgeRef.current === 'left') ? 'scaleX(-1)'
+                      : undefined,
+                  }}
+                />
+              )}
+              {/* Double-buffer: front buffer stays visible while back buffer preloads.
+                  Swap only after back buffer is already playing to avoid blank frames. */}
+              {[0, 1].map((idx) => {
+                const isFront = activeBuffer === idx
+                const ref = idx === 0 ? largeVideoRefA : largeVideoRefB
+                return (
+                  <video
+                    key={idx}
+                    ref={ref}
+                    autoPlay={isFront}
+                    loop={!(appMode === 'pet' && TRANSIENT_PET_ACTIONS.includes(currentPetAction))}
+                    muted
+                    playsInline
+                    preload="auto"
+                    onError={(e) => {
+                      if (!isFront) return
+                      console.warn('[large-video] error:', (e.target as HTMLVideoElement).error?.message, 'src:', largeVideoUrl)
+                      if (appModeRef.current === 'pet' && TRANSIENT_PET_ACTIONS.includes(currentPetActionRef.current)) {
+                        const d = petDataRef.current
+                        const next: PetAction = d.hunger < 30 ? 'hungry' : 'idle'
+                        setCurrentPetAction(next)
+                        currentPetActionRef.current = next
+                      }
+                    }}
+                    onEnded={() => {
+                      if (!isFront) return
+                      if (appModeRef.current === 'pet' && TRANSIENT_PET_ACTIONS.includes(currentPetActionRef.current)) {
+                        if (currentPetActionRef.current === 'farewell') {
+                          invoke('exit_app').catch(() => {})
+                          return
+                        }
+                        let next: PetAction
+                        if (currentPetActionRef.current === 'dance' && danceFromMusicRef.current) {
+                          danceFromMusicRef.current = false
+                          next = 'music'
+                        } else {
+                          const d = petDataRef.current
+                          next = d.hunger < 30 ? 'hungry' : 'idle'
+                        }
+                        setCurrentPetAction(next)
+                        currentPetActionRef.current = next
+                      }
+                    }}
+                    style={{
+                      position: 'absolute',
+                      inset: 0,
+                      width: '100%',
+                      height: '100%',
+                      objectFit: 'contain',
+                      pointerEvents: 'none',
+                      visibility: isFront ? 'visible' : 'hidden',
+                      opacity: useWindowsChromaKey ? 0 : 1,
+                      transform:
+                        (currentPetAction === 'walk' && walkFlipped) ? 'scaleX(-1)'
+                        : ((currentPetAction === 'peek' || currentPetAction === 'walkout') && peekEdgeRef.current === 'left') ? 'scaleX(-1)'
+                        : undefined,
+                    }}
+                    draggable={false}
+                  />
+                )
+              })}
+            </div>) : miniPet ? (
+              <div
+                style={{
+                  position: 'relative',
+                  width: largeMascotVisualSize,
+                  height: Math.round(largeMascotVisualSize * (208 / 192)),
+                }}
+              >
+                <MiniPetMascot
+                  pet={miniPet}
+                  baseState={mainSpriteState}
+                  size={largeMascotVisualSize}
+                  enableHoverJump
+                  externalHover={mascotHover}
+                  useExternalHover={!isWindowsPlatform}
+                  suppressHover={mascotDragActive}
+                />
+              </div>
+            ) : (
+              <div
+                style={{
+                  width: largeMascotVisualSize,
+                  height: largeMascotVisualSize,
+                  borderRadius: collapsedPlaceholderRadius,
+                  background: 'rgba(0,0,0,0.3)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  color: '#999',
+                  fontSize: collapsedPlaceholderFontSize,
+                }}
+              >
+                ?
+              </div>
+            )}
+            {appMode !== 'pet' && (
+              <div
+                style={{
+                  position: 'absolute',
+                  bottom: 8,
+                  right: 10,
+                  width: collapsedStatusSize,
+                  height: collapsedStatusSize,
+                  borderRadius: '50%',
+                  background: mainPetState === 'waiting' ? '#f59e0b' : hasWorking ? '#2ecc71' : '#777',
+                  border: `${collapsedStatusBorder}px solid rgba(0,0,0,0.3)`,
+                }}
+              />
+            )}
+            {(largeMascot || miniPet) && (
+              <div
+                data-no-drag
+                onPointerEnter={() => setResizeHandleHovered(true)}
+                onPointerLeave={() => setResizeHandleHovered(false)}
+                onPointerDown={handleMascotResizePointerDown}
+                title={t('settings.largeMascotScale', 'Mascot Size')}
+                style={{
+                  position: 'absolute',
+                  right: 0,
+                  bottom: 0,
+                  width: MASCOT_RESIZE_HANDLE_SIZE,
+                  height: MASCOT_RESIZE_HANDLE_SIZE,
+                  cursor: MASCOT_RESIZE_CURSOR,
+                  pointerEvents: 'auto',
+                  zIndex: 12,
+                  touchAction: 'none',
+                  background: 'rgba(255,255,255,0.01)',
+                  display: 'flex',
+                  alignItems: 'flex-end',
+                  justifyContent: 'flex-end',
+                  padding: 4,
+                }}
+              >
+                <div
+                  style={{
+                    width: MASCOT_RESIZE_ICON_SIZE,
+                    height: MASCOT_RESIZE_ICON_SIZE,
+                    borderRadius: 8,
+                    background: 'rgba(255,255,255,0.94)',
+                    boxShadow: '0 3px 10px rgba(0,0,0,0.22)',
+                    color: '#1f2937',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    cursor: MASCOT_RESIZE_CURSOR,
+                    opacity: resizeHandleHovered ? 1 : 0,
+                    transform: resizeHandleHovered ? 'translateY(0) scale(1) rotate(90deg)' : 'translateY(3px) scale(0.92) rotate(90deg)',
+                    transition: 'opacity 120ms ease, transform 120ms ease',
+                    pointerEvents: 'none',
+                  }}
+                >
+                  <Maximize2 size={15} strokeWidth={2.4} />
+                </div>
+              </div>
+            )}
+            {/* Pomodoro timer overlay (pet mode, study action) */}
+            {appMode === 'pet' && largeMascot && pomodoro?.active && (
+              <PomodoroOverlay
+                pomodoro={pomodoro}
+                mascotSize={largeMascotVisualSize}
+                onStop={handleStopPomodoro}
+              />
+            )}
+            {/* Pet mode context menu: status bar above + buttons on left */}
+            {appMode === 'pet' && largeMascot && (
+              <PetContextMenu
+                open={petContextMenuOpen}
+                petData={petData}
+                currentAction={currentPetAction}
+                pomodoro={pomodoro}
+                mascotSize={largeMascotVisualSize}
+                side={petMenuSide}
+                onClose={closePetContextMenu}
+                onUpdatePetData={handleUpdatePetData}
+                onSetAction={(action) => {
+                  handleSetPetAction(action)
+                  closePetContextMenu()
+                }}
+                onStartPomodoro={(m) => {
+                  handleStartPomodoro(m)
+                  closePetContextMenu()
+                }}
+                onStopPomodoro={() => {
+                  handleStopPomodoro()
+                  closePetContextMenu()
+                }}
+                onOpenSettings={() => {
+                  closePetContextMenu()
+                  enterSettings()
+                }}
+                onStar={() => {
+                  closePetContextMenu()
+                  invoke('open_url', { url: 'https://github.com/rainnoon/oc-claw' }).catch(() => {})
+                }}
+                onFoodRain={triggerFoodRain}
+                onPlayAudio={playPetAudio}
+                onQuit={() => {
+                  closePetContextMenu()
+                  handleSetPetAction('farewell')
+                  playPetAudio('farewell')
+                }}
+              />
+            )}
+
+            {/* Food rain effect — rendered outside context menu so it persists after menu closes */}
+            {foodRainDrops.length > 0 && (
+              <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none', overflow: 'hidden', zIndex: 9999 }}>
+                <AnimatePresence>
+                  {foodRainDrops.map(drop => (
+                    <motion.span
+                      key={drop.id}
+                      initial={{ y: -30, opacity: 1 }}
+                      animate={{ y: '100vh', opacity: 0 }}
+                      transition={{ duration: drop.duration, delay: drop.delay, ease: 'easeIn' }}
+                      style={{ position: 'absolute', left: `${drop.x}%`, fontSize: drop.size, willChange: 'transform' }}
+                    >
+                      {drop.emoji}
+                    </motion.span>
+                  ))}
+                </AnimatePresence>
+              </div>
+            )}
+
+          </div>
+        </div>
+      )}
+
+      {/* Expanded panel */}
+      {expanded && !settingsMode && !settingsTransitioning && !updateModalOpen && (
+        <div
+          id="mini-panel"
+          ref={panelRef}
+          className="scrollbar-hidden"
+          onMouseEnter={() => {
+            if (hoverCloseTimerRef.current) {
+              clearTimeout(hoverCloseTimerRef.current)
+              hoverCloseTimerRef.current = null
+            }
+          }}
+          onMouseLeave={() => {
+            if (hoverExpandedRef.current && !pinnedRef.current) {
+              hoverCloseTimerRef.current = setTimeout(() => {
+                hoverExpandedRef.current = false
+                hoverCloseTimerRef.current = null
+                collapse()
+              }, 300)
+            }
+          }}
+          style={{
+            position: 'absolute',
+            top: 0,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            transformOrigin: 'top center',
+            zoom: uiScale !== 1 ? uiScale : undefined,
+            // On Windows high-DPI / >100% scaling, the native window's CSS
+            // viewport width doesn't reliably equal the fixed panelW (Tauri vs
+            // WebView2 DPI mapping mismatch), leaving a grey gap on the right.
+            // Fill the actual viewport instead (compensating for `zoom`, since
+            // vw is relative to the window, not the zoomed element). macOS and
+            // the collapsed state keep the fixed panelW.
+            width: isWindowsPlatform && showPanel
+              ? (uiScale !== 1 ? `calc(100vw / ${uiScale})` : '100vw')
+              : panelW,
+            height: 'auto',
+            maxHeight: inDetailPage ? detailPageMaxHeight : panelMaxHeight,
+            overflowY: 'hidden',
+            overflowX: 'hidden',
+            display: 'flex',
+            flexDirection: 'column',
+            background: '#010101',
+            // Keep a real closed notch rectangle at the top-center. This mirrors
+            // ping-island's "always-present header" model and makes collapse
+            // feel like shrinking inward to the notch, not vanishing upward.
+            clipPath: showPanel ? openClipPath : closedClipPath,
+            boxShadow: showPanel ? '0 8px 32px rgba(0,0,0,0.8)' : '0 1px 4px rgba(0,0,0,0.18)',
+            transition: panelClipTransition,
+          }}
+        >
+          {/* Closed header: geometric anchor for clip-path collapse target (macOS notch only). */}
+          {!showPanel && !isWindowsPlatform && (
+            <div
+              style={{
+                position: 'absolute',
+                top: 0,
+                left: '50%',
+                transform: 'translateX(-50%)',
+                width: closedNotchWidth,
+                height: closedNotchHeight,
+                borderBottomLeftRadius: 8,
+                borderBottomRightRadius: 8,
+                background: '#010101',
+                pointerEvents: 'none',
+                zIndex: 30,
+              }}
+            />
+          )}
+
+          {/* Top Control Bar — outside the transform wrapper so sticky works correctly */}
+          <div
+            className="flex items-center justify-between px-4 py-2.5 shrink-0 sticky top-0 z-20 bg-black text-white"
+            style={{
+              opacity: showPanel ? 1 : 0,
+              transition: panelChromeTransition,
+            }}
+          >
+            <div className="flex items-center gap-4 min-w-0 flex-1">
+              {inAgentDetail || selectedClaudeSession || selectedSessionKey || showClaudeStats ? (
+                <button
+                  data-no-drag
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    setSelectedAgentId(null)
+                    setSelectedClaudeSession(null)
+                    setSelectedSessionKey(null)
+                    setShowClaudeStats(false)
+                  }}
+                  className="text-slate-400 hover:text-slate-200 transition-colors"
+                >
+                  <span style={{ fontSize: 13 }}>&lsaquo;</span> {t('common.back')}
+                </button>
+              ) : (
+                <button
+                  data-no-drag
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    const next = !pinned
+                    setPinned(next)
+                    pinnedRef.current = next
+                    // If pinning while hover-opened, upgrade to intentional open
+                    // so mouse-leave won't auto-close.
+                    if (next) hoverExpandedRef.current = false
+                  }}
+                  className={`transition-colors ${pinned ? 'text-[#F0D140]' : 'text-slate-400 hover:text-slate-200'}`}
+                  title={pinned ? t('mini.unpin') : t('mini.pin')}
+                >
+                  <Pin className="w-4 h-4" strokeWidth={2.5} />
+                </button>
+              )}
+              <button
+                data-no-drag
+                onClick={async (e) => {
+                  e.stopPropagation()
+                  const allOn = soundEnabled || codexSoundEnabled || cursorSoundEnabled
+                  const next = !allOn
+                  setSoundEnabled(next)
+                  setCodexSoundEnabled(next)
+                  setCursorSoundEnabled(next)
+                  const store = await load('settings.json', { defaults: {}, autoSave: true })
+                  await store.set('sound_enabled', next)
+                  await store.set('codex_sound_enabled', next)
+                  await store.set('cursor_sound_enabled', next)
+                  await store.save()
+                  if (next) {
+                    if (notifySound === 'manbo') new Audio('/audio/manbo.m4a').play().catch(() => {})
+                    else playDefaultSound()
+                  }
+                }}
+                className={`transition-colors ${soundEnabled || codexSoundEnabled || cursorSoundEnabled ? 'text-slate-400 hover:text-[#F0D140]' : 'text-slate-600 hover:text-[#F0D140]'}`}
+                title={soundEnabled || codexSoundEnabled || cursorSoundEnabled ? t('mini.soundOn') : t('mini.soundOff')}
+              >
+                {soundEnabled || codexSoundEnabled || cursorSoundEnabled ? <Bell className="w-4 h-4" strokeWidth={2.5} /> : <BellOff className="w-4 h-4" strokeWidth={2.5} />}
+              </button>
+            </div>
+            <div className="flex items-center gap-4">
+              {/* Move-mode toggle has been retired on Windows now that the
+                  collapsed mascot supports direct drag-to-move. macOS never
+                  showed it (it has its own native drag path), and pet mode
+                  also never showed it. */}
+              <button
+                data-no-drag
+                onClick={(e) => {
+                  e.stopPropagation()
+                  enterSettings()
+                }}
+                className="text-slate-400 hover:text-[#F0D140] transition-colors"
+                title={t('mini.settings')}
+              >
+                <Settings className="w-4 h-4" strokeWidth={2.5} />
+              </button>
+              <button
+                data-no-drag
+                onClick={(e) => {
+                  e.stopPropagation()
+                  window.blur()
+                  collapse()
+                }}
+                className="text-slate-400 hover:text-rose-500 transition-colors ml-1"
+              >
+                <X className="w-4.5 h-4.5" strokeWidth={2.5} />
+              </button>
+            </div>
+          </div>
+
+          <div
+            style={{
+              position: 'relative',
+              zIndex: 1,
+              opacity: showPanel ? 1 : 0,
+              transformOrigin: 'top center',
+              transition: panelChromeTransition,
+              flex: 1,
+              minHeight: 0,
+              display: 'flex',
+              flexDirection: 'column',
+            }}
+          >
+            {/* ===== Normal content (always rendered when expanded) ===== */}
+            <AnimatePresence mode="wait">
+              {!inAgentDetail && !selectedClaudeSession && !selectedSessionKey && !showClaudeStats ? (
+                viewMode === 'efficiency' ? (
+                  /* ===== Efficiency Mode ===== */
+                  <motion.div
+                    key="efficiency-view"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    transition={{ duration: 0.15 }}
+                    style={{ position: 'relative', display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}
+                  >
+                    <div className="flex flex-col bg-black" style={{ flex: 1, minHeight: 0 }}>
+                      <div className="overflow-y-auto scrollbar-hidden" style={{ maxHeight: panelMaxHeight - 60 }}>
+                        <AnimatePresence mode="popLayout">
+                          {(() => {
+                            const unified: { type: 'oc'; data: MiniSessionInfo; active: boolean; updatedAt: number }[] = allSessions.map((s) => ({
+                              type: 'oc' as const,
+                              data: s,
+                              active: s.active,
+                              updatedAt: s.updatedAt,
+                            }))
+                            const claudeUnified = visibleClaudeSessions.map((cs, ci) => ({
+                              type: 'claude' as const,
+                              data: cs,
+                              claudeIdx: ci,
+                              active: cs.status === 'processing' || cs.status === 'tool_running',
+                              updatedAt: cs.updatedAt ? new Date(cs.updatedAt).getTime() : 0,
+                            }))
+                            // Sort: waiting first, then everything else by recency.
+                            const getPriority = (item: (typeof unified)[0] | (typeof claudeUnified)[0]) => {
+                              if (item.type === 'claude') {
+                                const cs = item.data as any
+                                if (cs.status === 'waiting') return 0
+                              }
+                              return 1
+                            }
+                            const allItems = [...unified, ...claudeUnified].sort((a, b) => {
+                              const pa = getPriority(a),
+                                pb = getPriority(b)
+                              if (pa !== pb) return pa - pb
+                              return b.updatedAt - a.updatedAt
+                            })
+
+                            if (allItems.length === 0) {
+                              const trackingTargets = [
+                                ...(hasConfiguredOpenClaw ? ['OpenClaw'] : []),
+                                ...(enableClaudeCode ? [isWindowsPlatform ? 'Claude Code CLI' : 'Claude Code'] : []),
+                                ...(isWindowsPlatform && enableClaudeDesktop ? ['Claude Code Desktop'] : []),
+                                ...(enableCodex ? ['Codex'] : []),
+                                ...(enableCursor ? ['Cursor'] : []),
+                                ...(enableGemini ? ['Gemini'] : []),
+                                ...(enableOpencode ? ['opencode'] : []),
+                                ...(enableHermes ? ['Hermes'] : []),
+                              ]
+                              return (
+                                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="text-center py-10 px-4 flex flex-col items-center gap-2.5">
+                                  {trackingTargets.length > 0 && <p className="text-slate-500 text-sm font-medium">{t('mini.startTracking', { targets: trackingTargets.join(' / ') })}</p>}
+                                </motion.div>
+                              )
+                            }
+
+                            const agentSeqCount: Record<string, number> = {}
+                            const formatTimeAgo = (ts: number) => {
+                              if (!ts) return ''
+                              const diff = Date.now() - ts
+                              const mins = Math.floor(diff / 60000)
+                              if (mins < 1) return '<1m'
+                              if (mins < 60) return `${mins}m`
+                              const hrs = Math.floor(mins / 60)
+                              if (hrs < 24) return `${hrs}h`
+                              return `${Math.floor(hrs / 24)}d`
+                            }
+                            const formatChannelLabel = (channel?: string) => {
+                              const raw = (channel || '').trim()
+                              if (!raw) return ''
+                              const lower = raw.toLowerCase()
+                              if (lower.includes('feishu')) return 'Feishu'
+                              if (lower.includes('lark')) return 'Lark'
+                              if (lower.includes('telegram')) return 'Telegram'
+                              if (lower.includes('discord')) return 'Discord'
+                              if (lower.includes('slack')) return 'Slack'
+                              if (lower.includes('wechat') || lower.includes('weixin')) return 'WeChat'
+                              return raw.charAt(0).toUpperCase() + raw.slice(1)
+                            }
+                            const hasImportant = allItems.some((item) => {
+                              if (item.type !== 'claude') return false
+                              const cs = item.data as any
+                              if (cs.status === 'waiting' && cs.source !== 'cursor') return true
+                              if (!cs.status || cs.status === 'stopped') {
+                                if (cs.lastResponse && completionSessionId === cs.sessionId) return true
+                              }
+                              return false
+                            })
+                            const isImportant = (item: (typeof allItems)[0]) => {
+                              if (item.type !== 'claude') return false
+                              const cs = item.data as any
+                              if (cs.status === 'waiting' && cs.source !== 'cursor') return true
+                              if (cs.lastResponse && completionSessionId === cs.sessionId) return true
+                              return false
+                            }
+                            const visibleItems = effListCollapsed && hasImportant ? allItems.filter((item) => isImportant(item)) : allItems
+                            const hiddenCount = allItems.length - visibleItems.length
+                            const elements: React.ReactNode[] = visibleItems.map((item, index) => {
+                              if (item.type === 'oc') {
+                                const s = item.data
+                                const agent = agents.find((a) => a.id === s.agentId)
+                                const seq = (agentSeqCount[s.agentId] = (agentSeqCount[s.agentId] || 0) + 1)
+                                const agentName = `${agent?.identityEmoji || ''} ${agent?.identityName || s.agentId}`.trim()
+                                const recentlyDone = !s.active && s.updatedAt && Date.now() - s.updatedAt < 5 * 60 * 1000
+                                const showCharGif = s.active || recentlyDone
+                                const petState: PetState = s.active ? 'working' : 'idle'
+                                const ocSpriteState: CodexPetState = petStateToCodexState(petState)
+                                const title = `${agentName} #${seq}`
+                                const subtitle = s.lastUserMsg || ''
+                                const timeAgo = formatTimeAgo(s.updatedAt)
+                                const isWorking = s.active
+                                const openOcDetail = () => {
+                                  setSelectedClaudeSession(null)
+                                  setSelectedSessionKey(null)
+                                  setShowClaudeStats(false)
+                                  setSelectedAgentId(s.agentId)
+                                }
+                                return (
+                                  <motion.div
+                                    key={`list-oc-${s.agentId}-${s.key}`}
+                                    layout
+                                    initial={{ opacity: 0, x: -10 }}
+                                    animate={{ opacity: 1, x: 0 }}
+                                    exit={{ opacity: 0, filter: 'blur(4px)' }}
+                                    transition={{ duration: 0.2, delay: index * 0.05 }}
+                                    data-no-drag
+                                    onClick={() => {
+                                      const ch = (s.channel || '').toLowerCase()
+                                      const appName =
+                                        ch.includes('feishu') || ch.includes('lark')
+                                          ? 'Lark'
+                                          : ch.includes('telegram')
+                                            ? 'Telegram'
+                                            : ch.includes('discord')
+                                              ? 'Discord'
+                                              : ch.includes('slack')
+                                                ? 'Slack'
+                                                : ch.includes('wechat') || ch.includes('weixin')
+                                                  ? 'WeChat'
+                                                  : null
+                                      if (appName) {
+                                        invoke('activate_app', { appName }).catch((err: unknown) => console.warn('activate failed:', err))
+                                      }
+                                    }}
+                                    className="group flex items-center gap-3 px-4 hover:bg-white/[0.04] transition-colors cursor-pointer"
+                                    style={{ padding: '10px 16px' }}
+                                  >
+                                    {showCharGif && (
+                                      <div
+                                        data-no-drag
+                                        onClick={(e) => {
+                                          e.stopPropagation()
+                                          openOcDetail()
+                                        }}
+                                        className="relative shrink-0 flex items-center justify-center cursor-pointer"
+                                        style={{
+                                          width: Math.round(40 * SESSION_SPRITE_DISPLAY_MULTIPLIER),
+                                          height: Math.round(40 * SESSION_SPRITE_DISPLAY_MULTIPLIER * (208 / 192)),
+                                        }}
+                                      >
+                                        <div className="absolute inset-0" style={{ left: -16 }} />
+                                        {(() => {
+                                          const rowPet = getQueuePet(index)
+                                          return rowPet ? (
+                                            <SpritePet pet={rowPet} state={ocSpriteState} size={Math.round(40 * SESSION_SPRITE_DISPLAY_MULTIPLIER)} />
+                                          ) : (
+                                            <span className="text-white/40 text-lg">{agent?.identityEmoji || '?'}</span>
+                                          )
+                                        })()}
+                                        <div
+                                          style={{
+                                            position: 'absolute',
+                                            bottom: -2,
+                                            right: -2,
+                                            width: 6,
+                                            height: 6,
+                                            borderRadius: '50%',
+                                            background: recentlyDone ? '#94a3b8' : '#2ecc71',
+                                            border: '1.2px solid rgba(0,0,0,0.3)',
+                                          }}
+                                        />
+                                      </div>
+                                    )}
+                                    {!showCharGif && (
+                                      <div
+                                        data-no-drag
+                                        onClick={(e) => {
+                                          e.stopPropagation()
+                                          openOcDetail()
+                                        }}
+                                        className="relative shrink-0 w-10 h-10 flex items-center justify-center cursor-pointer"
+                                      >
+                                        <div className="absolute inset-0" style={{ left: -16 }} />
+                                        <span className="w-1 h-1 rounded-full bg-slate-600" />
+                                      </div>
+                                    )}
+                                    <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden" data-no-drag>
+                                      {editingSessionTitle === `oc:${s.agentId}:${s.key}` ? (
+                                        <input
+                                          autoFocus
+                                          data-no-drag
+                                          className="text-[13px] font-bold bg-transparent border-b border-slate-500 outline-none text-white w-24"
+                                          style={{ WebkitUserSelect: 'text', userSelect: 'text' }}
+                                          defaultValue={sessionNicknames[`oc:${s.agentId}:${s.key}`] || title}
+                                          ref={(el) => {
+                                            if (el) {
+                                              editingTitleValueRef.current = el.value
+                                              editingTitleDefaultRef.current = title
+                                            }
+                                          }}
+                                          onChange={(e) => {
+                                            editingTitleValueRef.current = e.target.value
+                                          }}
+                                          onCompositionStart={() => {
+                                            composingRef.current = true
+                                          }}
+                                          onCompositionEnd={(e) => {
+                                            composingRef.current = false
+                                            editingTitleValueRef.current = (e.target as HTMLInputElement).value
+                                          }}
+                                          onBlur={() => {
+                                            saveSessionNickname(`oc:${s.agentId}:${s.key}`, editingTitleValueRef.current, title)
+                                            setEditingSessionTitle(null)
+                                          }}
+                                          onKeyDown={(e) => {
+                                            if (composingRef.current) return
+                                            if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
+                                            if (e.key === 'Escape') setEditingSessionTitle(null)
+                                          }}
+                                          onClick={(e) => e.stopPropagation()}
+                                        />
+                                      ) : (
+                                        <span
+                                          className={`shrink-0 text-[13px] font-bold cursor-text ${isWorking ? 'text-white' : 'text-slate-300'}`}
+                                          onClick={(e) => e.stopPropagation()}
+                                          onDoubleClick={(e) => {
+                                            e.stopPropagation()
+                                            setEditingSessionTitle(`oc:${s.agentId}:${s.key}`)
+                                          }}
+                                        >
+                                          {sessionNicknames[`oc:${s.agentId}:${s.key}`] || title}
+                                        </span>
+                                      )}
+                                      {subtitle && <span className="min-w-0 max-w-[25%] truncate text-[13px] font-normal text-slate-500">· {subtitle}</span>}
+                                      {s.lastAssistantMsg && <span className="min-w-0 max-w-[30%] truncate text-[11px] text-white/40">· {s.lastAssistantMsg}</span>}
+                                    </div>
+                                    <div className="flex items-center gap-2 shrink-0 ml-auto">
+                                      {s.channel && <span className="text-[11px] px-2 py-0.5 rounded-md font-normal bg-[#27272a] text-slate-300 whitespace-nowrap">{formatChannelLabel(s.channel)}</span>}
+                                      <div className="w-8 flex items-center justify-center">
+                                        <span className="text-[11px] text-slate-500 font-normal group-hover:hidden">{timeAgo}</span>
+                                        <button
+                                          data-no-drag
+                                          onClick={(e) => {
+                                            e.stopPropagation()
+                                            dismissedSessionsRef.current.set(`${s.agentId}:${s.key}`, s.updatedAt)
+                                            setAllSessions((prev) => prev.filter((ss) => !(ss.agentId === s.agentId && ss.key === s.key)))
+                                          }}
+                                          className="hidden group-hover:flex items-center justify-center text-slate-600 hover:text-rose-500 transition-colors outline-none"
+                                          title={t('mini.remove')}
+                                        >
+                                          <Trash2 className="w-4 h-4" strokeWidth={2} />
+                                        </button>
+                                      </div>
+                                    </div>
+                                  </motion.div>
+                                )
+                              } else {
+                                const cs = item.data
+                                const isHermesSrc = cs.source === 'hermes'
+                                // Hermes title mirrors OpenClaw: a stable identity + sequence,
+                                // never the question (which only goes to the subtitle below).
+                                const hermesTitle = `Hermes #${getHermesSeq(cs.sessionId)}`
+                                const defaultProjectName = isHermesSrc ? hermesTitle : (cs.cwd ? cs.cwd.replace(/\\/g, '/').split('/').pop() : 'unknown')
+                                const projectName = sessionNicknames[cs.sessionId] || defaultProjectName
+                                const isActive = item.active
+                                const isWaiting = cs.status === 'waiting'
+                                const isCompacting = cs.status === 'compacting'
+                                const isWorking = isActive || isWaiting || isCompacting
+                                const recentlyDone = !isWorking && cs.status === 'stopped' && cs.updatedAt && Date.now() - cs.updatedAt < 5 * 60 * 1000
+                                const showCharGif = isWorking || recentlyDone
+                                const petState: PetState = isWaiting ? 'waiting' : isCompacting ? 'compacting' : isActive ? 'working' : 'idle'
+                                const claudeSpriteState: CodexPetState = petStateToCodexState(petState)
+                                const subtitle = cs.userPrompt || ''
+                                const timeAgo = formatTimeAgo(cs.updatedAt ? (typeof cs.updatedAt === 'string' ? new Date(cs.updatedAt).getTime() : cs.updatedAt) : 0)
+                                const isCursorSource = cs.source === 'cursor'
+                                const isCodexSource = cs.source === 'codex'
+                                const isGeminiSource = cs.source === 'gemini'
+                                const isOpencodeSource = cs.source === 'opencode'
+                                const isHermesSource = cs.source === 'hermes'
+                                const isRemoteHermes = isHermesSource && cs.sessionId?.startsWith('ssh:')
+                                const sourceLabel = isCursorSource ? 'Cursor' : isCodexSource ? 'Codex' : isGeminiSource ? 'Gemini' : isOpencodeSource ? 'opencode' : isHermesSource ? 'Hermes' : 'Claude'
+                                const sourceBadgeClass = isCursorSource ? 'bg-[#1a2f3f] text-[#5eb5f7]' : isCodexSource ? 'bg-[#1d2f26] text-[#6dd29c]' : isGeminiSource ? 'bg-[#1d2736] text-[#8ab4f8]' : isOpencodeSource ? 'bg-[#2a2616] text-[#e6c07b]' : isHermesSource ? 'bg-[#2d1f3f] text-[#c084fc]' : 'bg-[#3f211d] text-[#e87a65]'
+                                const openClaudeDetail = () => {
+                                  setSelectedAgentId(null)
+                                  setSelectedSessionKey(null)
+                                  setSelectedClaudeSession(null)
+                                  setClaudeStatsSource(resolveClaudeStatsSource(cs.source))
+                                  if (isRemoteHermes && cs.sessionId) {
+                                    const sshHost = cs.sessionId.split(':')[1] || ''
+                                    const matchedConn = hermesConns.find(c => c.type === 'remote' && c.host === sshHost)
+                                    setClaudeStatsSsh(matchedConn?.host && matchedConn?.user ? { user: matchedConn.user, host: matchedConn.host } : null)
+                                    const rawId = cs.sessionId?.replace(/^ssh:[^:]+:/, '') || null
+                                    setClaudeStatsSessionId(rawId)
+                                  } else {
+                                    setClaudeStatsSsh(null)
+                                    setClaudeStatsSessionId(isHermesSource ? (cs.sessionId || null) : null)
+                                  }
+                                  setShowClaudeStats(true)
+                                }
+                                return (
+                                  <motion.div
+                                    key={`list-claude-${cs.sessionId}`}
+                                    layout
+                                    initial={{ opacity: 0, x: -10 }}
+                                    animate={{ opacity: 1, x: 0 }}
+                                    exit={{ opacity: 0, filter: 'blur(4px)' }}
+                                    transition={{ duration: 0.2, delay: index * 0.05 }}
+                                    data-no-drag
+                                    onClick={() => {
+                                      if (isHermesSource) {
+                                        const p = (cs.platform || '').toLowerCase()
+                                        const appName = p.includes('feishu') || p.includes('lark') ? 'Lark'
+                                          : p.includes('telegram') ? 'Telegram'
+                                          : p.includes('discord') ? 'Discord'
+                                          : p.includes('slack') ? 'Slack'
+                                          : p.includes('wechat') || p.includes('weixin') ? 'WeChat'
+                                          : p.includes('whatsapp') ? 'WhatsApp'
+                                          : null
+                                        if (appName) {
+                                          invoke('activate_app', { appName }).catch(() => {})
+                                        }
+                                        return
+                                      }
+                                      if (!isWaiting || isGeminiSource || isOpencodeSource) {
+                                        if (cs.source === 'cursor') {
+                                          invoke('focus_cursor_terminal', { sessionId: cs.sessionId }).catch((err: unknown) => console.warn('focus cursor failed:', err))
+                                        } else {
+                                          invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch((err: unknown) => console.warn('jump failed:', err))
+                                        }
+                                      }
+                                    }}
+                                    className={`group hover:bg-white/[0.04] transition-colors ${(!isWaiting || isGeminiSource || isOpencodeSource || isHermesSource) ? 'cursor-pointer' : ''}`}
+                                    style={{ padding: '10px 16px' }}
+                                  >
+                                    <div className="flex min-w-0 w-full items-center gap-3">
+                                      {showCharGif && (
+                                        <div
+                                          data-no-drag
+                                          onClick={(e) => {
+                                            e.stopPropagation()
+                                            openClaudeDetail()
+                                          }}
+                                          className="relative shrink-0 flex items-center justify-center cursor-pointer"
+                                          style={{
+                                            width: Math.round(40 * SESSION_SPRITE_DISPLAY_MULTIPLIER),
+                                            height: Math.round(40 * SESSION_SPRITE_DISPLAY_MULTIPLIER * (208 / 192)),
+                                          }}
+                                        >
+                                          <div className="absolute inset-0" style={{ left: -16 }} />
+                                          {(() => {
+                                            const rowPet = getQueuePet(index)
+                                            return rowPet ? (
+                                              <SpritePet pet={rowPet} state={claudeSpriteState} size={Math.round(40 * SESSION_SPRITE_DISPLAY_MULTIPLIER)} />
+                                            ) : (
+                                              <span className="text-white/40 text-lg">🤖</span>
+                                            )
+                                          })()}
+                                          <div
+                                            style={{
+                                              position: 'absolute',
+                                              bottom: -2,
+                                              right: -2,
+                                              width: 6,
+                                              height: 6,
+                                              borderRadius: '50%',
+                                              background: isWaiting ? '#f59e0b' : recentlyDone ? '#94a3b8' : '#2ecc71',
+                                              border: '1.2px solid rgba(0,0,0,0.3)',
+                                            }}
+                                          />
+                                        </div>
+                                      )}
+                                      {!showCharGif && (
+                                        <div
+                                          data-no-drag
+                                          onClick={(e) => {
+                                            e.stopPropagation()
+                                            openClaudeDetail()
+                                          }}
+                                          className="relative shrink-0 w-10 h-10 flex items-center justify-center cursor-pointer"
+                                        >
+                                          <div className="absolute inset-0" style={{ left: -16 }} />
+                                          <span className="w-1 h-1 rounded-full bg-slate-600" />
+                                        </div>
+                                      )}
+                                      <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden" data-no-drag>
+                                        {editingSessionTitle === cs.sessionId ? (
+                                          <input
+                                            autoFocus
+                                            data-no-drag
+                                            className="text-[13px] font-bold bg-transparent border-b border-slate-500 outline-none text-white w-24"
+                                            style={{ WebkitUserSelect: 'text', userSelect: 'text' }}
+                                            defaultValue={projectName}
+                                            ref={(el) => {
+                                              if (el) {
+                                                editingTitleValueRef.current = el.value
+                                                editingTitleDefaultRef.current = defaultProjectName
+                                              }
+                                            }}
+                                            onChange={(e) => {
+                                              editingTitleValueRef.current = e.target.value
+                                            }}
+                                            onCompositionStart={() => {
+                                              composingRef.current = true
+                                            }}
+                                            onCompositionEnd={(e) => {
+                                              composingRef.current = false
+                                              editingTitleValueRef.current = (e.target as HTMLInputElement).value
+                                            }}
+                                            onBlur={() => {
+                                              saveSessionNickname(cs.sessionId, editingTitleValueRef.current, defaultProjectName)
+                                              setEditingSessionTitle(null)
+                                            }}
+                                            onKeyDown={(e) => {
+                                              if (composingRef.current) return
+                                              if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
+                                              if (e.key === 'Escape') setEditingSessionTitle(null)
+                                            }}
+                                            onClick={(e) => e.stopPropagation()}
+                                          />
+                                        ) : (
+                                          <span
+                                            className={`min-w-0 max-w-[55%] truncate text-[13px] font-bold cursor-text ${isWorking ? 'text-white' : 'text-slate-300'}`}
+                                            onClick={(e) => {
+                                              // Keep title area reserved for rename interaction.
+                                              // Clicking title should not trigger jump.
+                                              e.stopPropagation()
+                                            }}
+                                            onDoubleClick={(e) => {
+                                              e.stopPropagation()
+                                              setEditingSessionTitle(cs.sessionId)
+                                            }}
+                                          >
+                                            {projectName}
+                                          </span>
+                                        )}
+                                        {subtitle && <span className="min-w-0 max-w-[25%] truncate text-[13px] font-normal text-slate-500">· {subtitle}</span>}
+                                        {cs.lastResponse && <span className="min-w-0 max-w-[30%] truncate text-[11px] text-white/40">· {cs.lastResponse}</span>}
+                                      </div>
+                                      <div className="flex items-center gap-2 shrink-0 ml-auto">
+                                        <span className={`text-[11px] px-2 py-0.5 rounded-md font-normal whitespace-nowrap ${sourceBadgeClass}`}>{sourceLabel}</span>
+                                        <div className="w-8 flex items-center justify-center">
+                                          <span className="text-[11px] text-slate-500 font-normal group-hover:hidden">{timeAgo}</span>
+                                          <button
+                                            data-no-drag
+                                            onClick={(e) => {
+                                              e.stopPropagation()
+                                              invoke('remove_claude_session', { sessionId: cs.sessionId }).catch(() => {})
+                                              // Remote (ssh:) sessions bypass the backend dismissed
+                                              // filter, so also record the dismissal on the frontend.
+                                              if (cs.sessionId.startsWith('ssh:')) remoteDismissedRef.current.set(cs.sessionId, Date.now())
+                                              setClaudeSessions((prev) => prev.filter((s) => s.sessionId !== cs.sessionId))
+                                            }}
+                                            className="hidden group-hover:flex items-center justify-center text-slate-600 hover:text-rose-500 transition-colors outline-none"
+                                            title={t('mini.remove')}
+                                          >
+                                            <Trash2 className="w-4 h-4" strokeWidth={2} />
+                                          </button>
+                                        </div>
+                                      </div>
+                                    </div>
+                                    {/* ── 提醒弹窗 (Reminder Popup) ──
+                                       在效率模式下，当 CC session 需要用户批准
+                                       (PermissionRequest → isWaiting) 且该 session
+                                       对应的终端 tab 不在当前激活状态时，自动弹出
+                                       此面板。包含四个操作按钮：拒绝、允许一次、
+                                       全部允许、自动批准。
+                                       用途：让用户无需切换到终端即可快速处理权限请求。 */}
+                                    {isWaiting && cs.source !== 'cursor' && !dismissedWaitingIds.has(cs.sessionId) && (
+                                      <div className="mt-2 flex flex-col" style={{ maxHeight: panelMaxHeight - 140 }}>
+                                        {cs.tool && (
+                                          <div className="flex items-center gap-1.5 mb-2">
+                                            <span className="text-amber-400 text-[12px]">⚠</span>
+                                            <span className="text-amber-400 text-[12px] font-bold">{cs.tool}</span>
+                                          </div>
+                                        )}
+                                        <div style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
+                                        {cs.toolInput &&
+                                          (() => {
+                                            try {
+                                              const input = JSON.parse(cs.toolInput)
+                                              // Write/Edit: show file name + numbered code lines
+                                              if ((cs.tool === 'Write' || cs.tool === 'Edit') && (input.file_path || input.content)) {
+                                                const fileName = input.file_path ? input.file_path.replace(/\\/g, '/').split('/').pop() : ''
+                                                const isNew = cs.tool === 'Write'
+                                                const content = input.content || input.new_string || input.old_string || ''
+                                                const lines = content.split('\n')
+                                                return (
+                                                  <div className="mb-2 rounded-lg bg-[#1a1a1e] border border-[#2a2a2e] overflow-hidden">
+                                                    {fileName && (
+                                                      <div className="flex items-center gap-2 px-3 py-1.5 border-b border-[#2a2a2e] sticky top-0 bg-[#1a1a1e] z-10">
+                                                        <span className="text-[12px] text-slate-300 font-mono">{fileName}</span>
+                                                        {isNew && <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-900/50 text-emerald-400">{t('mini.newFile', '新文件')}</span>}
+                                                      </div>
+                                                    )}
+                                                    <div className="px-3 py-2 overflow-y-auto scrollbar-thin" style={{ maxHeight: 120 }}>
+                                                      {lines.map((line: string, i: number) => (
+                                                        <div key={i} className="flex gap-3 leading-[1.6]">
+                                                          <span className="text-[11px] text-slate-600 font-mono select-none w-5 text-right shrink-0">{i + 1}</span>
+                                                          <pre className="text-[11px] text-slate-300 font-mono whitespace-pre-wrap break-all">{line || ' '}</pre>
+                                                        </div>
+                                                      ))}
+                                                    </div>
+                                                  </div>
+                                                )
+                                              }
+                                              if (typeof input.justification === 'string' && input.justification.trim()) {
+                                                return (
+                                                  <div className="mb-2 p-2.5 rounded-lg bg-[#1a1a1e] border border-[#2a2a2e] overflow-auto" style={{ maxHeight: 120 }}>
+                                                    <pre className="text-[11px] text-amber-300 font-mono whitespace-pre-wrap break-all leading-tight">{input.justification}</pre>
+                                                  </div>
+                                                )
+                                              }
+                                              // Bash: show command
+                                              if (cs.tool === 'Bash' && input.command) {
+                                                return (
+                                                  <div className="mb-2 p-2.5 rounded-lg bg-[#1a1a1e] border border-[#2a2a2e] overflow-auto" style={{ maxHeight: 120 }}>
+                                                    <pre className="text-[11px] text-slate-300 font-mono whitespace-pre-wrap break-all leading-tight">{input.command}</pre>
+                                                  </div>
+                                                )
+                                              }
+                                              // Fallback: show parsed fields
+                                              const preview = input.command || input.file_path || input.content?.slice(0, 150) || cs.toolInput.slice(0, 150)
+                                              return (
+                                                <div className="mb-2 p-2.5 rounded-lg bg-[#1a1a1e] border border-[#2a2a2e] overflow-auto" style={{ maxHeight: 120 }}>
+                                                  <pre className="text-[11px] text-slate-400 font-mono whitespace-pre-wrap break-all leading-tight">{preview}</pre>
+                                                </div>
+                                              )
+                                            } catch {
+                                              return (
+                                                <div className="mb-2 p-2.5 rounded-lg bg-[#1a1a1e] border border-[#2a2a2e] overflow-auto" style={{ maxHeight: 120 }}>
+                                                  <pre className="text-[11px] text-slate-400 font-mono whitespace-pre-wrap break-all leading-tight">{cs.toolInput.slice(0, 150)}</pre>
+                                                </div>
+                                              )
+                                            }
+                                          })()}
+                                        </div>
+                                        <div className="flex gap-2 shrink-0 mt-2">
+                                          {(() => {
+                                            // Immediately clear the waiting state locally so
+                                            // the permission popup closes without waiting for
+                                            // the next 2s poll cycle.
+                                            const resolvePermission = (decision: string) => {
+                                              invoke('resolve_claude_permission', { sessionId: cs.sessionId, decision }).catch(() => {})
+                                              // Clear waiting state locally so popup disappears instantly
+                                              setClaudeSessions((prev) => prev.map((s) => (s.sessionId === cs.sessionId ? { ...s, status: 'processing', tool: undefined, toolInput: undefined } : s)))
+                                              // Collapse the panel
+                                              hoverExpandedRef.current = false
+                                              collapse()
+                                            }
+                                            // Codex / Gemini approval should be made in their own UI.
+                                            // oc-claw only surfaces a reminder and a jump action
+                                            // so the user can approve there.
+                                            if (cs.source === 'codex' || cs.source === 'gemini' || cs.source === 'opencode' || cs.source === 'hermes') {
+                                              const hermesPlatLabel = (() => {
+                                                if (cs.source !== 'hermes' || !cs.platform) return ''
+                                                const p = (cs.platform || '').toLowerCase()
+                                                if (p.includes('feishu') || p.includes('lark')) return 'Feishu'
+                                                if (p.includes('telegram')) return 'Telegram'
+                                                if (p.includes('discord')) return 'Discord'
+                                                if (p.includes('slack')) return 'Slack'
+                                                return ''
+                                              })()
+                                              const isWinGemini = isWindowsPlatform && cs.source === 'gemini'
+                                              if (isWinGemini) {
+                                                return (
+                                                  <span className="text-[11px] text-white/40 text-center py-1">
+                                                    {t('mini.goToTerminal', 'Please approve in the terminal')}
+                                                  </span>
+                                                )
+                                              }
+                                              const jumpLabel = cs.source === 'hermes'
+                                                ? (hermesPlatLabel ? t('mini.viewInHermes', 'Go to Hermes').replace('Hermes', hermesPlatLabel) : t('mini.viewInHermes', 'Go to Hermes'))
+                                                : cs.source === 'gemini'
+                                                ? t('mini.viewInGemini', '前往 Gemini')
+                                                : cs.source === 'opencode'
+                                                ? t('mini.viewInOpencode', '前往 opencode')
+                                                : t('mini.viewInCodex', '前往 Codex')
+                                              return (
+                                                <>
+                                                  <button
+                                                    data-no-drag
+                                                    onClick={(e) => {
+                                                      e.stopPropagation()
+                                                      if (cs.source === 'hermes' && cs.platform) {
+                                                        const p = (cs.platform || '').toLowerCase()
+                                                        const appName =
+                                                          p.includes('feishu') || p.includes('lark') ? 'Lark'
+                                                          : p.includes('telegram') ? 'Telegram'
+                                                          : p.includes('discord') ? 'Discord'
+                                                          : p.includes('slack') ? 'Slack'
+                                                          : null
+                                                        if (appName) {
+                                                          invoke('activate_app', { appName }).catch(() => {})
+                                                        } else {
+                                                          invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
+                                                        }
+                                                      } else {
+                                                        invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
+                                                      }
+                                                      hoverExpandedRef.current = false
+                                                      collapse()
+                                                    }}
+                                                    className="flex-1 py-1.5 rounded-md text-[12px] font-normal bg-[#27272a] text-slate-300 hover:bg-[#303033] transition-colors"
+                                                  >
+                                                    {jumpLabel}
+                                                  </button>
+                                                  <button
+                                                    data-no-drag
+                                                    onClick={(e) => {
+                                                      e.stopPropagation()
+                                                      // Hide buttons for this session's current waiting cycle.
+                                                      // Cleared automatically when session leaves waiting state.
+                                                      setDismissedWaitingIds((prev) => {
+                                                        const next = new Set(prev)
+                                                        next.add(cs.sessionId)
+                                                        return next
+                                                      })
+                                                      hoverExpandedRef.current = false
+                                                      collapse()
+                                                    }}
+                                                    className="flex-1 py-1.5 rounded-md text-[12px] font-normal bg-[#27272a] text-slate-300 hover:bg-[#303033] transition-colors"
+                                                  >
+                                                    {t('mini.later', '稍后处理')}
+                                                  </button>
+                                                </>
+                                              )
+                                            }
+
+                                            return (
+                                              <>
+                                                <button
+                                                  data-no-drag
+                                                  onClick={(e) => {
+                                                    e.stopPropagation()
+                                                    resolvePermission('deny')
+                                                  }}
+                                                  className="flex-1 py-1.5 rounded-md text-[12px] font-normal bg-[#27272a] text-slate-300 hover:bg-[#303033] transition-colors"
+                                                >
+                                                  {t('mini.deny', '拒绝')}
+                                                </button>
+                                                <button
+                                                  data-no-drag
+                                                  onClick={(e) => {
+                                                    e.stopPropagation()
+                                                    resolvePermission('allow_once')
+                                                  }}
+                                                  className="flex-1 py-1.5 rounded-md text-[12px] font-normal bg-[#27272a] text-slate-300 hover:bg-[#303033] transition-colors"
+                                                >
+                                                  {t('mini.allowOnce', '允许一次')}
+                                                </button>
+                                                <button
+                                                  data-no-drag
+                                                  onClick={(e) => {
+                                                    e.stopPropagation()
+                                                    resolvePermission('allow_all')
+                                                  }}
+                                                  className="flex-1 py-1.5 rounded-md text-[12px] font-normal bg-emerald-900/50 text-emerald-300 hover:bg-emerald-800/50 transition-colors"
+                                                >
+                                                  {t('mini.allowAll', '全部允许')}
+                                                </button>
+                                                <button
+                                                  data-no-drag
+                                                  onClick={(e) => {
+                                                    e.stopPropagation()
+                                                    resolvePermission('auto_approve')
+                                                  }}
+                                                  className="flex-1 py-1.5 rounded-md text-[12px] font-normal bg-rose-900/50 text-rose-300 hover:bg-rose-800/50 transition-colors"
+                                                >
+                                                  {t('mini.autoApprove', '自动批准')}
+                                                </button>
+                                              </>
+                                            )
+                                          })()}
+                                        </div>
+                                      </div>
+                                    )}
+                                    {/* ── 完成提醒弹窗 (Completion Reminder) ──
+                                       任务完成且终端未激活时，显示用户问题和 AI 回复预览，
+                                       点击跳转到对应终端。
+                                       只有刚完成的 session 才展开弹窗，其余已完成的只显示标题行。 */}
+                                    {!isWaiting && !isWorking && cs.lastResponse && completionSessionId === cs.sessionId && (
+                                      <div data-no-drag className="mt-2 rounded-lg bg-[#1a1a1e] border border-[#2a2a2e] overflow-hidden">
+                                        <div
+                                          className="flex items-center justify-between px-3 py-2 border-b border-[#2a2a2e] cursor-pointer hover:bg-[#222226] transition-colors"
+                                          onClick={(e) => {
+                                            e.stopPropagation()
+                                            // Fire the jump first so focus shifts to the target app
+                                            // immediately, then close the mini panel directly.
+                                            // Going through collapse() (instead of just clearing
+                                            // completionSessionId) avoids the flash where the panel
+                                            // stays open re-rendered with the full session list
+                                            // until focus blur eventually triggers a close.
+                                            if (cs.source === 'cursor') {
+                                              invoke('focus_cursor_terminal', { sessionId: cs.sessionId }).catch((err: unknown) => console.warn('focus cursor failed:', err))
+                                            } else if (!(isWindowsPlatform && cs.source === 'gemini')) {
+                                              // Gemini on Windows runs in a terminal whose window can't be
+                                              // reliably targeted from the detached process tree, so don't
+                                              // attempt to jump — just dismiss the popup.
+                                              invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
+                                            }
+                                            collapseFnRef.current?.()
+                                          }}
+                                        >
+                                          <span className="text-[12px] text-slate-300 truncate">
+                                            {cs.userPrompt ? (
+                                              <>
+                                                <span className="text-slate-500">{t('mini.you', '你')}：</span>
+                                                {cs.userPrompt}
+                                              </>
+                                            ) : (
+                                              <span className="text-slate-500">{t('mini.taskCompleted', 'Task completed')}</span>
+                                            )}
+                                          </span>
+                                          <span className="text-[11px] px-1.5 py-0.5 rounded bg-emerald-900/50 text-emerald-400 shrink-0 ml-2">{t('mini.done', '完成')}</span>
+                                        </div>
+                                        <div className="px-3 py-2 max-h-[160px] overflow-y-auto scrollbar-thin text-[12px] text-slate-400 leading-[1.6] markdown-content">
+                                          {(cs.source === 'cursor' || cs.source === 'codex' || cs.source === 'gemini' || cs.source === 'opencode') && cs.lastResponse === '✓' ? (
+                                            <p>
+                                              {cs.source === 'codex'
+                                                ? t('mini.codeDone', 'Code has finished working. Click to view.')
+                                                : cs.source === 'gemini'
+                                                  ? (isWindowsPlatform
+                                                      ? t('mini.geminiDoneNoJump', 'Gemini has finished working.')
+                                                      : t('mini.geminiDone', 'Gemini has finished working. Click to view.'))
+                                                  : cs.source === 'opencode'
+                                                    ? t('mini.opencodeDone', 'opencode has finished working. Click to view.')
+                                                    : t('mini.cursorDone', 'Cursor has finished working. Click to view.')}
+                                            </p>
+                                          ) : (
+                                            <ReactMarkdown>{cs.lastResponse}</ReactMarkdown>
+                                          )}
+                                        </div>
+                                      </div>
+                                    )}
+                                  </motion.div>
+                                )
+                              }
+                            })
+                            if (hiddenCount > 0) {
+                              elements.push(
+                                <motion.div key="expand-list-btn" layout initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="flex justify-center py-2">
+                                  <button
+                                    data-no-drag
+                                    onClick={(e) => {
+                                      e.stopPropagation()
+                                      setEffListCollapsed(false)
+                                    }}
+                                    className="text-[11px] text-slate-500 hover:text-slate-300 transition-colors"
+                                  >
+                                    {t('mini.showMore', 'Show {{count}} more', { count: hiddenCount })}
+                                  </button>
+                                </motion.div>,
+                              )
+                            } else if (!effListCollapsed && hasImportant && allItems.length > 1) {
+                              elements.push(
+                                <motion.div key="collapse-list-btn" layout initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="flex justify-center py-2">
+                                  <button
+                                    data-no-drag
+                                    onClick={(e) => {
+                                      e.stopPropagation()
+                                      setEffListCollapsed(true)
+                                    }}
+                                    className="text-[11px] text-slate-500 hover:text-slate-300 transition-colors"
+                                  >
+                                    {t('mini.collapse', 'Collapse')}
+                                  </button>
+                                </motion.div>,
+                              )
+                            }
+                            return elements
+                          })()}
+                        </AnimatePresence>
+                      </div>
+                      {/* Footer */}
+                      <div className="mt-auto py-0.5 flex justify-center items-center select-none opacity-30 hover:opacity-60 transition-opacity">
+                        <span
+                          data-no-drag
+                          onClick={() => invoke('open_url', { url: 'https://github.com/rainnoon/oc-claw' })}
+                          className="text-[8px] font-bold tracking-[0.2em] text-slate-500 uppercase cursor-pointer"
+                        >
+                          oc–claw
+                        </span>
+                      </div>
+                    </div>
+                  </motion.div>
+                ) : (
+                  /* ===== Normal: character island + sessions ===== */
+                  <motion.div
+                    key="main"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    transition={{ duration: 0.15 }}
+                    style={{ position: 'relative', display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}
+                  >
+                    {/* Loading overlay while refreshing connections */}
+                    <AnimatePresence>
+                      {refreshingAgents && (
+                        <motion.div
+                          initial={{ opacity: 0 }}
+                          animate={{ opacity: 1 }}
+                          exit={{ opacity: 0 }}
+                          transition={{ duration: 0.15 }}
+                          style={{
+                            position: 'absolute',
+                            inset: 0,
+                            zIndex: 10,
+                            background: 'rgba(15,15,19,0.9)',
+                            display: 'flex',
+                            flexDirection: 'column',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            gap: 8,
+                          }}
+                        >
+                          <Loader2 className="w-5 h-5 animate-spin" style={{ color: 'rgba(255,255,255,0.4)' }} />
+                          <span style={{ color: 'rgba(255,255,255,0.35)', fontSize: 11 }}>{t('mini.connecting')}</span>
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+                    {/* Banner Area */}
+                    <div
+                      className="border-b-[3px] border-black relative overflow-hidden select-none"
+                      style={{
+                        height: 125,
+                        flexShrink: 0,
+                        ...(islandBg === '__anime__'
+                          ? {
+                              background: '#F0D140',
+                            }
+                          : {
+                              backgroundImage: `url(/assets/backgrounds/${islandBg})`,
+                              backgroundSize: 'cover',
+                              backgroundPosition: `${bgPos.x}% ${bgPos.y}%`,
+                            }),
+                      }}
+                    >
+                      {islandBg === '__anime__' && (
+                        <>
+                          <div className="absolute inset-0 bg-[linear-gradient(to_right,#00000015_2px,transparent_2px),linear-gradient(to_bottom,#00000015_2px,transparent_2px)] bg-[size:16px_16px]" />
+                          <motion.div
+                            animate={{ x: [-80, panelW + 80] }}
+                            transition={{ repeat: Infinity, duration: 18, ease: 'linear' }}
+                            className="absolute top-1 left-0 text-black p-4 -m-4"
+                            style={{ filter: 'drop-shadow(2px 2px 0px #000)' }}
+                          >
+                            <Cloud className="w-12 h-12 fill-white" strokeWidth={2} style={{ overflow: 'visible' }} />
+                          </motion.div>
+                          <motion.div
+                            animate={{ x: [-60, panelW + 60] }}
+                            transition={{ repeat: Infinity, duration: 25, ease: 'linear', delay: 4 }}
+                            className="absolute top-10 left-0 text-black p-4 -m-4"
+                            style={{ filter: 'drop-shadow(2px 2px 0px #000)' }}
+                          >
+                            <Cloud className="w-8 h-8 fill-white" strokeWidth={2} style={{ overflow: 'visible' }} />
+                          </motion.div>
+                        </>
+                      )}
+
+                      {sessionSlots.length === 0 && (
+                        <div
+                          style={{
+                            position: 'absolute',
+                            inset: 0,
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            zIndex: 2,
+                          }}
+                        >
+                          {miniPet ? (
+                            <SpritePet
+                              pet={miniPet}
+                              state="idle"
+                              size={Math.round(68 * SESSION_SPRITE_DISPLAY_MULTIPLIER)}
+                              style={{ animation: 'bob 2s ease-in-out infinite', opacity: 0.8 }}
+                            />
+                          ) : (
+                            <span style={{ color: 'rgba(255,255,255,0.3)', fontSize: 11 }}>{t('mini.waitingForAgents')}</span>
+                          )}
+                        </div>
+                      )}
+
+                      {(() => {
+                        const shuffled = sessionSlots
+                          .map((slot, idx) => {
+                            const seed = (slot.agentId + slot.sessionIdx).split('').reduce((a: number, c: string) => a + c.charCodeAt(0), 0)
+                            return { slot, idx, seed }
+                          })
+                          .sort((a, b) => ((a.seed * 7 + 13) % 97) - ((b.seed * 7 + 13) % 97))
+
+                        return shuffled.map(({ slot, seed }, sortedIdx) => {
+                          const slotPetState: PetState = slot.petState ?? (slot.isWorking ? 'working' : 'idle')
+                          const slotSpriteState: CodexPetState = petStateToCodexState(slotPetState)
+                          const singleRow = sessionSlots.length <= 6
+                          const row = sortedIdx < 6 ? 0 : 1
+                          const col = row === 0 ? sortedIdx : sortedIdx - 6
+                          const cols = row === 0 ? Math.min(sessionSlots.length, 6) : Math.min(sessionSlots.length - 6, 4)
+                          const slotW = 475 / Math.max(cols, 1)
+                          const xBase = slotW * col + slotW / 2 - 28 + (row === 1 ? slotW * 0.4 : 0)
+                          const yBase = row === 0 ? (singleRow ? 16 : 10) : 64
+                          const jx = ((seed * 7) % 17) - 8
+                          const jy = singleRow ? ((seed * 11) % 45) - 22 : ((seed * 11) % 11) - 5
+                          const x = Math.max(2, Math.min(415, xBase + jx))
+                          const y = yBase + jy
+                          return (
+                            <div
+                              key={`${slot.agentId}-${slot.sessionIdx}`}
+                              data-no-drag
+                              onClick={() => {
+                                if (slot.agentId.startsWith('claude:')) {
+                                  const sessionId = slot.agentId.slice('claude:'.length)
+                                  setSelectedAgentId(null)
+                                  setSelectedSessionKey(null)
+                                  setSelectedClaudeSession(null)
+                                  setClaudeStatsSource(resolveClaudeStatsSourceBySession(sessionId))
+                                  setShowClaudeStats(true)
+                                } else {
+                                  setSelectedClaudeSession(null)
+                                  setSelectedSessionKey(null)
+                                  setSelectedAgentId(slot.agentId)
+                                }
+                              }}
+                              style={{
+                                position: 'absolute',
+                                left: x,
+                                top: y,
+                                display: 'flex',
+                                flexDirection: 'column',
+                                alignItems: 'center',
+                                cursor: 'pointer',
+                                zIndex: 2,
+                                animation: 'bob 1.6s ease-in-out infinite',
+                                animationDelay: `${sortedIdx * -0.3}s`,
+                              }}
+                            >
+                              <div style={{ position: 'relative' }}>
+                                {(() => {
+                                  const rowPet = getQueuePet(sortedIdx)
+                                  return rowPet ? (
+                                    <SpritePet pet={rowPet} state={slotSpriteState} size={Math.round(56 * SESSION_SPRITE_DISPLAY_MULTIPLIER)} />
+                                  ) : null
+                                })()}
+                                {!miniPet && petQueueResolved.length === 0 && (
+                                  <div
+                                    style={{
+                                      width: 56,
+                                      height: 56,
+                                      borderRadius: 8,
+                                      background: 'rgba(255,255,255,0.1)',
+                                      display: 'flex',
+                                      alignItems: 'center',
+                                      justifyContent: 'center',
+                                      color: '#555',
+                                      fontSize: 13,
+                                    }}
+                                  >
+                                    ?
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          )
+                        })
+                      })()}
+                    </div>
+
+                    {/* Task List */}
+                    <div className="p-2 bg-[#0f0f13] flex flex-col gap-0.5" style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
+                      {allSessions.length === 0 && visibleClaudeSessions.length === 0 && !refreshingAgents && (
+                        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="text-center py-10 px-4 flex flex-col items-center gap-2.5">
+                          {(() => {
+                            const targets = [
+                              ...(hasConfiguredOpenClaw ? ['OpenClaw'] : []),
+                              ...(enableClaudeCode ? [isWindowsPlatform ? 'Claude Code CLI' : 'Claude Code'] : []),
+                              ...(isWindowsPlatform && enableClaudeDesktop ? ['Claude Code Desktop'] : []),
+                              ...(enableCodex ? ['Codex'] : []),
+                              ...(enableCursor ? ['Cursor'] : []),
+                              ...(enableGemini ? ['Gemini'] : []),
+                              ...(enableOpencode ? ['opencode'] : []),
+                              ...(enableHermes ? ['Hermes'] : []),
+                            ]
+                            return targets.length > 0 ? <p className="text-slate-500 text-sm font-medium">{t('mini.startTracking', { targets: targets.join(' / ') })}</p> : null
+                          })()}
+                          <button
+                            data-no-drag
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              enterSettings()
+                            }}
+                            className="text-slate-400 text-sm font-medium underline decoration-slate-500 underline-offset-4 hover:text-slate-200 transition-colors"
+                          >
+                            {t('mini.goToSettings')}
+                          </button>
+                        </motion.div>
+                      )}
+
+                      <div className="scrollbar-hidden" style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
+                        <AnimatePresence mode="popLayout">
+                          {(() => {
+                            const unified: { type: 'oc'; data: MiniSessionInfo; active: boolean; updatedAt: number }[] = allSessions.map((s) => ({
+                              type: 'oc' as const,
+                              data: s,
+                              active: s.active,
+                              updatedAt: s.updatedAt,
+                            }))
+                            const claudeUnified = visibleClaudeSessions.map((cs, ci) => ({
+                              type: 'claude' as const,
+                              data: cs,
+                              claudeIdx: ci,
+                              active: cs.status === 'processing' || cs.status === 'tool_running',
+                              updatedAt: cs.updatedAt ? new Date(cs.updatedAt).getTime() : 0,
+                            }))
+                            const merged = [...unified, ...claudeUnified].sort((a, b) => (b.active ? 1 : 0) - (a.active ? 1 : 0) || b.updatedAt - a.updatedAt)
+
+                            const agentSeqCount: Record<string, number> = {}
+                            return merged.map((item, index) => {
+                              if (item.type === 'oc') {
+                                const s = item.data
+                                const agent = agents.find((a) => a.id === s.agentId)
+                                const seq = (agentSeqCount[s.agentId] = (agentSeqCount[s.agentId] || 0) + 1)
+                                const agentName = `${agent?.identityEmoji || ''} ${agent?.identityName || s.agentId}`.trim()
+                                const label = `${agentName} #${seq}${s.lastUserMsg ? ` - ${s.lastUserMsg}` : ''}`
+                                return (
+                                  <motion.div
+                                    key={`oc-${s.agentId}-${s.key}`}
+                                    layout
+                                    initial={{ opacity: 0, x: -10 }}
+                                    animate={{ opacity: 1, x: 0 }}
+                                    exit={{ opacity: 0, filter: 'blur(4px)' }}
+                                    transition={{ duration: 0.2, delay: index * 0.05 }}
+                                    data-no-drag
+                                    onClick={() => {
+                                      setSelectedClaudeSession(null)
+                                      setSelectedAgentId(null)
+                                      setSelectedSessionKey({ agentId: s.agentId, key: s.key })
+                                    }}
+                                    className="group flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-white/[0.04] transition-colors cursor-pointer"
+                                  >
+                                    <div className="shrink-0 flex items-center justify-center w-4 h-4">
+                                      {s.active ? (
+                                        <Asterisk className="w-4 h-4 text-emerald-400 animate-[spin_4s_linear_infinite]" strokeWidth={2.5} />
+                                      ) : (
+                                        <span className="w-1 h-1 rounded-full bg-slate-600" />
+                                      )}
+                                    </div>
+                                    <div className="flex items-baseline gap-2 min-w-0 flex-1">
+                                      <span className={`text-sm font-bold tracking-wide truncate ${s.active ? 'text-slate-200' : 'text-slate-400'}`}>{label}</span>
+                                    </div>
+                                    <button
+                                      data-no-drag
+                                      onClick={(e) => {
+                                        e.stopPropagation()
+                                        dismissedSessionsRef.current.set(`${s.agentId}:${s.key}`, s.updatedAt)
+                                        setAllSessions((prev) => prev.filter((ss) => !(ss.agentId === s.agentId && ss.key === s.key)))
+                                      }}
+                                      className="shrink-0 text-slate-600 hover:text-rose-500 transition-colors outline-none"
+                                      title={t('mini.remove')}
+                                    >
+                                      <Trash2 className="w-4 h-4" strokeWidth={2} />
+                                    </button>
+                                  </motion.div>
+                                )
+                              } else {
+                                const cs = item.data
+                                // Hermes title mirrors OpenClaw: stable identity + sequence,
+                                // never the question (the question is appended separately below).
+                                const hermesTitle = `Hermes #${getHermesSeq(cs.sessionId)}`
+                                const projectName = cs.source === 'hermes' ? hermesTitle : (cs.cwd ? cs.cwd.replace(/\\/g, '/').split('/').pop() : 'unknown')
+                                const isActive = item.active
+                                const isWaiting = cs.status === 'waiting'
+                                const statusText = cs.tool
+                                  ? `🔧 ${cs.tool}`
+                                  : cs.status === 'stopped'
+                                    ? t('mini.idle')
+                                    : cs.status === 'waiting'
+                                      ? '⏳ ' + t('mini.waiting')
+                                      : cs.status === 'processing'
+                                        ? t('mini.thinking')
+                                        : cs.status === 'tool_running'
+                                          ? t('mini.working')
+                                          : cs.status === 'compacting'
+                                            ? t('mini.compacting')
+                                            : cs.status
+                                const label = `${projectName}${cs.userPrompt ? ` - ${cs.userPrompt}` : ` - ${statusText}`}`
+                                return (
+                                  <motion.div
+                                    key={`claude-${cs.sessionId}`}
+                                    layout
+                                    initial={{ opacity: 0, x: -10 }}
+                                    animate={{ opacity: 1, x: 0 }}
+                                    exit={{ opacity: 0, filter: 'blur(4px)' }}
+                                    transition={{ duration: 0.2, delay: index * 0.05 }}
+                                    data-no-drag
+                                    onClick={() => {
+                                      setSelectedAgentId(null)
+                                      setSelectedSessionKey(null)
+                                      setSelectedClaudeSession(cs.sessionId)
+                                    }}
+                                    className="group flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-white/[0.04] transition-colors cursor-pointer"
+                                  >
+                                    <div className="shrink-0 flex items-center justify-center w-4 h-4">
+                                      {isActive || isWaiting ? (
+                                        <Asterisk className={`w-4 h-4 animate-[spin_4s_linear_infinite] ${isWaiting ? 'text-amber-400' : 'text-emerald-400'}`} strokeWidth={2.5} />
+                                      ) : (
+                                        <span className="w-1 h-1 rounded-full bg-slate-600" />
+                                      )}
+                                    </div>
+                                    <div className="flex items-baseline gap-2 min-w-0 flex-1">
+                                      <span className={`text-sm font-bold tracking-wide truncate ${isActive || isWaiting ? 'text-slate-200' : 'text-slate-400'}`}>{label}</span>
+                                    </div>
+                                    <button
+                                      data-no-drag
+                                      onClick={(e) => {
+                                        e.stopPropagation()
+                                        invoke('remove_claude_session', { sessionId: cs.sessionId }).catch(() => {})
+                                        // Remote (ssh:) sessions bypass the backend dismissed
+                                        // filter, so also record the dismissal on the frontend.
+                                        if (cs.sessionId.startsWith('ssh:')) remoteDismissedRef.current.set(cs.sessionId, Date.now())
+                                        setClaudeSessions((prev) => prev.filter((s) => s.sessionId !== cs.sessionId))
+                                      }}
+                                      className="shrink-0 text-slate-600 hover:text-rose-500 transition-colors outline-none"
+                                      title={t('mini.remove')}
+                                    >
+                                      <Trash2 className="w-4 h-4" strokeWidth={2} />
+                                    </button>
+                                  </motion.div>
+                                )
+                              }
+                            })
+                          })()}
+                        </AnimatePresence>
+                      </div>
+
+                      {/* Trademark / Footer */}
+                      <div className="mt-auto pt-1.5 pb-1 flex justify-center items-center select-none">
+                        <span
+                          data-no-drag
+                          onClick={() => invoke('open_url', { url: 'https://github.com/rainnoon/oc-claw' })}
+                          className="text-[10px] font-black tracking-[0.25em] text-slate-500 uppercase cursor-pointer hover:text-slate-300 transition-colors"
+                        >
+                          oc–claw.ai
+                        </span>
+                      </div>
+                    </div>
+                  </motion.div>
+                )
+              ) : selectedSessionKey ? (
+                /* ===== OpenClaw session chat ===== */
+                <motion.div
+                  key="oc-chat"
+                  style={{ background: '#1a1a1a', display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}
+                  initial={{ opacity: 0, filter: 'blur(8px)', y: -20 }}
+                  animate={{ opacity: 1, filter: 'blur(0px)', y: 0 }}
+                  exit={{ opacity: 0, filter: 'blur(8px)', y: -20 }}
+                  transition={{ duration: 0.25, delay: 0.05 }}
+                >
+                  {sessionMessages.length === 0 ? (
+                    <div style={{ color: 'rgba(255,255,255,0.3)', fontSize: 11, textAlign: 'center', padding: '30px 0' }}>{t('common.loading')}</div>
+                  ) : (
+                    <ChatList messages={sessionMessages} accentColor="#2ecc71" />
+                  )}
+                </motion.div>
+              ) : selectedClaudeSession ? (
+                /* ===== Claude session chat ===== */
+                <motion.div
+                  key="claude-chat"
+                  style={{ background: '#1a1a1a', display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}
+                  initial={{ opacity: 0, filter: 'blur(8px)', y: -20 }}
+                  animate={{ opacity: 1, filter: 'blur(0px)', y: 0 }}
+                  exit={{ opacity: 0, filter: 'blur(8px)', y: -20 }}
+                  transition={{ duration: 0.25, delay: 0.05 }}
+                >
+                  {claudeConversation.length === 0 ? (
+                    <div style={{ color: 'rgba(255,255,255,0.3)', fontSize: 11, textAlign: 'center', padding: '30px 0' }}>{t('common.loading')}</div>
+                  ) : (
+                    <ChatList messages={claudeConversation} accentColor="#007AFF" />
+                  )}
+                </motion.div>
+              ) : showClaudeStats ? (
+                /* ===== Claude Code stats ===== */
+                <motion.div
+                  key="claude-stats"
+                  style={{ background: '#1a1a1a', display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}
+                  initial={{ opacity: 0, filter: 'blur(8px)', y: -20 }}
+                  animate={{ opacity: 1, filter: 'blur(0px)', y: 0 }}
+                  exit={{ opacity: 0, filter: 'blur(8px)', y: -20 }}
+                  transition={{ duration: 0.25, delay: 0.05 }}
+                >
+                  <ClaudeStatsView
+                    source={claudeStatsSource}
+                    isActive={claudeStatsSource === 'hermes' ? (() => {
+                      const sid = claudeStatsSessionId
+                      if (sid && claudeStatsSsh) {
+                        const fullSid = `ssh:${claudeStatsSsh.host}:${sid}`
+                        const s = claudeSessions.find(s => s.sessionId === fullSid)
+                        return s ? s.status === 'processing' || s.status === 'tool_running' : false
+                      }
+                      const s = claudeSessions.find(s => s.source === 'hermes' && s.sessionId === sid)
+                      return s ? s.status === 'processing' || s.status === 'tool_running' : false
+                    })() : undefined}
+                    channel={claudeStatsSource === 'hermes' ? (() => {
+                      const sid = claudeStatsSessionId
+                      if (sid && claudeStatsSsh) {
+                        const fullSid = `ssh:${claudeStatsSsh.host}:${sid}`
+                        return claudeSessions.find(s => s.sessionId === fullSid)?.platform || undefined
+                      }
+                      return claudeSessions.find(s => s.source === 'hermes' && s.sessionId === sid)?.platform || undefined
+                    })() : undefined}
+                    sshConn={claudeStatsSsh ?? undefined}
+                    hermesSessionId={claudeStatsSessionId ?? undefined}
+                  />
+                </motion.div>
+              ) : (
+                /* ===== Agent detail panel (ui-2 style) ===== */
+                <motion.div
+                  key="agent-detail"
+                  style={{ background: '#1a1a1a', display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}
+                  initial={{ opacity: 0, filter: 'blur(8px)', y: -20 }}
+                  animate={{ opacity: 1, filter: 'blur(0px)', y: 0 }}
+                  exit={{ opacity: 0, filter: 'blur(8px)', y: -20 }}
+                  transition={{ duration: 0.25, delay: 0.05 }}
+                >
+                  <AgentDetailView agent={selectedAgent} metrics={metrics} extraInfo={extraInfo} />
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+        </div>
+      )}
+
+      {/* ===== Settings overlay (independent fixed layer) ===== */}
+      <AnimatePresence>
+        {showSettingsOverlay && (
+          <>
+            <div
+              data-no-drag
+              onMouseDown={(e) => {
+                // While a native picker is active, also swallow mousedown
+                // so the underlying mini panel cannot receive a stray
+                // click that would tear down the settings layout (and
+                // leave the mascot stuck in the `hiding` state).
+                if (isSettingsPickerBlockingClose()) {
+                  debugToTerminal('overlay', 'overlay mousedown swallowed: settings picker active')
+                  e.preventDefault()
+                  e.stopPropagation()
+                  return
+                }
+                if (e.target === e.currentTarget) {
+                  debugToTerminal('overlay', 'overlay mousedown on backdrop (swallow)')
+                  e.preventDefault()
+                  e.stopPropagation()
+                }
+              }}
+              onClick={(e) => {
+                if (isSettingsPickerBlockingClose()) {
+                  // Always swallow clicks while a picker is in flight,
+                  // regardless of which descendant they hit.
+                  debugToTerminal('overlay', 'overlay click swallowed: settings picker active')
+                  e.preventDefault()
+                  e.stopPropagation()
+                  return
+                }
+                if (e.target !== e.currentTarget) return
+                debugToTerminal('overlay', 'overlay click backdrop -> exitSettings')
+                e.preventDefault()
+                e.stopPropagation()
+                exitSettings()
+              }}
+              style={{
+                position: 'fixed',
+                inset: 0,
+                zIndex: 40,
+                background: 'rgba(0,0,0,0.01)',
+              }}
+            />
+            <motion.div
+              key="settings-overlay"
+              data-no-drag
+              className="scrollbar-hidden"
+              variants={{
+                hidden: { opacity: 0, scale: 0.96, y: -24, filter: 'blur(10px)' },
+                visible: { opacity: 1, scale: 1, y: 0, filter: 'blur(0px)', transition: { type: 'spring', damping: 22, stiffness: 150, mass: 1.2 } },
+                exit: { opacity: 0, scale: 0.96, y: -24, filter: 'blur(10px)', transition: { type: 'spring', damping: 25, stiffness: 300 } },
+              }}
+              initial="hidden"
+              animate="visible"
+              exit="exit"
+              style={{
+                position: 'fixed',
+                top: 4,
+                left: 12,
+                right: 12,
+                bottom: 12,
+                zIndex: 50,
+                background: '#0f0f13',
+                border: '1px solid rgba(255,255,255,0.08)',
+                borderRadius: 24,
+                display: 'flex',
+                flexDirection: 'column',
+                transformOrigin: 'top center',
+                overflow: 'hidden',
+              }}
+            >
+              {/* Settings header */}
+              <div id="settings-overlay" className="flex items-center justify-between px-4 py-2.5 shrink-0 bg-[#18181c] border-b border-white/[0.06]">
+                <div className="flex items-center gap-6 min-w-0 flex-1">
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <button
+                      data-no-drag
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        exitSettings(true)
+                      }}
+                      style={{
+                        background: 'rgba(255,255,255,0.06)',
+                        border: 'none',
+                        color: 'rgba(255,255,255,0.6)',
+                        fontSize: 11,
+                        cursor: 'pointer',
+                        padding: '3px 8px',
+                        borderRadius: 6,
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 4,
+                      }}
+                    >
+                      <span style={{ fontSize: 13 }}>&lsaquo;</span> {t('common.back')}
+                    </button>
+                    {(appMode === 'pet' ? ['settings'] as const : ['pairing', 'settings'] as const).map((nav) => (
+                      <button
+                        key={nav}
+                        data-no-drag
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          setSettingsNav(nav)
+                        }}
+                        style={{
+                          background: settingsNav === nav ? 'rgba(255,255,255,0.12)' : 'none',
+                          border: 'none',
+                          color: settingsNav === nav ? '#fff' : 'rgba(255,255,255,0.4)',
+                          fontSize: 11,
+                          cursor: 'pointer',
+                          padding: '3px 10px',
+                          borderRadius: 6,
+                          fontWeight: settingsNav === nav ? 600 : 400,
+                        }}
+                      >
+                        {nav === 'pairing' ? t('mini.pairing') : t('mini.settings')}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <button
+                  data-no-drag
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    exitSettings(true)
+                  }}
+                  className="text-slate-400 hover:text-rose-500 transition-colors ml-1"
+                >
+                  <X className="w-4.5 h-4.5" strokeWidth={2.5} />
+                </button>
+              </div>
+              <div style={{ flex: 1, overflow: 'hidden', margin: 8, marginTop: 0, borderRadius: 12, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+                <div className="bg-[#151515] text-white font-sans antialiased scrollbar-hidden" style={{ borderRadius: '12px 12px 0 0', overflow: 'auto', flex: 1, minHeight: 0 }}>
+                  {settingsNav === 'pairing' && (
+                    <div className="h-full overflow-y-auto bg-[#151515] pt-6 px-6 pb-10 scrollbar-hidden">
+                      <div className="max-w-3xl mx-auto">
+                        <p className="text-sm text-white/50 mb-6">
+                          选择小看板娘要使用的 codex 像素宠物。大看板娘（香企鹅）由顶部按钮切换。
+                        </p>
+                        <PetPicker
+                          selectedId={largeMascot ? '__xiang-qi-e__' : (miniPet?.id ?? null)}
+                          onSelect={async (pet) => {
+                            await saveMiniPetId(pet.id)
+                            setMiniPet(pet)
+                            if (largeMascot) {
+                              setLargeMascot(false)
+                              largeMascotRef.current = false
+                              const store = await load('settings.json', { defaults: {}, autoSave: true })
+                              await store.set('large_mascot', false)
+                              await store.save()
+                            }
+                          }}
+                          specialPets={[
+                            {
+                              id: '__xiang-qi-e__',
+                              displayName: '香企鹅',
+                              description: '特殊的存在',
+                              avatar: <span style={{ fontSize: 24, lineHeight: 1 }}>🐧</span>,
+                            },
+                          ]}
+                          onSelectSpecial={async (pet) => {
+                            if (pet.id !== '__xiang-qi-e__') return
+                            setLargeMascot(true)
+                            largeMascotRef.current = true
+                            if (largeActionTimerRef.current) clearTimeout(largeActionTimerRef.current)
+                            largeActionTimerRef.current = null
+                            setLargePetAction(null)
+                            largePetActionRef.current = null
+                            const store = await load('settings.json', { defaults: {}, autoSave: true })
+                            await store.set('large_mascot', true)
+                            await store.save()
+                          }}
+                          queueIds={petQueue}
+                          onChangeQueue={savePetQueue}
+                          largeMascotScale={largeMascotScale}
+                          onChangeLargeMascotScale={async (v) => {
+                            const clamped = Math.min(6, Math.max(1, v))
+                            setLargeMascotScale(clamped)
+                            largeMascotScaleRef.current = clamped
+                            const store = await load('settings.json', { defaults: {}, autoSave: true })
+                            await store.set('large_mascot_scale', clamped)
+                            await store.save()
+                          }}
+                          onNativeDialogStart={() => {
+                            debugToTerminal('dialog', `native picker start (before=${nativeDialogActiveRef.current})`)
+                            if (settingsModeRef.current) {
+                              settingsPickerOpenRef.current = true
+                              debugToTerminal('dialog', 'settingsPickerOpen=true')
+                            }
+                            settingsPickerCloseGraceUntilRef.current = Date.now() + 600
+                            setNativeDialogActive(true)
+                          }}
+                          onNativeDialogEnd={() => {
+                            debugToTerminal('dialog', `native picker end (before=${nativeDialogActiveRef.current})`)
+                            settingsPickerOpenRef.current = false
+                            settingsPickerCloseGraceUntilRef.current = Date.now() + 2000
+                            debugToTerminal('dialog', 'settingsPickerOpen=false')
+                            setNativeDialogActive(false)
+                          }}
+                          petdexUrl={petdexUrl}
+                          petdexFailed={petdexFailed}
+                        />
+                      </div>
+                    </div>
+                  )}
+                  {settingsNav === 'settings' && (
+                    <div className="h-full overflow-y-auto bg-[#151515] scrollbar-hidden">
+                      <SettingsTab
+                        notifySound={notifySound}
+                        onChangeNotifySound={async (v) => {
+                          setNotifySound(v)
+                          const store = await getStore()
+                          await store.set('notify_sound', v)
+                          await store.save()
+                        }}
+                        soundEnabled={soundEnabled}
+                        onToggleSoundEnabled={async (v) => {
+                          setSoundEnabled(v)
+                          const store = await getStore()
+                          await store.set('sound_enabled', v)
+                          await store.save()
+                        }}
+                        codexSoundEnabled={codexSoundEnabled}
+                        onToggleCodexSoundEnabled={async (v) => {
+                          setCodexSoundEnabled(v)
+                          const store = await getStore()
+                          await store.set('codex_sound_enabled', v)
+                          await store.save()
+                        }}
+                        cursorSoundEnabled={cursorSoundEnabled}
+                        onToggleCursorSoundEnabled={async (v) => {
+                          setCursorSoundEnabled(v)
+                          const store = await getStore()
+                          await store.set('cursor_sound_enabled', v)
+                          await store.save()
+                        }}
+                        geminiSoundEnabled={geminiSoundEnabled}
+                        onToggleGeminiSoundEnabled={async (v) => {
+                          setGeminiSoundEnabled(v)
+                          const store = await getStore()
+                          await store.set('gemini_sound_enabled', v)
+                          await store.save()
+                        }}
+                        opencodeSoundEnabled={opencodeSoundEnabled}
+                        onToggleOpencodeSoundEnabled={async (v) => {
+                          setOpencodeSoundEnabled(v)
+                          const store = await getStore()
+                          await store.set('opencode_sound_enabled', v)
+                          await store.save()
+                        }}
+                        hermesSoundEnabled={hermesSoundEnabled}
+                        onToggleHermesSoundEnabled={async (v) => {
+                          setHermesSoundEnabled(v)
+                          const store = await getStore()
+                          await store.set('hermes_sound_enabled', v)
+                          await store.save()
+                        }}
+                        waitingSound={waitingSound}
+                        onToggleWaitingSound={async (v) => {
+                          setWaitingSound(v)
+                          const store = await getStore()
+                          await store.set('waiting_sound', v)
+                          await store.save()
+                        }}
+                        autoCloseCompletion={autoCloseCompletion}
+                        onToggleAutoCloseCompletion={async (v) => {
+                          setAutoCloseCompletion(v)
+                          const store = await getStore()
+                          await store.set('auto_close_completion', v)
+                          await store.save()
+                        }}
+                        autoExpandOnTask={autoExpandOnTask}
+                        onToggleAutoExpandOnTask={async (v) => {
+                          setAutoExpandOnTask(v)
+                          autoExpandOnTaskRef.current = v
+                          const store = await getStore()
+                          await store.set('auto_expand_on_task', v)
+                          await store.save()
+                        }}
+                        islandBg={islandBg}
+                        onChangeIslandBg={async (v) => {
+                          setIslandBg(v)
+                          const store = await getStore()
+                          await store.set('island_bg', v)
+                          await store.save()
+                        }}
+                        bgPos={bgPos}
+                        onChangeBgPos={async (v) => {
+                          setBgPos(v)
+                          const store = await getStore()
+                          await store.set('island_bg_pos', v)
+                          await store.save()
+                        }}
+                        panelMaxHeight={panelMaxHeight}
+                        onChangePanelMaxHeight={async (v) => {
+                          setPanelMaxHeight(v)
+                          const store = await getStore()
+                          await store.set('panel_max_height', v)
+                          await store.save()
+                        }}
+                        hoverDelay={hoverDelay}
+                        onChangeHoverDelay={async (v) => {
+                          setHoverDelay(v)
+                          hoverDelayRef.current = v
+                          const store = await getStore()
+                          await store.set('hover_delay', v)
+                          await store.save()
+                        }}
+                        largeMascotScale={largeMascotScale}
+                        onChangeLargeMascotScale={async (v) => {
+                          const clamped = Math.min(6, Math.max(1, v))
+                          setLargeMascotScale(clamped)
+                          largeMascotScaleRef.current = clamped
+                          const store = await getStore()
+                          await store.set('large_mascot_scale', clamped)
+                          await store.save()
+                        }}
+                        appMode={appMode}
+                        onChangeAppMode={handleSelectAppMode}
+                        petSfxEnabled={petSfxEnabled}
+                        onTogglePetSfxEnabled={async (v) => {
+                          setPetSfxEnabled(v)
+                          petSfxEnabledRef.current = v
+                          const store = await getStore()
+                          await store.set('pet_sfx_enabled', v)
+                          await store.save()
+                        }}
+                        petIdleIntervalMin={petIdleIntervalMin}
+                        onChangePetIdleIntervalMin={async (v) => {
+                          const clamped = Math.min(30, Math.max(0.5, v))
+                          setPetIdleIntervalMin(clamped)
+                          petIdleIntervalMinRef.current = clamped
+                          const store = await getStore()
+                          await store.set('pet_idle_interval_min', clamped)
+                          await store.save()
+                        }}
+                      />
+                    </div>
+                  )}
+                </div>
+                <div
+                  style={{
+                    background: '#1a1a1a',
+                    padding: '10px 14px',
+                    borderRadius: '0 0 12px 12px',
+                    flexShrink: 0,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                  }}
+                >
+                  <span
+                    onClick={() => invoke('open_url', { url: 'https://github.com/rainnoon/oc-claw' })}
+                    style={{
+                      color: 'rgba(255,255,255,0.35)',
+                      fontSize: 11,
+                      cursor: 'pointer',
+                      transition: 'color 0.25s, transform 0.25s, letter-spacing 0.25s',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 4,
+                    }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.color = '#f5c542'
+                      e.currentTarget.style.transform = 'scale(1.04)'
+                      e.currentTarget.style.letterSpacing = '0.3px'
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.color = 'rgba(255,255,255,0.35)'
+                      e.currentTarget.style.transform = 'scale(1)'
+                      e.currentTarget.style.letterSpacing = '0px'
+                    }}
+                  >
+                    {t('mini.starPrompt')} <span style={{ fontSize: 13, lineHeight: 1 }}>⭐</span> {t('mini.starPromptSuffix')}
+                  </span>
+                </div>
+              </div>
+            </motion.div>
+          </>
+        )}
+      </AnimatePresence>
+
+      <UpdateModal
+        open={updateModalOpen}
+        phase={updateModalPhase}
+        info={updateModalInfo}
+        progress={updateModalProgress}
+        progressStage={updateModalProgressStage}
+        onLater={closeUpdateModal}
+        onSkipVersion={skipCurrentUpdateVersion}
+        onUpdateNow={runUpdateFromModal}
+        onRestartNow={restartFromModal}
+      />
+
+      <CreateCharacterModal
+        isOpen={isCreateModalOpen}
+        onClose={() => setIsCreateModalOpen(false)}
+        onSaved={async () => {
+          await invoke('scan_characters')
+          const chars = await loadCharacters()
+          setCharacters(chars)
+        }}
+      />
+
+      {/* Onboarding modal — first launch only */}
+      <OnboardingModal open={showOnboarding} onSelect={handleSelectAppMode} />
+
+      {/* Pet context menu rendered inside mascot wrapper below */}
+    </div>
+  )
+}

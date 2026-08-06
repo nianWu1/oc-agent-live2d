@@ -1,0 +1,225 @@
+---
+import { t as tr, type Lang } from '../i18n/index';
+import MacbookMockup from './MacbookMockup.astro';
+
+interface Props {
+  lang?: Lang;
+}
+
+const { lang = 'en' } = Astro.props;
+---
+
+<section class="hero">
+  <img src="/app-icon.png" alt="OC-Claw app icon" class="app-icon" width="180" height="180" />
+  <div class="hero-copy">
+    <h1>OC-Claw</h1>
+  </div>
+  <div class="btn-wrap">
+    <a id="download-btn" href="https://github.com/rainnoon/oc-claw/releases/download/v1.8.6/oc-claw_1.8.6_aarch64.dmg" class="btn" download>
+      <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+        <polyline points="7 10 12 15 17 10"/>
+        <line x1="12" y1="15" x2="12" y2="3"/>
+      </svg>
+      <span id="download-label">{tr(lang, 'hero.download.mac')}</span>
+    </a>
+    <a href="https://github.com/rainnoon/oc-claw" target="_blank" rel="noopener" class="btn btn-secondary">
+      <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+      </svg>
+      <span>{tr(lang, 'hero.star')}</span>
+    </a>
+  </div>
+  <p class="tagline" id="hero-tagline">{tr(lang, 'hero.tagline')}</p>
+  <div class="agent-chips" id="agent-chips">
+    <a href="https://github.com/nicepkg/openclaw" target="_blank" rel="noopener" class="agent-chip">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#4ade80" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a7 7 0 0 0-7 7c0 3.5 2.5 6.5 5 8v3h4v-3c2.5-1.5 5-4.5 5-8a7 7 0 0 0-7-7z"/><path d="M9 22h6"/><path d="M10 2v1"/><path d="M14 2v1"/></svg>
+      <span>OpenClaw</span>
+    </a>
+    <a href="https://docs.anthropic.com/en/docs/claude-code" target="_blank" rel="noopener" class="agent-chip">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#e87a65" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.64 3.64-1.28-1.28a1.21 1.21 0 0 0-1.72 0L2.36 18.64a1.21 1.21 0 0 0 0 1.72l1.28 1.28a1.2 1.2 0 0 0 1.72 0L21.64 5.36a1.2 1.2 0 0 0 0-1.72z"/><path d="m14 7 3 3"/></svg>
+      <span>Claude Code CLI/Desktop</span>
+    </a>
+    <a href="https://github.com/openai/codex" target="_blank" rel="noopener" class="agent-chip" id="chip-codex">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#c4b5fd" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 8l-4 4 4 4"/><path d="M17 8l4 4-4 4"/><path d="m14 4-4 16"/></svg>
+      <span>Codex</span>
+    </a>
+    <a href="https://github.com/sst/opencode" target="_blank" rel="noopener" class="agent-chip" id="chip-opencode">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#2dd4bf" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
+      <span>opencode</span>
+    </a>
+    <a href="https://www.cursor.com" target="_blank" rel="noopener" class="agent-chip" id="chip-cursor">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#5eb5f7" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3l14 8-6 2-4 6z"/></svg>
+      <span>Cursor</span>
+    </a>
+    <a href="https://github.com/google-gemini/gemini-cli" target="_blank" rel="noopener" class="agent-chip" id="chip-gemini">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#4f8ef7" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3c.4 4.4 1.6 5.6 6 6-4.4.4-5.6 1.6-6 6-.4-4.4-1.6-5.6-6-6 4.4-.4 5.6-1.6 6-6z"/></svg>
+      <span>Gemini CLI</span>
+    </a>
+    <a href="https://github.com/NousResearch/hermes-agent" target="_blank" rel="noopener" class="agent-chip" id="chip-hermes">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#fbbf24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/></svg>
+      <span>Hermes Agent</span>
+    </a>
+  </div>
+  <MacbookMockup lang={lang} />
+</section>
+
+<section class="features">
+  <div class="feature-card">
+    <div class="feature-emoji">🐾</div>
+    <h2 class="feature-title">{tr(lang, 'hero.feature1.title')}</h2>
+    <div class="feature-desc">{tr(lang, 'hero.feature1.desc')}</div>
+  </div>
+  <div class="feature-card">
+    <div class="feature-emoji">🤖</div>
+    <h2 class="feature-title">{tr(lang, 'hero.feature2.title')}</h2>
+    <div class="feature-desc" id="feature2-desc">{tr(lang, 'hero.feature2.desc')}</div>
+  </div>
+  <div class="feature-card">
+    <div class="feature-emoji">🎨</div>
+    <h2 class="feature-title">{tr(lang, 'hero.feature3.title')}</h2>
+    <div class="feature-desc">{tr(lang, 'hero.feature3.desc')}</div>
+  </div>
+</section>
+
+<script define:vars={{ winLabel: tr(lang, 'hero.download.win'), winTagline: tr(lang, 'hero.tagline.win'), winFeature2: tr(lang, 'hero.feature2.desc.win') }}>
+  {
+    const btn = document.getElementById('download-btn');
+    const label = document.getElementById('download-label');
+    if (btn && label && navigator.userAgent.includes('Windows')) {
+      btn.setAttribute('href', 'https://github.com/rainnoon/oc-claw/releases/download/v1.8.6/oc-claw_1.8.6_x64-setup.exe');
+      label.textContent = winLabel;
+      // Show the macbook mockup and the action buttons on Windows too — the
+      // mockup demo (companion / jump / approve / details / monitor) is now
+      // generic enough to run on either platform. All agent chips (Codex and
+      // opencode included) now run on Windows as well, so none are hidden;
+      // any future mac-only chip can opt back in with `.agent-chip-mac`.
+      document.querySelectorAll('.agent-chip-mac').forEach(el => el.style.display = 'none');
+      const tagline = document.getElementById('hero-tagline');
+      if (tagline) tagline.textContent = winTagline;
+      const f2 = document.getElementById('feature2-desc');
+      if (f2) f2.textContent = winFeature2;
+    }
+  }
+
+  const SHAPES = ['star4', 'star6', 'cross', 'circle', 'dot', 'diamond', 'ring'];
+  const COLORS = [
+    '#f47b38', '#ff9a5d', '#ffb180',
+    '#a78bfa', '#818cf8',
+    '#34d399', '#6ee7b7',
+    '#f472b6', '#fb7185',
+    '#60a5fa', '#38bdf8',
+    '#fbbf24', '#facc15',
+  ];
+
+  const SHAPE_PATHS = {
+    star4: 'M8 0L9.5 6.5 16 8 9.5 9.5 8 16 6.5 9.5 0 8 6.5 6.5Z',
+    star6: 'M8 0L9.2 5.5 14 2 10.5 6.8 16 8 10.5 9.2 14 14 9.2 10.5 8 16 6.8 10.5 2 14 5.5 9.2 0 8 5.5 6.8 2 2 6.8 5.5Z',
+    cross: 'M7 0h2v16H7zM0 7h16v2H0z',
+    diamond: 'M8 2L14 8 8 14 2 8Z',
+  };
+  const CIRCLE_SHAPES = {
+    circle: { r: 3.5, sw: 1.5, fill: false },
+    dot: { r: 2.5, sw: 0, fill: true },
+    ring: { r: 5, sw: 1, fill: false },
+  };
+
+  const MAX_PARTICLES = 40;
+  let liveCount = 0;
+
+  function createSparkleEl(shape, color, size) {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('width', String(size));
+    svg.setAttribute('height', String(size));
+    svg.setAttribute('viewBox', '0 0 16 16');
+
+    if (SHAPE_PATHS[shape]) {
+      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      path.setAttribute('d', SHAPE_PATHS[shape]);
+      if (shape === 'diamond') {
+        path.setAttribute('stroke', color);
+        path.setAttribute('stroke-width', '1.5');
+        path.setAttribute('fill', 'none');
+      } else {
+        path.setAttribute('fill', color);
+      }
+      svg.appendChild(path);
+    } else {
+      const c = CIRCLE_SHAPES[shape];
+      const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      circle.setAttribute('cx', '8');
+      circle.setAttribute('cy', '8');
+      circle.setAttribute('r', String(c.r));
+      if (c.fill) {
+        circle.setAttribute('fill', color);
+      } else {
+        circle.setAttribute('stroke', color);
+        circle.setAttribute('stroke-width', String(c.sw));
+        circle.setAttribute('fill', 'none');
+      }
+      svg.appendChild(circle);
+    }
+
+    const el = document.createElement('div');
+    el.className = 'sparkle';
+    el.appendChild(svg);
+    return el;
+  }
+
+  function spawnSparkle(container, rect) {
+    if (liveCount >= MAX_PARTICLES) return;
+
+    const shape = SHAPES[Math.floor(Math.random() * SHAPES.length)];
+    const color = COLORS[Math.floor(Math.random() * COLORS.length)];
+    const size = 6 + Math.random() * 12;
+
+    const padX = 60;
+    const padY = 50;
+    const x = -padX + Math.random() * (rect.width + padX * 2);
+    const y = -padY + Math.random() * (rect.height + padY * 2);
+
+    const inBtn = x > 0 && x < rect.width && y > 0 && y < rect.height;
+    if (inBtn && Math.random() > 0.3) return;
+
+    const el = createSparkleEl(shape, color, size);
+    el.style.left = `${x}px`;
+    el.style.top = `${y}px`;
+
+    const drift = -20 + Math.random() * 40;
+    const rise = -15 + Math.random() * -25;
+    const dur = 600 + Math.random() * 900;
+    const rot = Math.random() * 180 - 90;
+
+    el.style.setProperty('--drift', `${drift}px`);
+    el.style.setProperty('--rise', `${rise}px`);
+    el.style.setProperty('--rot', `${rot}deg`);
+    el.style.animationDuration = `${dur}ms`;
+
+    liveCount++;
+    container.appendChild(el);
+  }
+
+  const wrap = document.querySelector('.btn-wrap');
+  if (wrap) {
+    let interval = null;
+
+    wrap.addEventListener('animationend', (e) => {
+      if (e.target.classList.contains('sparkle')) {
+        e.target.remove();
+        liveCount--;
+      }
+    });
+
+    wrap.addEventListener('mouseenter', () => {
+      const rect = wrap.getBoundingClientRect();
+      clearInterval(interval);
+      for (let i = 0; i < 8; i++) setTimeout(() => spawnSparkle(wrap, rect), i * 50);
+      interval = setInterval(() => spawnSparkle(wrap, rect), 80);
+    });
+
+    wrap.addEventListener('mouseleave', () => {
+      clearInterval(interval);
+      interval = null;
+    });
+  }
+</script>

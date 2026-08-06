@@ -1,0 +1,1575 @@
+import { useState, useEffect, useRef, useCallback } from 'react'
+import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
+import {
+  enable as enableAutostartCmd,
+  disable as disableAutostartCmd,
+  isEnabled as isAutostartEnabled,
+} from '@tauri-apps/plugin-autostart'
+import { Loader2, Check, ChevronDown, Copy, Plus, Trash2 } from 'lucide-react'
+import { AnimatePresence, motion } from 'motion/react'
+import { useTranslation } from 'react-i18next'
+import { getStore, loadOcConnections, saveOcConnections } from '../lib/store'
+import type { OcConnection } from '../lib/types'
+
+type UpdateProgressPayload = {
+  stage: string
+  progress?: number | null
+  downloadedBytes?: number
+  totalBytes?: number | null
+  message?: string
+}
+
+function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <button
+      onClick={() => onChange(!checked)}
+      className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${checked ? 'bg-blue-500' : 'bg-white/10'}`}
+      role="switch"
+      aria-checked={checked}
+    >
+      <span
+        className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${checked ? 'translate-x-5' : 'translate-x-0'}`}
+      />
+    </button>
+  )
+}
+
+function CopyCode({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false)
+  return (
+    <div className="flex items-center gap-1 bg-black/40 rounded overflow-hidden">
+      <code className="flex-1 px-2 py-1 text-[11px] text-white/60 font-mono select-all">{text}</code>
+      <button
+        onClick={() => { navigator.clipboard.writeText(text); setCopied(true); setTimeout(() => setCopied(false), 1500) }}
+        className="px-1.5 py-1 text-white/30 hover:text-white/60 transition-colors shrink-0"
+      >
+        {copied ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+      </button>
+    </div>
+  )
+}
+
+function ConnectionRow({ conn, onUpdate, onDelete, disableLocal }: { conn: OcConnection; onUpdate: (c: OcConnection) => void; onDelete: () => void; disableLocal?: boolean }) {
+  const { t } = useTranslation()
+  const [testing, setTesting] = useState(false)
+  const [testResult, setTestResult] = useState<'success' | 'error' | null>(null)
+  const [testMsg, setTestMsg] = useState('')
+  const [showGuide, setShowGuide] = useState(false)
+  // Used to discard results from a cancelled test — the Tauri invoke can't
+  // be aborted, but we stop the UI from acting on stale results.
+  const cancelledRef = useRef(false)
+
+  const testConnection = async () => {
+    cancelledRef.current = false
+    setTesting(true)
+    setTestResult(null)
+    setTestMsg('')
+    try {
+      if (conn.type === 'remote') {
+        // Reset backoff and stale socket so manual test always retries immediately
+        await invoke('reset_ssh', { sshHost: conn.host, sshUser: conn.user }).catch(() => {})
+        const result: any = await invoke('get_agents', { mode: 'remote', sshHost: conn.host, sshUser: conn.user })
+        if (cancelledRef.current) return
+        // Query which SSH key was used for this connection
+        let keyInfo = ''
+        try {
+          const key = await invoke('get_ssh_key_info', { sshHost: conn.host, sshUser: conn.user }) as string | null
+          if (key) keyInfo = ` · ${t('settings.key')} ${key}`
+        } catch {}
+        setTestMsg(`${result.length} ${t('settings.agents')}${keyInfo}`)
+      } else {
+        const store = await getStore()
+        const agentId = ((await store.get('tracked_agent')) as string) || 'main'
+        const result: any = await invoke('get_status', { gatewayUrl: 'http://localhost:4446', token: '', agentId })
+        if (cancelledRef.current) return
+        setTestMsg(`${result.sessions.length} ${t('settings.sessions')}`)
+      }
+      setTestResult('success')
+      setTimeout(() => setTestResult(null), 3000)
+    } catch (e: any) {
+      if (cancelledRef.current) return
+      setTestResult('error')
+      setTestMsg(String(e))
+    }
+    setTesting(false)
+  }
+
+  const cancelTest = () => {
+    cancelledRef.current = true
+    setTesting(false)
+    setTestResult(null)
+    setTestMsg('')
+    // Kill the SSH connection so it doesn't hang in the background
+    if (conn.type === 'remote' && conn.host && conn.user) {
+      invoke('close_ssh', { sshHost: conn.host, sshUser: conn.user }).catch(() => {})
+    }
+  }
+
+  return (
+    <div className="p-4 flex flex-col gap-3">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <div className="flex bg-black/50 p-0.5 rounded-lg border border-white/5">
+            {(['local', 'remote'] as const).map((typ) => {
+              // Only one local connection allowed across all connections
+              const disabled = typ === 'local' && disableLocal
+              return (
+                <button
+                  key={typ}
+                  onClick={() => !disabled && onUpdate({ ...conn, type: typ })}
+                  className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${conn.type === typ ? 'bg-white/10 text-white' : disabled ? 'text-white/15 cursor-not-allowed' : 'text-white/40 hover:text-white/60'}`}
+                >
+                  {typ === 'local' ? t('settings.local') : t('settings.remote')}
+                </button>
+              )
+            })}
+          </div>
+          <span className="text-xs text-white/30">
+            {conn.type === 'local' ? '~/.openclaw' : conn.host ? `${conn.user || 'root'}@${conn.host}` : t('settings.notConfigured')}
+          </span>
+        </div>
+        <button onClick={onDelete} className="p-1.5 text-white/20 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10">
+          <Trash2 className="w-3.5 h-3.5" />
+        </button>
+      </div>
+
+      <AnimatePresence>
+        {conn.type === 'remote' && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            className="flex flex-col gap-3 overflow-hidden"
+          >
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={conn.user || ''}
+                onChange={(e) => onUpdate({ ...conn, user: e.target.value })}
+                placeholder={t('settings.username')}
+                autoCapitalize="off"
+                autoCorrect="off"
+                spellCheck={false}
+                className="w-24 bg-black/50 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder:text-white/30 focus:outline-none focus:border-white/30 transition-colors"
+              />
+              <span className="self-center text-white/30 text-sm">@</span>
+              <input
+                type="text"
+                value={conn.host || ''}
+                onChange={(e) => onUpdate({ ...conn, host: e.target.value })}
+                placeholder={t('settings.serverAddress')}
+                className="flex-1 bg-black/50 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder:text-white/30 focus:outline-none focus:border-white/30 transition-colors"
+              />
+            </div>
+            <button
+              onClick={() => setShowGuide(!showGuide)}
+              className="flex items-center gap-1 text-xs text-white/40 hover:text-white/60 transition-colors w-fit"
+            >
+              <ChevronDown className={`w-3 h-3 transition-transform ${showGuide ? 'rotate-0' : '-rotate-90'}`} />
+              {t('settings.howToConnect')}
+            </button>
+            <AnimatePresence>
+              {showGuide && (
+                <motion.div
+                  initial={{ height: 0, opacity: 0 }}
+                  animate={{ height: 'auto', opacity: 1 }}
+                  exit={{ height: 0, opacity: 0 }}
+                  className="overflow-hidden"
+                >
+                  <div className="bg-white/[0.03] border border-white/5 rounded-lg p-3 flex flex-col gap-2 text-xs text-white/50 leading-relaxed">
+                    <p className="text-white/70 font-medium">{t('settings.prerequisites')}</p>
+                    <p>{t('settings.prerequisitesDesc')}</p>
+                    <p className="text-white/70 font-medium pt-1">{t('settings.steps')}</p>
+                    <p>{t('settings.step1')}</p>
+                    <CopyCode text="ssh-keygen -t ed25519" />
+                    <p>{t('settings.step2')}</p>
+                    <CopyCode text="ssh-copy-id -i ~/.ssh/id_ed25519.pub 用户名@xx.xx.xx.xx" />
+                    <p>{t('settings.step3')}</p>
+                    <CopyCode text={`ssh 用户名@xx.xx.xx.xx "echo ok"`} />
+                    <p>{t('settings.step4')}</p>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <div className="flex items-center gap-2">
+        <button
+          onClick={testConnection}
+          disabled={testing || (conn.type === 'remote' && (!conn.host || !conn.user))}
+          className="px-3 py-1.5 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-xs font-medium text-white transition-colors flex items-center gap-1.5 disabled:opacity-50"
+        >
+          {testing && <Loader2 className="w-3 h-3 animate-spin" />}
+          {t('common.test')}
+        </button>
+        {testing && (
+          <button
+            onClick={cancelTest}
+            className="px-3 py-1.5 bg-white/5 hover:bg-red-500/20 border border-white/10 rounded-lg text-xs font-medium text-white/50 hover:text-red-400 transition-colors"
+          >
+            {t('common.cancel')}
+          </button>
+        )}
+        {testResult === 'success' && (
+          <span className="text-xs text-emerald-400 flex items-center gap-1">
+            <Check className="w-3 h-3" /> {t('common.success')} {testMsg && `· ${testMsg}`}
+          </span>
+        )}
+        {testResult === 'error' && (
+          <div className="text-xs text-red-400 w-full">
+            <span>{t('common.failed')}</span>
+            <pre className="mt-1 p-2 bg-red-500/10 border border-red-500/20 rounded-lg whitespace-pre-wrap break-all max-h-[120px] overflow-y-auto font-mono text-[11px] leading-relaxed select-text">
+              {testMsg}
+            </pre>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+type HermesConn = { id: string; type: 'local' | 'remote'; host?: string; user?: string }
+
+function HermesConnectionRow({ conn, onUpdate, onDelete, disableLocal, t }: {
+  conn: HermesConn; onUpdate: (c: HermesConn) => void; onDelete: () => void; disableLocal?: boolean
+  t: any
+}) {
+  const [testing, setTesting] = useState(false)
+  const [testResult, setTestResult] = useState<'success' | 'error' | null>(null)
+  const [testMsg, setTestMsg] = useState('')
+  const [showGuide, setShowGuide] = useState(false)
+  const [needsPlugin, setNeedsPlugin] = useState(false)
+  const [installingPlugin, setInstallingPlugin] = useState(false)
+  // Require an explicit confirmation before installing/updating the plugin,
+  // because it restarts the Hermes gateway and can interrupt running sessions.
+  const [confirmingInstall, setConfirmingInstall] = useState(false)
+  const [installMsg, setInstallMsg] = useState('')
+  const [pluginChecked, setPluginChecked] = useState(false)
+  const cancelledRef = useRef(false)
+
+  // Auto-detect plugin status when panel opens (local connections only)
+  useEffect(() => {
+    if (conn.type !== 'local') return
+    let cancelled = false
+    ;(async () => {
+      try {
+        const result: any = await invoke('test_hermes_hook')
+        if (cancelled) return
+        const checks: { ok: boolean; msg: string }[] = result.checks || []
+        const pluginOk = checks.filter(c => c.msg.toLowerCase().includes('plugin')).every(c => c.ok)
+        setNeedsPlugin(!pluginOk)
+        setPluginChecked(true)
+      } catch {
+        if (!cancelled) {
+          setNeedsPlugin(true)
+          setPluginChecked(true)
+        }
+      }
+    })()
+    return () => { cancelled = true }
+  }, [conn.type, installMsg])
+
+  const testConnection = async () => {
+    cancelledRef.current = false
+    setTesting(true)
+    setTestResult(null)
+    setTestMsg('')
+    try {
+      if (conn.type === 'remote') {
+        await invoke('reset_ssh', { sshHost: conn.host, sshUser: conn.user }).catch(() => {})
+        const result: any = await invoke('test_hermes_ssh', { sshHost: conn.host, sshUser: conn.user })
+        if (cancelledRef.current) return
+        // Connection success criteria: SSH reachable + hermes installed on remote
+        const connOk = !!result.hermes_installed
+        if (connOk) {
+          let keyInfo = ''
+          try {
+            const key = await invoke('get_ssh_key_info', { sshHost: conn.host, sshUser: conn.user }) as string | null
+            if (key) keyInfo = ` · ${t('settings.key')} ${key}`
+          } catch {}
+          setTestMsg(`已连接${keyInfo}`)
+          setTestResult('success')
+        } else {
+          setTestMsg(result.hermes_installed === false ? '远程未安装 Hermes' : 'SSH 连接失败')
+          setTestResult('error')
+        }
+        // Update plugin state independently
+        setNeedsPlugin(!result.plugin_installed || !result.plugin_enabled)
+      } else {
+        const result: any = await invoke('test_hermes_hook')
+        if (cancelledRef.current) return
+        const checks: { ok: boolean; msg: string }[] = result.checks || []
+        // Connection success: ~/.hermes exists + socket running (ignore plugin checks)
+        const dirOk = checks.find(c => c.msg.toLowerCase().includes('hermes_dir') || c.msg.toLowerCase().includes('~/.hermes'))?.ok ?? false
+        const socketOk = checks.find(c => c.msg.toLowerCase().includes('socket'))?.ok ?? false
+        const connOk = dirOk && socketOk
+        if (connOk) {
+          setTestMsg('已连接')
+          setTestResult('success')
+        } else {
+          if (!dirOk) setTestMsg('~/.hermes 不存在，Hermes 未安装')
+          else if (!socketOk) setTestMsg('Socket server 未运行')
+          else setTestMsg('连接失败')
+          setTestResult('error')
+        }
+        // Update plugin state independently
+        const pluginChecks = checks.filter(c => c.msg.toLowerCase().includes('plugin'))
+        setNeedsPlugin(pluginChecks.length > 0 ? pluginChecks.some(c => !c.ok) : true)
+      }
+      setTimeout(() => setTestResult(null), 5000)
+    } catch (e: any) {
+      if (cancelledRef.current) return
+      setTestResult('error')
+      setTestMsg(String(e))
+    }
+    setTesting(false)
+  }
+
+  const cancelTest = () => {
+    cancelledRef.current = true
+    setTesting(false)
+    setTestResult(null)
+    setTestMsg('')
+    if (conn.type === 'remote' && conn.host && conn.user) {
+      invoke('close_ssh', { sshHost: conn.host, sshUser: conn.user }).catch(() => {})
+    }
+  }
+
+  return (
+    <div className="p-4 flex flex-col gap-3">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <div className="flex bg-black/50 p-0.5 rounded-lg border border-white/5">
+            {(['local', 'remote'] as const).filter(typ => !(typ === 'local' && disableLocal)).map((typ) => (
+              <button
+                key={typ}
+                onClick={() => onUpdate({ ...conn, type: typ })}
+                className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${conn.type === typ ? 'bg-white/10 text-white' : 'text-white/40 hover:text-white/60'}`}
+              >
+                {typ === 'local' ? t('settings.local') : t('settings.remote')}
+              </button>
+            ))}
+          </div>
+          <span className="text-xs text-white/30">
+            {conn.type === 'local' ? '~/.hermes' : conn.host ? `${conn.user || 'root'}@${conn.host}` : t('settings.notConfigured')}
+          </span>
+        </div>
+        <button onClick={onDelete} className="p-1.5 text-white/20 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10">
+          <Trash2 className="w-3.5 h-3.5" />
+        </button>
+      </div>
+
+      <AnimatePresence>
+        {conn.type === 'remote' && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            className="flex flex-col gap-3 overflow-hidden"
+          >
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={conn.user || ''}
+                onChange={(e) => onUpdate({ ...conn, user: e.target.value })}
+                placeholder={t('settings.username')}
+                autoCapitalize="off"
+                autoCorrect="off"
+                spellCheck={false}
+                className="w-24 bg-black/50 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder:text-white/30 focus:outline-none focus:border-white/30 transition-colors"
+              />
+              <span className="self-center text-white/30 text-sm">@</span>
+              <input
+                type="text"
+                value={conn.host || ''}
+                onChange={(e) => onUpdate({ ...conn, host: e.target.value })}
+                placeholder={t('settings.serverAddress')}
+                className="flex-1 bg-black/50 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder:text-white/30 focus:outline-none focus:border-white/30 transition-colors"
+              />
+            </div>
+            <button
+              onClick={() => setShowGuide(!showGuide)}
+              className="flex items-center gap-1 text-xs text-white/40 hover:text-white/60 transition-colors w-fit"
+            >
+              <ChevronDown className={`w-3 h-3 transition-transform ${showGuide ? 'rotate-0' : '-rotate-90'}`} />
+              {t('settings.howToConnect')}
+            </button>
+            <AnimatePresence>
+              {showGuide && (
+                <motion.div
+                  initial={{ height: 0, opacity: 0 }}
+                  animate={{ height: 'auto', opacity: 1 }}
+                  exit={{ height: 0, opacity: 0 }}
+                  className="overflow-hidden"
+                >
+                  <div className="bg-white/[0.03] border border-white/5 rounded-lg p-3 flex flex-col gap-2 text-xs text-white/50 leading-relaxed">
+                    <p className="text-white/70 font-medium">{t('settings.prerequisites')}</p>
+                    <p>{t('settings.prerequisitesDesc')}</p>
+                    <p className="text-white/70 font-medium pt-1">{t('settings.steps')}</p>
+                    <p>{t('settings.step1')}</p>
+                    <CopyCode text="ssh-keygen -t ed25519" />
+                    <p>{t('settings.step2')}</p>
+                    <CopyCode text="ssh-copy-id -i ~/.ssh/id_ed25519.pub 用户名@xx.xx.xx.xx" />
+                    <p>{t('settings.step3')}</p>
+                    <CopyCode text={`ssh 用户名@xx.xx.xx.xx "echo ok"`} />
+                    <p>{t('settings.step4')}</p>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Row 1: Test connection */}
+      <div className="flex items-center gap-2 flex-wrap">
+        <button
+          onClick={testConnection}
+          disabled={testing || (conn.type === 'remote' && (!conn.host || !conn.user))}
+          className="px-3 py-1.5 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-xs font-medium text-white transition-colors flex items-center gap-1.5 disabled:opacity-50"
+        >
+          {testing && <Loader2 className="w-3 h-3 animate-spin" />}
+          {t('settings.testConnection', '测试连接')}
+        </button>
+        {testing && (
+          <button
+            onClick={cancelTest}
+            className="px-3 py-1.5 bg-white/5 hover:bg-red-500/20 border border-white/10 rounded-lg text-xs font-medium text-white/50 hover:text-red-400 transition-colors"
+          >
+            {t('common.cancel')}
+          </button>
+        )}
+        {testResult === 'success' && (
+          <span className="text-xs text-emerald-400 flex items-center gap-1">
+            <Check className="w-3 h-3" /> {testMsg}
+          </span>
+        )}
+        {testResult === 'error' && (
+          <div className="text-xs text-red-400 w-full">
+            <span>{t('common.failed')}</span>
+            <pre className="mt-1 p-2 bg-red-500/10 border border-red-500/20 rounded-lg whitespace-pre-wrap break-all max-h-[120px] overflow-y-auto font-mono text-[11px] leading-relaxed select-text">
+              {testMsg}
+            </pre>
+          </div>
+        )}
+      </div>
+
+      {/* Row 2: Plugin status + install/update */}
+      {conn.type === 'local' && pluginChecked && (
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className={`text-xs flex items-center gap-1 ${needsPlugin ? 'text-amber-400' : 'text-emerald-400'}`}>
+            {needsPlugin ? '⚠ 插件未安装' : '✓ 插件已安装'}
+          </span>
+          {confirmingInstall ? (
+            <>
+              <span className="text-xs text-amber-400">{t('settings.pluginRestartWarn', '安装/更新会重启 Hermes Gateway，正在进行的会话可能中断（约 1 分钟）。确认继续？')}</span>
+              <button
+                disabled={installingPlugin}
+                onClick={async () => {
+                  setConfirmingInstall(false)
+                  setInstallingPlugin(true)
+                  setInstallMsg('')
+                  try {
+                    await invoke('install_hermes_hooks')
+                    setNeedsPlugin(false)
+                    setInstallMsg('✓ 安装成功 · Gateway 重启中，约 1 分钟后生效')
+                  } catch (e: any) {
+                    setInstallMsg(`✗ ${String(e)}`)
+                  }
+                  setInstallingPlugin(false)
+                }}
+                className="px-3 py-1 border rounded-lg text-xs font-medium transition-colors bg-amber-500/20 hover:bg-amber-500/30 border-amber-500/30 text-amber-400"
+              >
+                {installingPlugin ? '安装中...' : t('settings.confirmInstall', '确认安装')}
+              </button>
+              <button
+                disabled={installingPlugin}
+                onClick={() => setConfirmingInstall(false)}
+                className="px-3 py-1 border rounded-lg text-xs font-medium transition-colors bg-white/5 hover:bg-white/10 border-white/10 text-white/60"
+              >
+                {t('common.cancel', '取消')}
+              </button>
+            </>
+          ) : (
+            <button
+              disabled={installingPlugin}
+              onClick={() => {
+                setInstallMsg('')
+                setConfirmingInstall(true)
+              }}
+              className={`px-3 py-1 border rounded-lg text-xs font-medium transition-colors ${needsPlugin ? 'bg-amber-500/20 hover:bg-amber-500/30 border-amber-500/30 text-amber-400' : 'bg-cyan-500/20 hover:bg-cyan-500/30 border-cyan-500/30 text-cyan-400'}`}
+            >
+              {needsPlugin ? '安装插件' : '更新插件'}
+            </button>
+          )}
+          {installMsg && (
+            <span className={`text-xs ${installMsg.startsWith('✓') ? 'text-emerald-400' : 'text-red-400'}`}>
+              {installMsg}
+            </span>
+          )}
+        </div>
+      )}
+      {conn.type === 'remote' && testResult === 'success' && (
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className={`text-xs flex items-center gap-1 ${needsPlugin ? 'text-amber-400' : 'text-emerald-400'}`}>
+            {needsPlugin ? '⚠ 插件未安装' : '✓ 插件已安装'}
+          </span>
+          {confirmingInstall ? (
+            <>
+              <span className="text-xs text-amber-400">{t('settings.pluginRestartWarnRemote', '安装/更新会重启远程 Hermes Gateway，正在进行的会话可能中断（约 1 分钟）。确认继续？')}</span>
+              <button
+                disabled={installingPlugin}
+                onClick={async () => {
+                  setConfirmingInstall(false)
+                  setInstallingPlugin(true)
+                  setInstallMsg('')
+                  try {
+                    const r: any = await invoke('install_hermes_remote_plugin', { sshHost: conn.host, sshUser: conn.user })
+                    if (r.installed && r.enabled) {
+                      setNeedsPlugin(false)
+                      setTestMsg(testMsg.replace('Plugin ✗', 'Plugin ✓').replace('Plugin ✓ (未启用)', 'Plugin ✓'))
+                      const targets = (r.targets || []).length
+                      setInstallMsg(`✓ 安装成功 · ${targets} 个 profile · Gateway 重启中，约 1 分钟后生效`)
+                    } else {
+                      setInstallMsg(`✗ 安装失败: ${r.enable_error || r.error || '未知错误'}`)
+                    }
+                  } catch (e: any) {
+                    setInstallMsg(`✗ ${String(e)}`)
+                  }
+                  setInstallingPlugin(false)
+                }}
+                className="px-3 py-1 border rounded-lg text-xs font-medium transition-colors bg-amber-500/20 hover:bg-amber-500/30 border-amber-500/30 text-amber-400"
+              >
+                {installingPlugin ? '安装中...' : t('settings.confirmInstall', '确认安装')}
+              </button>
+              <button
+                disabled={installingPlugin}
+                onClick={() => setConfirmingInstall(false)}
+                className="px-3 py-1 border rounded-lg text-xs font-medium transition-colors bg-white/5 hover:bg-white/10 border-white/10 text-white/60"
+              >
+                {t('common.cancel', '取消')}
+              </button>
+            </>
+          ) : (
+            <button
+              disabled={installingPlugin}
+              onClick={() => {
+                setInstallMsg('')
+                setConfirmingInstall(true)
+              }}
+              className={`px-3 py-1 border rounded-lg text-xs font-medium transition-colors ${needsPlugin ? 'bg-amber-500/20 hover:bg-amber-500/30 border-amber-500/30 text-amber-400' : 'bg-cyan-500/20 hover:bg-cyan-500/30 border-cyan-500/30 text-cyan-400'}`}
+            >
+              {needsPlugin ? '安装插件' : '更新插件'}
+            </button>
+          )}
+          {installMsg && (
+            <span className={`text-xs ${installMsg.startsWith('✓') ? 'text-emerald-400' : 'text-red-400'}`}>
+              {installMsg}
+            </span>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function HermesSection({ hermesHookStatus, t }: {
+  hermesHookStatus: string
+  t: any
+}) {
+  const isWindows = typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows')
+  const [conns, setConns] = useState<HermesConn[]>([])
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const store = await getStore()
+        const saved = await store.get<HermesConn[]>('hermes_connections')
+        if (saved && saved.length > 0) {
+          const adjusted = isWindows ? saved.map(c => c.type === 'local' ? { ...c, type: 'remote' as const } : c) : saved
+          setConns(adjusted)
+        } else if (saved) {
+          // Explicitly empty list → the user removed all connections. Respect it
+          // so Hermes stays disabled (enablement now follows connection presence).
+          setConns([])
+        } else {
+          // First run (key never set): migrate old format or seed a default
+          // local connection so Hermes works out of the box.
+          const oldSsh = await store.get<{ host: string; user: string }[]>('hermes_ssh_connections')
+          if (oldSsh && oldSsh.length > 0) {
+            const migrated: HermesConn[] = oldSsh.map(c => ({
+              id: crypto.randomUUID(), type: 'remote' as const, host: c.host, user: c.user,
+            }))
+            setConns(migrated)
+            await store.set('hermes_connections', migrated)
+          } else {
+            const defaultConn: HermesConn[] = [{ id: crypto.randomUUID(), type: isWindows ? 'remote' : 'local' }]
+            setConns(defaultConn)
+            await store.set('hermes_connections', defaultConn)
+          }
+        }
+      } catch {}
+    })()
+  }, [])
+
+  const saveConns = async (updated: HermesConn[]) => {
+    setConns(updated)
+    try {
+      const store = await getStore()
+      await store.set('hermes_connections', updated)
+      // Keep hermes_ssh_connections in sync for Mini.tsx polling
+      const sshOnly = updated.filter(c => c.type === 'remote' && c.host && c.user).map(c => ({ host: c.host!, user: c.user! }))
+      await store.set('hermes_ssh_connections', sshOnly)
+    } catch {}
+  }
+
+  const addConnection = () => {
+    const hasLocal = conns.some(c => c.type === 'local')
+    saveConns([...conns, { id: crypto.randomUUID(), type: (isWindows || hasLocal) ? 'remote' : 'local' }])
+  }
+
+  const updateConn = (idx: number, c: HermesConn) => {
+    const updated = [...conns]
+    updated[idx] = c
+    saveConns(updated)
+  }
+
+  const deleteConn = (idx: number) => {
+    const conn = conns[idx]
+    if (conn.type === 'remote' && conn.host && conn.user) {
+      invoke('close_ssh', { sshHost: conn.host, sshUser: conn.user }).catch(() => {})
+    }
+    saveConns(conns.filter((_, i) => i !== idx))
+  }
+
+  return (
+    <section className="flex flex-col gap-4">
+      <div className="flex items-center justify-between">
+        <h2 className="text-lg font-medium text-white">{t('settings.hermesConnections', 'Hermes Agent')}</h2>
+        <button
+          onClick={addConnection}
+          className="flex items-center gap-1 px-3 py-1.5 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-xs font-medium text-white transition-colors"
+        >
+          <Plus className="w-3 h-3" /> {t('common.add', 'Add')}
+        </button>
+      </div>
+      {hermesHookStatus && <span className="text-xs text-white/30 -mt-2">{hermesHookStatus}</span>}
+
+      <div className="bg-[#0f0f0f] border border-white/5 rounded-2xl overflow-hidden divide-y divide-white/5">
+        {conns.length === 0 ? (
+          <div className="text-center text-white/30 py-8 text-sm">
+            {t('settings.noConnections', 'No connections configured')}
+          </div>
+        ) : (
+          conns.map((conn, idx) => (
+            <HermesConnectionRow
+              key={conn.id}
+              conn={conn}
+              onUpdate={(c) => updateConn(idx, c)}
+              onDelete={() => deleteConn(idx)}
+              disableLocal={isWindows || conns.some((c, i) => i !== idx && c.type === 'local')}
+              t={t}
+            />
+          ))
+        )}
+      </div>
+    </section>
+  )
+}
+
+export function SettingsTab({ notifySound, onChangeNotifySound, waitingSound, onToggleWaitingSound, soundEnabled, onToggleSoundEnabled, codexSoundEnabled, onToggleCodexSoundEnabled, cursorSoundEnabled, onToggleCursorSoundEnabled, geminiSoundEnabled, onToggleGeminiSoundEnabled, opencodeSoundEnabled, onToggleOpencodeSoundEnabled, hermesSoundEnabled, onToggleHermesSoundEnabled, autoCloseCompletion, onToggleAutoCloseCompletion, autoExpandOnTask, onToggleAutoExpandOnTask, islandBg, onChangeIslandBg, bgPos, onChangeBgPos, panelMaxHeight, onChangePanelMaxHeight, hoverDelay, onChangeHoverDelay, largeMascotScale, onChangeLargeMascotScale, appMode, onChangeAppMode, petSfxEnabled, onTogglePetSfxEnabled, petIdleIntervalMin, onChangePetIdleIntervalMin }: { notifySound: 'default' | 'manbo'; onChangeNotifySound: (v: 'default' | 'manbo') => void; waitingSound: boolean; onToggleWaitingSound: (v: boolean) => void; soundEnabled: boolean; onToggleSoundEnabled: (v: boolean) => void; codexSoundEnabled: boolean; onToggleCodexSoundEnabled: (v: boolean) => void; cursorSoundEnabled: boolean; onToggleCursorSoundEnabled: (v: boolean) => void; geminiSoundEnabled: boolean; onToggleGeminiSoundEnabled: (v: boolean) => void; opencodeSoundEnabled: boolean; onToggleOpencodeSoundEnabled: (v: boolean) => void; hermesSoundEnabled: boolean; onToggleHermesSoundEnabled: (v: boolean) => void; autoCloseCompletion: boolean; onToggleAutoCloseCompletion: (v: boolean) => void; autoExpandOnTask: boolean; onToggleAutoExpandOnTask: (v: boolean) => void; islandBg: string; onChangeIslandBg: (v: string) => void; bgPos: { x: number; y: number }; onChangeBgPos: (v: { x: number; y: number }) => void; panelMaxHeight: number; onChangePanelMaxHeight: (v: number) => void; hoverDelay: number; onChangeHoverDelay: (v: number) => void; largeMascotScale: number; onChangeLargeMascotScale: (v: number) => void; appMode?: 'coding' | 'pet' | null; onChangeAppMode?: (v: 'coding' | 'pet') => void; petSfxEnabled?: boolean; onTogglePetSfxEnabled?: (v: boolean) => void; petIdleIntervalMin?: number; onChangePetIdleIntervalMin?: (v: number) => void }) {
+  const { t, i18n } = useTranslation()
+  const [connections, setConnections] = useState<OcConnection[]>([])
+  const [enableClaudeCode, setEnableClaudeCode] = useState(true)
+  const [hookStatus, setHookStatus] = useState('')
+  const [enableClaudeDesktop, setEnableClaudeDesktop] = useState(true)
+  const [claudeDesktopHookStatus, setClaudeDesktopHookStatus] = useState('')
+  const [enableCodex, setEnableCodex] = useState(true)
+  const [codexHookStatus, setCodexHookStatus] = useState('')
+  const [enableCursor, setEnableCursor] = useState(true)
+  const [cursorHookStatus, setCursorHookStatus] = useState('')
+  const [enableGemini, setEnableGemini] = useState(true)
+  const [geminiHookStatus, setGeminiHookStatus] = useState('')
+  const [enableOpencode, setEnableOpencode] = useState(true)
+  const [opencodeHookStatus, setOpencodeHookStatus] = useState('')
+  const [hermesHookStatus] = useState('')
+  const [enableAutostart, setEnableAutostart] = useState(false)
+  const [autostartStatus, setAutostartStatus] = useState('')
+  const [updateInfo, setUpdateInfo] = useState<{ current: string; latest: string; hasUpdate: boolean; url: string } | null>(null)
+  const [updateChecking, setUpdateChecking] = useState(false)
+  const [updateCheckResult, setUpdateCheckResult] = useState<'success' | 'error' | null>(null)
+  const [updateCheckMsg, setUpdateCheckMsg] = useState('')
+  const [updating, setUpdating] = useState(false)
+  const [updateProgress, setUpdateProgress] = useState<number | null>(null)
+  const [updateProgressMsg, setUpdateProgressMsg] = useState('')
+  const [updateRunResult, setUpdateRunResult] = useState<'success' | 'error' | null>(null)
+  const [updateRunMsg, setUpdateRunMsg] = useState('')
+  const [backgrounds, setBackgrounds] = useState<string[]>([])
+  const [bgPreviewUrl, setBgPreviewUrl] = useState<string | null>(null)
+  const [bgNaturalSize, setBgNaturalSize] = useState<{ w: number; h: number } | null>(null)
+  const cropContainerRef = useRef<HTMLDivElement>(null)
+  const draggingRef = useRef(false)
+  const showIslandBackgroundSettings = false
+  const resolveUpdateProgressText = useCallback((stage?: string, fallbackMessage?: string) => {
+    if (stage) {
+      const key = `updateModal.progress.${stage}`
+      const localized = t(key)
+      if (localized !== key) return localized
+    }
+    return fallbackMessage || ''
+  }, [t])
+
+  const checkForUpdate = useCallback(async (showFeedback = false) => {
+    setUpdateChecking(true)
+    if (showFeedback) {
+      setUpdateCheckResult(null)
+      setUpdateCheckMsg('')
+    }
+    try {
+      const info = await invoke('check_for_update', { lang: i18n.language }) as { current: string; latest: string; hasUpdate: boolean; url: string; notes?: string }
+      setUpdateInfo(info)
+      if (showFeedback) {
+        setUpdateCheckResult('success')
+        setUpdateCheckMsg(info.hasUpdate ? `${t('settings.newVersionFound')} v${info.latest}` : t('settings.alreadyLatest'))
+      }
+    } catch (e: any) {
+      if (showFeedback) {
+        setUpdateCheckResult('error')
+        setUpdateCheckMsg(`${t('settings.checkFailed')}${String(e)}`)
+      }
+    } finally {
+      setUpdateChecking(false)
+    }
+  }, [i18n.language, t])
+
+  useEffect(() => {
+    ;(async () => {
+      const conns = await loadOcConnections()
+      setConnections(conns)
+      const store = await getStore()
+      const cc = await store.get('enable_claudecode')
+      if (typeof cc === 'boolean') setEnableClaudeCode(cc)
+      const ccDesktop = await store.get('enable_claude_desktop')
+      if (typeof ccDesktop === 'boolean') setEnableClaudeDesktop(ccDesktop)
+      const cod = await store.get('enable_codex')
+      setEnableCodex(cod !== false)
+      const cur = await store.get('enable_cursor')
+      if (typeof cur === 'boolean') setEnableCursor(cur)
+      const gem = await store.get('enable_gemini')
+      if (typeof gem === 'boolean') setEnableGemini(gem)
+      const oc = await store.get('enable_opencode')
+      if (typeof oc === 'boolean') setEnableOpencode(oc)
+      // Reconcile autostart toggle with the system: the OS-level registration
+      // (registry on Windows, LaunchAgent on macOS) is the source of truth in
+      // case the user disabled it externally; mirror that into our store so
+      // the UI never lies about the current state.
+      try {
+        const sysEnabled = await isAutostartEnabled()
+        setEnableAutostart(sysEnabled)
+        await store.set('enable_autostart', sysEnabled)
+        await store.save()
+      } catch {
+        // ignore — toggle stays at default false if the plugin can't report
+      }
+    })()
+    void checkForUpdate()
+    if (showIslandBackgroundSettings) {
+      invoke('list_backgrounds').then((list: any) => setBackgrounds(list as string[])).catch(() => {})
+    }
+  }, [checkForUpdate])
+
+  useEffect(() => {
+    const unlisten = listen<UpdateProgressPayload>('update-progress', (event) => {
+      const payload = event.payload
+      setUpdateProgress(typeof payload.progress === 'number' ? payload.progress : null)
+      setUpdateProgressMsg(resolveUpdateProgressText(payload.stage, payload.message))
+    })
+    return () => { unlisten.then((fn) => fn()) }
+  }, [resolveUpdateProgressText])
+
+  // Load preview image for current background
+  useEffect(() => {
+    if (!showIslandBackgroundSettings || !islandBg) return
+    // Try public path first (bundled), fallback to Rust command (custom)
+    const img = new Image()
+    img.onload = () => { setBgPreviewUrl(img.src); setBgNaturalSize({ w: img.naturalWidth, h: img.naturalHeight }) }
+    img.onerror = () => {
+      invoke('get_background_data', { fileName: islandBg }).then((dataUrl: any) => {
+        const img2 = new Image()
+        img2.onload = () => { setBgPreviewUrl(dataUrl as string); setBgNaturalSize({ w: img2.naturalWidth, h: img2.naturalHeight }) }
+        img2.src = dataUrl as string
+      }).catch(() => {})
+    }
+    img.src = `/assets/backgrounds/${islandBg}`
+  }, [islandBg])
+
+  // Handle file upload for custom background
+  const handleBgUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = async () => {
+      const dataUrl = reader.result as string
+      try {
+        const saved = await invoke('save_background', { fileName: file.name, dataUrl }) as string
+        // Refresh list and select
+        const list = await invoke('list_backgrounds') as string[]
+        setBackgrounds(list)
+        onChangeIslandBg(saved)
+      } catch (e: any) { console.error('save bg:', e) }
+    }
+    reader.readAsDataURL(file)
+    e.target.value = ''
+  }, [onChangeIslandBg])
+
+  // Drag handler for crop rectangle
+  const handleCropDrag = useCallback((e: React.MouseEvent | React.TouchEvent) => {
+    e.preventDefault()
+    const container = cropContainerRef.current
+    if (!container || !bgNaturalSize) return
+    draggingRef.current = true
+    const rect = container.getBoundingClientRect()
+    const update = (clientX: number, clientY: number) => {
+      // The crop rect aspect ratio is ~7:1 (island width:height)
+      // Container shows full image, crop rect shows visible portion
+      const x = Math.max(0, Math.min(100, ((clientX - rect.left) / rect.width) * 100))
+      const y = Math.max(0, Math.min(100, ((clientY - rect.top) / rect.height) * 100))
+      onChangeBgPos({ x: Math.round(x), y: Math.round(y) })
+    }
+    const isTouch = 'touches' in e
+    if (isTouch) {
+      const t = (e as React.TouchEvent).touches[0]
+      update(t.clientX, t.clientY)
+    } else {
+      update((e as React.MouseEvent).clientX, (e as React.MouseEvent).clientY)
+    }
+    const onMove = (ev: MouseEvent | TouchEvent) => {
+      if (!draggingRef.current) return
+      const p = 'touches' in ev ? (ev as TouchEvent).touches[0] : (ev as MouseEvent)
+      update(p.clientX, p.clientY)
+    }
+    const onUp = () => { draggingRef.current = false; window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); window.removeEventListener('touchmove', onMove); window.removeEventListener('touchend', onUp) }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+    window.addEventListener('touchmove', onMove)
+    window.addEventListener('touchend', onUp)
+  }, [bgNaturalSize, onChangeBgPos])
+
+  const updateConnection = (idx: number, conn: OcConnection) => {
+    const updated = [...connections]
+    updated[idx] = conn
+    setConnections(updated)
+    saveOcConnections(updated)
+  }
+
+  const deleteConnection = (idx: number) => {
+    const conn = connections[idx]
+    if (conn.type === 'remote' && conn.host && conn.user) {
+      invoke('close_ssh', { sshHost: conn.host, sshUser: conn.user }).catch(() => {})
+    }
+    const updated = connections.filter((_, i) => i !== idx)
+    setConnections(updated)
+    saveOcConnections(updated)
+  }
+
+  const addConnection = () => {
+    // Default to remote if a local connection already exists (only one local allowed)
+    const hasLocal = connections.some(c => c.type === 'local')
+    const updated = [...connections, { id: crypto.randomUUID(), type: (hasLocal ? 'remote' : 'local') as OcConnection['type'] }]
+    setConnections(updated)
+    saveOcConnections(updated)
+  }
+
+  const toggleClaudeCode = async (val: boolean) => {
+    setEnableClaudeCode(val)
+    const store = await getStore()
+    await store.set('enable_claudecode', val)
+    await store.save()
+    if (val) {
+      try {
+        await invoke('install_claude_hooks')
+        setHookStatus(t('settings.hookInstalled'))
+      } catch (e: any) {
+        setHookStatus(`${t('settings.hookFailed')} ${String(e)}`)
+      }
+    }
+  }
+
+  // CC Desktop shares the same on-disk hook script as CC CLI — toggling the
+  // listener purely gates UI visibility and notifications. We still call
+  // install_claude_hooks on enable so a fresh install (CLI off, Desktop on)
+  // registers the hook script.
+  const toggleClaudeDesktop = async (val: boolean) => {
+    setEnableClaudeDesktop(val)
+    const store = await getStore()
+    await store.set('enable_claude_desktop', val)
+    await store.save()
+    if (val) {
+      try {
+        await invoke('install_claude_hooks')
+        setClaudeDesktopHookStatus(t('settings.hookInstalled'))
+      } catch (e: any) {
+        setClaudeDesktopHookStatus(`${t('settings.hookFailed')} ${String(e)}`)
+      }
+    }
+  }
+
+  const toggleCursor = async (val: boolean) => {
+    setEnableCursor(val)
+    const store = await getStore()
+    await store.set('enable_cursor', val)
+    await store.save()
+    if (val) {
+      try {
+        await invoke('install_cursor_hooks')
+        setCursorHookStatus(t('settings.hookInstalled'))
+      } catch (e: any) {
+        setCursorHookStatus(`${t('settings.hookFailed')} ${String(e)}`)
+      }
+    }
+  }
+
+  const toggleCodex = async (val: boolean) => {
+    setEnableCodex(val)
+    const store = await getStore()
+    await store.set('enable_codex', val)
+    await store.save()
+    if (val) {
+      try {
+        await invoke('install_codex_hooks')
+        setCodexHookStatus(t('settings.hookInstalled'))
+      } catch (e: any) {
+        setCodexHookStatus(`${t('settings.hookFailed')} ${String(e)}`)
+      }
+    }
+  }
+
+  const toggleGemini = async (val: boolean) => {
+    setEnableGemini(val)
+    const store = await getStore()
+    await store.set('enable_gemini', val)
+    await store.save()
+    if (val) {
+      try {
+        await invoke('install_gemini_hooks')
+        setGeminiHookStatus(t('settings.hookInstalled'))
+      } catch (e: any) {
+        setGeminiHookStatus(`${t('settings.hookFailed')} ${String(e)}`)
+      }
+    }
+  }
+
+  const toggleOpencode = async (val: boolean) => {
+    setEnableOpencode(val)
+    const store = await getStore()
+    await store.set('enable_opencode', val)
+    await store.save()
+    if (val) {
+      try {
+        await invoke('install_opencode_hooks')
+        setOpencodeHookStatus(t('settings.hookInstalled'))
+      } catch (e: any) {
+        setOpencodeHookStatus(`${t('settings.hookFailed')} ${String(e)}`)
+      }
+    }
+  }
+
+  const toggleAutostart = async (val: boolean) => {
+    setEnableAutostart(val)
+    setAutostartStatus('')
+    try {
+      if (val) await enableAutostartCmd()
+      else await disableAutostartCmd()
+      const store = await getStore()
+      await store.set('enable_autostart', val)
+      await store.save()
+    } catch (e: any) {
+      setEnableAutostart(!val)
+      setAutostartStatus(`${t('settings.autostartFailed', 'Failed to update autostart')} ${String(e)}`)
+    }
+  }
+
+  const isPetMode = appMode === 'pet'
+
+  return (
+    <div className="max-w-2xl mx-auto pt-10 pb-20 px-6 flex flex-col gap-10">
+      {/* App Mode Switch */}
+      {appMode && onChangeAppMode && (
+        <section className="flex flex-col gap-4">
+          <h2 className="text-lg font-medium text-white">{t('settings.appMode', 'Mode')}</h2>
+          <div className="bg-[#0f0f0f] border border-white/5 rounded-2xl overflow-hidden p-4">
+            <div className="flex gap-3">
+              {([
+                { mode: 'coding' as const, label: t('settings.codingMode'), icon: '💻', desc: t('settings.codingModeDesc') },
+                { mode: 'pet' as const, label: t('settings.petMode'), icon: '🐾', desc: t('settings.petModeDesc') },
+              ]).map(({ mode, label, icon, desc }) => (
+                <button
+                  key={mode}
+                  onClick={() => onChangeAppMode(mode)}
+                  className={`flex-1 flex items-center gap-3 p-3 rounded-xl border transition-all ${
+                    appMode === mode
+                      ? 'bg-white/10 border-white/20'
+                      : 'bg-white/[0.02] border-white/5 hover:bg-white/[0.05] hover:border-white/10'
+                  }`}
+                >
+                  <span className="text-xl">{icon}</span>
+                  <div className="text-left">
+                    <div className={`text-sm font-medium ${appMode === mode ? 'text-white' : 'text-white/60'}`}>{label}</div>
+                    <div className="text-[11px] text-white/30">{desc}</div>
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+        </section>
+      )}
+
+      {/* Pet mode: mascot size */}
+      {isPetMode && (
+        <section className="flex flex-col gap-4">
+          <h2 className="text-lg font-medium text-white">{t('settings.display')}</h2>
+          <div className="bg-[#0f0f0f] border border-white/5 rounded-2xl overflow-hidden">
+            <div className="p-4">
+              <div className="flex items-center justify-between mb-2">
+                <div className="flex flex-col gap-1">
+                  <span className="text-sm font-medium text-white/90">{t('settings.largeMascotScale', 'Mascot Size')}</span>
+                  <span className="text-xs text-white/40">{t('settings.largeMascotScaleDesc', 'Scale multiplier for mascot')}</span>
+                </div>
+                <span className="text-sm text-white/60 tabular-nums">{largeMascotScale.toFixed(1)}x</span>
+              </div>
+              <input
+                type="range"
+                min={1}
+                max={6}
+                step={0.1}
+                value={largeMascotScale}
+                onChange={(e) => onChangeLargeMascotScale(Number(e.target.value))}
+                className="w-full accent-white/60 h-1"
+              />
+            </div>
+          </div>
+        </section>
+      )}
+
+      {/* Pet mode: character voice toggle */}
+      {isPetMode && onTogglePetSfxEnabled && (
+        <section className="flex flex-col gap-4">
+          <h2 className="text-lg font-medium text-white">{t('settings.sound')}</h2>
+          <div className="bg-[#0f0f0f] border border-white/5 rounded-2xl overflow-hidden">
+            <div className="flex items-center justify-between p-4">
+              <div className="flex flex-col gap-1">
+                <span className="text-sm font-medium text-white/90">{t('settings.petSfx')}</span>
+                <span className="text-xs text-white/40">{t('settings.petSfxDesc')}</span>
+              </div>
+              <Toggle checked={petSfxEnabled ?? true} onChange={onTogglePetSfxEnabled} />
+            </div>
+          </div>
+        </section>
+      )}
+
+      {/* Pet mode: random idle action interval */}
+      {isPetMode && onChangePetIdleIntervalMin && (
+        <section className="flex flex-col gap-4">
+          <h2 className="text-lg font-medium text-white">{t('settings.petBehavior', 'Behavior')}</h2>
+          <div className="bg-[#0f0f0f] border border-white/5 rounded-2xl overflow-hidden">
+            <div className="p-4">
+              <div className="flex items-center justify-between mb-2">
+                <div className="flex flex-col gap-1">
+                  <span className="text-sm font-medium text-white/90">{t('settings.petIdleInterval', 'Random action interval')}</span>
+                  <span className="text-xs text-white/40">{t('settings.petIdleIntervalDesc', 'How often the mascot triggers a random action while idle')}</span>
+                </div>
+                <span className="text-sm text-white/60 tabular-nums">
+                  {(petIdleIntervalMin ?? 2).toFixed(1)} {t('settings.minutesShort', 'min')}
+                </span>
+              </div>
+              <input
+                type="range"
+                min={0.5}
+                max={30}
+                step={0.5}
+                value={petIdleIntervalMin ?? 2}
+                onChange={(e) => onChangePetIdleIntervalMin(Number(e.target.value))}
+                className="w-full accent-white/60 h-1"
+              />
+            </div>
+          </div>
+        </section>
+      )}
+
+      {!isPetMode && <>
+      {/* OpenClaw 连接 */}
+      <section className="flex flex-col gap-4">
+        <div className="flex items-center justify-between">
+          <h2 className="text-lg font-medium text-white">{t('settings.ocConnections')}</h2>
+          <button
+            onClick={addConnection}
+            className="flex items-center gap-1 px-3 py-1.5 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-xs font-medium text-white transition-colors"
+          >
+            <Plus className="w-3 h-3" /> {t('common.add')}
+          </button>
+        </div>
+        <div className="bg-[#0f0f0f] border border-white/5 rounded-2xl overflow-hidden divide-y divide-white/5">
+          {connections.length === 0 ? (
+            <div className="text-center text-white/30 py-8 text-sm">
+              {t('settings.noConnections')}
+            </div>
+          ) : (
+            connections.map((conn, idx) => (
+              <ConnectionRow
+                key={conn.id}
+                conn={conn}
+                onUpdate={(c) => updateConnection(idx, c)}
+                onDelete={() => deleteConnection(idx)}
+                disableLocal={connections.some((c, i) => i !== idx && c.type === 'local')}
+              />
+            ))
+          )}
+        </div>
+      </section>
+
+      {/* Hermes Agent */}
+      <HermesSection
+        hermesHookStatus={hermesHookStatus}
+        t={t}
+      />
+
+      {/* Claude Code */}
+      <section className="flex flex-col gap-4">
+        <h2 className="text-lg font-medium text-white">Claude Code</h2>
+        <div className="bg-[#0f0f0f] border border-white/5 rounded-2xl overflow-hidden">
+          <div className="flex items-center justify-between p-4 border-b border-white/5">
+            <div className="flex flex-col gap-1">
+              <span className="text-sm font-medium text-white/90">{t('settings.enableClaudeCli', 'Enable Claude Code CLI')}</span>
+              <span className="text-xs text-white/40">{t('settings.enableClaudeCliDesc', 'Monitor local Claude Code CLI sessions via Hooks')}</span>
+              {hookStatus && <span className="text-xs text-white/30 mt-1">{hookStatus}</span>}
+            </div>
+            <Toggle checked={enableClaudeCode} onChange={toggleClaudeCode} />
+          </div>
+          <div className="flex items-center justify-between p-4">
+            <div className="flex flex-col gap-1">
+              <span className="text-sm font-medium text-white/90">{t('settings.enableClaudeDesktop', 'Enable Claude Code Desktop')}</span>
+              <span className="text-xs text-white/40">{t('settings.enableClaudeDesktopDesc', 'Monitor local Claude Code Desktop sessions via Hooks')}</span>
+              {claudeDesktopHookStatus && <span className="text-xs text-white/30 mt-1">{claudeDesktopHookStatus}</span>}
+            </div>
+            <Toggle checked={enableClaudeDesktop} onChange={toggleClaudeDesktop} />
+          </div>
+        </div>
+      </section>
+
+      {/* Codex */}
+      <section className="flex flex-col gap-4">
+        <h2 className="text-lg font-medium text-white">{t('settings.codex', 'Codex')}</h2>
+        <div className="bg-[#0f0f0f] border border-white/5 rounded-2xl overflow-hidden">
+          <div className="flex items-center justify-between p-4">
+            <div className="flex flex-col gap-1">
+              <span className="text-sm font-medium text-white/90">{t('settings.enableCodex', 'Enable Codex')}</span>
+              <span className="text-xs text-white/40">{t('settings.enableCodexDesc', 'Monitor local Codex sessions via Hooks')}</span>
+              {codexHookStatus && <span className="text-xs text-white/30 mt-1">{codexHookStatus}</span>}
+            </div>
+            <Toggle checked={enableCodex} onChange={toggleCodex} />
+          </div>
+        </div>
+      </section>
+
+      {/* Cursor */}
+      <section className="flex flex-col gap-4">
+        <h2 className="text-lg font-medium text-white">Cursor</h2>
+        <div className="bg-[#0f0f0f] border border-white/5 rounded-2xl overflow-hidden">
+          <div className="flex items-center justify-between p-4">
+            <div className="flex flex-col gap-1">
+              <span className="text-sm font-medium text-white/90">{t('settings.enableCursor', 'Enable Cursor')}</span>
+              <span className="text-xs text-white/40">{t('settings.enableCursorDesc', 'Monitor local Cursor agent sessions via Hooks')}</span>
+              {cursorHookStatus && <span className="text-xs text-white/30 mt-1">{cursorHookStatus}</span>}
+            </div>
+            <Toggle checked={enableCursor} onChange={toggleCursor} />
+          </div>
+        </div>
+      </section>
+
+      {/* Gemini CLI */}
+      <section className="flex flex-col gap-4">
+        <h2 className="text-lg font-medium text-white">Gemini CLI</h2>
+        <div className="bg-[#0f0f0f] border border-white/5 rounded-2xl overflow-hidden">
+          <div className="flex items-center justify-between p-4">
+            <div className="flex flex-col gap-1">
+              <span className="text-sm font-medium text-white/90">{t('settings.enableGemini', 'Enable Gemini CLI')}</span>
+              <span className="text-xs text-white/40">{t('settings.enableGeminiDesc', 'Monitor local Gemini CLI sessions via Hooks')}</span>
+              {geminiHookStatus && <span className="text-xs text-white/30 mt-1">{geminiHookStatus}</span>}
+            </div>
+            <Toggle checked={enableGemini} onChange={toggleGemini} />
+          </div>
+        </div>
+      </section>
+
+      {/* opencode */}
+      <section className="flex flex-col gap-4">
+        <h2 className="text-lg font-medium text-white">opencode</h2>
+        <div className="bg-[#0f0f0f] border border-white/5 rounded-2xl overflow-hidden">
+          <div className="flex items-center justify-between p-4">
+            <div className="flex flex-col gap-1">
+              <span className="text-sm font-medium text-white/90">{t('settings.enableOpencode', 'Enable opencode')}</span>
+              <span className="text-xs text-white/40">{t('settings.enableOpencodeDesc', 'Monitor local opencode sessions via a plugin')}</span>
+              {opencodeHookStatus && <span className="text-xs text-white/30 mt-1">{opencodeHookStatus}</span>}
+            </div>
+            <Toggle checked={enableOpencode} onChange={toggleOpencode} />
+          </div>
+        </div>
+      </section>
+
+      {/* 显示设置 */}
+      <section className="flex flex-col gap-4">
+        <h2 className="text-lg font-medium text-white">{t('settings.display')}</h2>
+        <div className="bg-[#0f0f0f] border border-white/5 rounded-2xl overflow-hidden">
+          <div className="flex items-center justify-between p-4 border-b border-white/5">
+            <div className="flex flex-col gap-1">
+              <span className="text-sm font-medium text-white/90">{t('settings.autoExpandOnTask', 'Auto Popup')}</span>
+              <span className="text-xs text-white/40">{t('settings.autoExpandOnTaskDesc', 'Automatically expand panel when a task completes or needs input')}</span>
+            </div>
+            <Toggle checked={autoExpandOnTask} onChange={onToggleAutoExpandOnTask} />
+          </div>
+          <div className="p-4 border-b border-white/5">
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex flex-col gap-1">
+                <span className="text-sm font-medium text-white/90">{t('settings.panelMaxHeight', 'Panel Height')}</span>
+                <span className="text-xs text-white/40">{t('settings.panelMaxHeightDesc', 'Maximum height of the expanded panel')}</span>
+              </div>
+              <span className="text-sm text-white/60 tabular-nums">{panelMaxHeight}px</span>
+            </div>
+            <input
+              type="range"
+              min={200}
+              max={500}
+              step={10}
+              value={panelMaxHeight}
+              onChange={(e) => onChangePanelMaxHeight(Number(e.target.value))}
+              className="w-full accent-white/60 h-1"
+            />
+          </div>
+          <div className={`p-4 ${showIslandBackgroundSettings ? 'border-b border-white/5' : ''}`}>
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex flex-col gap-1">
+                <span className="text-sm font-medium text-white/90">{t('settings.hoverDelay', 'Hover Trigger Delay')}</span>
+                <span className="text-xs text-white/40">{t('settings.hoverDelayDesc', 'Delay before expanding panel on hover')}</span>
+              </div>
+              <span className="text-sm text-white/60 tabular-nums">{hoverDelay.toFixed(1)}s</span>
+            </div>
+            <input
+              type="range"
+              min={0}
+              max={2}
+              step={0.1}
+              value={hoverDelay}
+              onChange={(e) => onChangeHoverDelay(Number(e.target.value))}
+              className="w-full accent-white/60 h-1"
+            />
+          </div>
+          {showIslandBackgroundSettings && (
+            <div className="p-4">
+              <div className="flex flex-col gap-1 mb-3">
+                <span className="text-sm font-medium text-white/90">{t('settings.islandBg')}</span>
+                <span className="text-xs text-white/40">{t('settings.islandBgDesc')}</span>
+              </div>
+
+              <div className="flex gap-2 flex-wrap mb-3">
+                <button
+                  onClick={() => onChangeIslandBg('__anime__')}
+                  className={`relative w-14 h-9 rounded-lg overflow-hidden border-2 transition-all ${islandBg === '__anime__' ? 'border-blue-500 shadow-lg shadow-blue-500/20' : 'border-white/10 hover:border-white/30'}`}
+                >
+                  <div style={{ width: '100%', height: '100%', background: '#F0D140' }}>
+                    <div style={{ width: '100%', height: '100%', backgroundImage: 'linear-gradient(to right, #00000015 1px, transparent 1px), linear-gradient(to bottom, #00000015 1px, transparent 1px)', backgroundSize: '8px 8px' }} />
+                  </div>
+                </button>
+                {backgrounds.map((bg) => (
+                  <button
+                    key={bg}
+                    onClick={() => onChangeIslandBg(bg)}
+                    className={`relative w-14 h-9 rounded-lg overflow-hidden border-2 transition-all ${islandBg === bg ? 'border-blue-500 shadow-lg shadow-blue-500/20' : 'border-white/10 hover:border-white/30'}`}
+                  >
+                    <div style={{ width: '100%', height: '100%', backgroundImage: `url(/assets/backgrounds/${bg})`, backgroundSize: 'cover' }} />
+                  </button>
+                ))}
+                <label className="relative w-14 h-9 rounded-lg overflow-hidden border-2 border-dashed border-white/20 hover:border-white/40 transition-all cursor-pointer flex items-center justify-center">
+                  <Plus className="w-4 h-4 text-white/40" />
+                  <input type="file" accept="image/*" onChange={handleBgUpload} className="hidden" />
+                </label>
+              </div>
+
+              {islandBg !== '__anime__' && bgPreviewUrl && bgNaturalSize && (
+                <div className="flex flex-col items-center gap-2">
+                  <div
+                    ref={cropContainerRef}
+                    className="relative rounded-lg overflow-hidden cursor-crosshair select-none"
+                    style={{ width: '100%', maxWidth: 360, aspectRatio: `${bgNaturalSize.w} / ${bgNaturalSize.h}` }}
+                    onMouseDown={handleCropDrag}
+                    onTouchStart={handleCropDrag}
+                  >
+                    <img src={bgPreviewUrl} alt="" draggable={false} style={{ width: '100%', height: '100%', objectFit: 'cover', opacity: 0.4 }} />
+                    {(() => {
+                      const cropAspect = 7
+                      const imgAspect = bgNaturalSize.w / bgNaturalSize.h
+                      let cropW: number, cropH: number
+                      if (imgAspect > cropAspect) {
+                        cropH = 100
+                        cropW = (cropAspect / imgAspect) * 100
+                      } else {
+                        cropW = 100
+                        cropH = (imgAspect / cropAspect) * 100
+                      }
+                      const maxX = 100 - cropW
+                      const maxY = 100 - cropH
+                      const left = (bgPos.x / 100) * maxX
+                      const top = (bgPos.y / 100) * maxY
+                      return (
+                        <div
+                          style={{
+                            position: 'absolute',
+                            left: `${left}%`, top: `${top}%`,
+                            width: `${cropW}%`, height: `${cropH}%`,
+                            border: '2px solid white',
+                            borderRadius: 4,
+                            boxShadow: '0 0 0 9999px rgba(0,0,0,0.5)',
+                            pointerEvents: 'none',
+                          }}
+                        />
+                      )
+                    })()}
+                  </div>
+                  <div className="rounded-lg overflow-hidden border border-white/10" style={{ width: '100%', maxWidth: 360, height: 50 }}>
+                    <div style={{
+                      width: '100%', height: '100%',
+                      backgroundImage: `url(${bgPreviewUrl})`,
+                      backgroundSize: 'cover',
+                      backgroundPosition: `${bgPos.x}% ${bgPos.y}%`,
+                    }} />
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </section>
+
+      {/* 提示音 */}
+      <section className="flex flex-col gap-4">
+        <h2 className="text-lg font-medium text-white">{t('settings.sound')}</h2>
+        <div className="bg-[#0f0f0f] border border-white/5 rounded-2xl overflow-hidden">
+          <div className="flex items-center justify-between p-4 border-b border-white/5">
+            <div className="flex flex-col gap-1">
+              <span className="text-sm font-medium text-white/90">{t('settings.completionSound')}</span>
+              <span className="text-xs text-white/40">{t('settings.completionSoundDesc')}</span>
+            </div>
+            <div className="flex bg-black/50 p-0.5 rounded-lg border border-white/5">
+              {(['default', 'manbo'] as const).map((s) => (
+                <button
+                  key={s}
+                  onClick={() => onChangeNotifySound(s)}
+                  className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${notifySound === s ? 'bg-white/10 text-white' : 'text-white/40 hover:text-white/60'}`}
+                >
+                  {s === 'default' ? t('settings.defaultSound') : t('settings.manboSound')}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="flex items-center justify-between p-4 border-b border-white/5">
+            <div className="flex flex-col gap-1">
+              <span className="text-sm font-medium text-white/90">{t('settings.ccSound', 'Claude Code Completion Sound')}</span>
+              <span className="text-xs text-white/40">{t('settings.ccSoundDesc', 'Play sound when Claude Code finishes a task')}</span>
+            </div>
+            <Toggle checked={soundEnabled} onChange={onToggleSoundEnabled} />
+          </div>
+          <div className="flex items-center justify-between p-4 border-b border-white/5">
+            <div className="flex flex-col gap-1">
+              <span className="text-sm font-medium text-white/90">{t('settings.codexSound', 'Codex Completion Sound')}</span>
+              <span className="text-xs text-white/40">{t('settings.codexSoundDesc', 'Play sound when Codex finishes a task')}</span>
+            </div>
+            <Toggle checked={codexSoundEnabled} onChange={onToggleCodexSoundEnabled} />
+          </div>
+          <div className="flex items-center justify-between p-4 border-b border-white/5">
+            <div className="flex flex-col gap-1">
+              <span className="text-sm font-medium text-white/90">{t('settings.cursorSound', 'Cursor Completion Sound')}</span>
+              <span className="text-xs text-white/40">{t('settings.cursorSoundDesc', 'Play sound when Cursor finishes a task')}</span>
+            </div>
+            <Toggle checked={cursorSoundEnabled} onChange={onToggleCursorSoundEnabled} />
+          </div>
+          <div className="flex items-center justify-between p-4 border-b border-white/5">
+            <div className="flex flex-col gap-1">
+              <span className="text-sm font-medium text-white/90">{t('settings.geminiSound', 'Gemini Completion Sound')}</span>
+              <span className="text-xs text-white/40">{t('settings.geminiSoundDesc', 'Play sound when Gemini finishes a task')}</span>
+            </div>
+            <Toggle checked={geminiSoundEnabled} onChange={onToggleGeminiSoundEnabled} />
+          </div>
+          <div className="flex items-center justify-between p-4 border-b border-white/5">
+            <div className="flex flex-col gap-1">
+              <span className="text-sm font-medium text-white/90">{t('settings.opencodeSound', 'opencode Completion Sound')}</span>
+              <span className="text-xs text-white/40">{t('settings.opencodeSoundDesc', 'Play sound when opencode finishes a task')}</span>
+            </div>
+            <Toggle checked={opencodeSoundEnabled} onChange={onToggleOpencodeSoundEnabled} />
+          </div>
+          <div className="flex items-center justify-between p-4 border-b border-white/5">
+            <div className="flex flex-col gap-1">
+              <span className="text-sm font-medium text-white/90">{t('settings.hermesSound', 'Hermes Completion Sound')}</span>
+              <span className="text-xs text-white/40">{t('settings.hermesSoundDesc', 'Play sound when Hermes finishes a task')}</span>
+            </div>
+            <Toggle checked={hermesSoundEnabled} onChange={onToggleHermesSoundEnabled} />
+          </div>
+          <div className="flex items-center justify-between p-4 border-b border-white/5">
+            <div className="flex flex-col gap-1">
+              <span className="text-sm font-medium text-white/90">{t('settings.waitingSound')}</span>
+              <span className="text-xs text-white/40">{t('settings.waitingSoundDesc')}</span>
+            </div>
+            <Toggle checked={waitingSound} onChange={onToggleWaitingSound} />
+          </div>
+          <div className="flex items-center justify-between p-4">
+            <div className="flex flex-col gap-1">
+              <span className="text-sm font-medium text-white/90">{t('settings.autoCloseCompletion', 'Auto-close Completion Popup')}</span>
+              <span className="text-xs text-white/40">{t('settings.autoCloseCompletionDesc', 'Automatically close the completion popup after 5 seconds')}</span>
+            </div>
+            <Toggle checked={autoCloseCompletion} onChange={onToggleAutoCloseCompletion} />
+          </div>
+        </div>
+      </section>
+
+      </>}
+      {/* 系统 */}
+      <section className="flex flex-col gap-4">
+        <h2 className="text-lg font-medium text-white">{t('settings.system', 'System')}</h2>
+        <div className="bg-[#0f0f0f] border border-white/5 rounded-2xl overflow-hidden">
+          <div className="flex items-center justify-between p-4">
+            <div className="flex flex-col gap-1">
+              <span className="text-sm font-medium text-white/90">{t('settings.autostart', 'Launch on Login')}</span>
+              <span className="text-xs text-white/40">{t('settings.autostartDesc', 'Start oc-claw automatically when you log in')}</span>
+              {autostartStatus && <span className="text-xs text-red-400 mt-1 break-all">{autostartStatus}</span>}
+            </div>
+            <Toggle checked={enableAutostart} onChange={toggleAutostart} />
+          </div>
+        </div>
+      </section>
+
+      {/* 关于 */}
+      <section className="flex flex-col gap-4">
+        <h2 className="text-lg font-medium text-white">{t('settings.about')}</h2>
+        <div className="bg-[#0f0f0f] border border-white/5 rounded-2xl overflow-hidden">
+          <div className="flex items-center justify-between p-4">
+            <div className="flex flex-col gap-1">
+              <span className="text-sm font-medium text-white/90">{t('settings.currentVersion')}</span>
+              <span className="text-xs text-white/40">
+                {updateInfo ? `v${updateInfo.current}` : '...'}
+                {updateInfo && !updateInfo.hasUpdate && ` (${t('settings.latest')})`}
+                {updateInfo?.hasUpdate && (
+                  <span className="ml-2 text-emerald-400">v{updateInfo.latest} {t('settings.available')}</span>
+                )}
+              </span>
+              {updateCheckResult === 'success' && updateCheckMsg && (
+                <span className="text-xs text-emerald-400">{updateCheckMsg}</span>
+              )}
+              {updateCheckResult === 'error' && updateCheckMsg && (
+                <span className="text-xs text-red-400 break-all">{updateCheckMsg}</span>
+              )}
+              {updateRunResult === 'success' && updateRunMsg && (
+                <span className="text-xs text-emerald-400">{updateRunMsg}</span>
+              )}
+              {updateRunResult === 'error' && updateRunMsg && (
+                <span className="text-xs text-red-400 break-all">{updateRunMsg}</span>
+              )}
+              {(updating || updateProgressMsg) && (
+                <div className="flex flex-col gap-1 pt-1">
+                  <span className="text-xs text-white/50">
+                    {updateProgressMsg}
+                    {typeof updateProgress === 'number' && updateProgress < 100 && ` · ${updateProgress}%`}
+                  </span>
+                  {typeof updateProgress === 'number' && (
+                    <div className="w-full h-1.5 bg-white/5 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-blue-500 transition-all duration-200"
+                        style={{ width: `${Math.max(updateProgress, 2)}%` }}
+                      />
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              {updateInfo?.hasUpdate && (
+                <button
+                  onClick={async () => {
+                    setUpdating(true)
+                    setUpdateProgress(0)
+                    setUpdateProgressMsg(resolveUpdateProgressText('preparing', t('settings.preparingDownload')))
+                    setUpdateRunResult(null)
+                    setUpdateRunMsg('')
+                    try {
+                      await invoke('run_update', { dmgUrl: updateInfo?.url || '' })
+                      setUpdateRunResult('success')
+                      setUpdateRunMsg(t('settings.downloadComplete'))
+                      window.setTimeout(() => {
+                        void invoke('exit_app').catch((e: any) => {
+                          setUpdating(false)
+                          setUpdateRunResult('error')
+                          setUpdateRunMsg(`${t('settings.exitFailed')}${String(e)}`)
+                        })
+                      }, 600)
+                    } catch (e: any) {
+                      setUpdateProgress(null)
+                      setUpdateProgressMsg('')
+                      setUpdateRunResult('error')
+                      setUpdateRunMsg(`${t('settings.updateFailed')}${String(e)}`)
+                      setUpdating(false)
+                    }
+                  }}
+                  disabled={updating}
+                  className="px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
+                >
+                  {updating ? t('settings.updating') : t('settings.updateNow')}
+                </button>
+              )}
+              <button
+                onClick={() => { void checkForUpdate(true) }}
+                disabled={updateChecking}
+                className="px-4 py-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-sm font-medium text-white transition-colors disabled:opacity-50"
+              >
+                {updateChecking ? t('settings.checking') : t('settings.checkUpdate')}
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* Language selector */}
+      <section className="flex flex-col gap-4">
+        <h2 className="text-lg font-medium text-white">{t('settings.language')}</h2>
+        <div className="bg-[#0f0f0f] border border-white/5 rounded-2xl overflow-hidden">
+          <div className="flex items-center justify-between p-4">
+            <div className="flex flex-col gap-1">
+              <span className="text-sm font-medium text-white/90">{t('settings.language')}</span>
+              <span className="text-xs text-white/40">{t('settings.languageDesc')}</span>
+            </div>
+            <div className="flex flex-wrap bg-black/50 p-0.5 rounded-lg border border-white/5 gap-0.5">
+              {(['zh', 'en', 'ja', 'ko', 'es', 'fr'] as const).map((lng) => (
+                <button
+                  key={lng}
+                  onClick={async () => { i18n.changeLanguage(lng); localStorage.setItem('oc-claw-lang', lng); const store = await getStore(); await store.set('oc-claw-lang', lng); await store.save(); invoke('update_tray_language', { lang: lng }).catch(() => {}) }}
+                  className={`px-2 py-1 text-xs font-medium rounded-md transition-colors ${i18n.language === lng ? 'bg-white/10 text-white' : 'text-white/40 hover:text-white/60'}`}
+                >
+                  {t(`settings.lang${lng.charAt(0).toUpperCase() + lng.slice(1)}`)}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* Exit app */}
+      <section className="pt-4">
+        <button
+          onClick={() => invoke('exit_app').catch(() => {})}
+          className="w-full py-3 bg-red-500/10 hover:bg-red-500/20 border border-red-500/20 text-red-400 rounded-xl text-sm font-medium transition-colors"
+        >
+          {t('settings.exitApp')}
+        </button>
+      </section>
+    </div>
+  )
+}

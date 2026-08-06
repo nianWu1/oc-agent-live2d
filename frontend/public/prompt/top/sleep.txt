@@ -1,0 +1,52 @@
+Pixel art sprite sheet based on the reference image. Focus on the FULL BODY of the rightmost humanoid character (first from right) — capture the entire figure from head to feet, including body, limbs, clothing, and hair. Do NOT isolate or focus on any single accessory, ornament, backpack, or attachment. The subject is the whole standing character as a complete entity.
+
+Create a 5x5 grid (25 frames) sprite sheet in top-down RPG style. Each cell is exactly 32x32 pixels, total image size is exactly 160x160 pixels.
+
+STRICT GRID LAYOUT:
+- The final image must be exactly 160x160 pixels (5 columns × 5 rows)
+- Each cell is exactly 32x32 pixels
+- 5 columns per row, 5 rows total = exactly 25 cells
+- Column boundaries: 0, 32, 64, 96, 128
+- Row boundaries: 0, 32, 64, 96, 128
+
+This sprite sheet contains THREE different animations stacked vertically:
+- Row 1 and Row 2: TALKING/WORKING animation (character standing with speech bubble "..." appearing)
+- Row 3: EATING animation (character sitting and eating food)
+- Row 4 and Row 5: EATING animation (identical to Row 3)
+
+=== ROWS 1-2: TALKING/WORKING ===
+
+The character is shown FULL BODY, standing upright in a neutral front-facing pose — eyes open, mouth closed or neutral expression. The character's body pose is IDENTICAL and FROZEN in all 5 frames per row. The character is positioned in the lower portion of each cell, small enough to leave room above the head for a speech bubble.
+
+Row 1 and Row 2 are IDENTICAL — same 5-frame cycle:
+- Column 1: Character standing, NO bubble — just character on green background. Clean frame.
+- Column 2: A white (#FFFFFF) speech bubble with black (#000000) outline APPEARS above the head. Bubble contains one dot "." (black). Bubble has a triangular tail pointing down toward character.
+- Column 3: Same bubble (same size, same position), now containing ". ." — two dots evenly spaced.
+- Column 4: Same bubble (same size, same position), now containing ". . ." — three dots, the classic "..." typing indicator.
+- Column 5: Character standing, NO bubble — bubble disappeared. Identical to Column 1 for seamless loop.
+
+=== ROWS 3-5: EATING ===
+
+The character is shown FULL BODY, sitting on the ground with a small bowl of food in front. The character is happily eating — eyes squinting with joy, mouth open or chewing. The character's body pose is IDENTICAL and FROZEN in all 5 frames per row. The character is positioned in the lower portion of each cell, small enough to leave room above the head for a speech bubble.
+
+Row 3, Row 4, and Row 5 are IDENTICAL — same 5-frame cycle:
+- Column 1: Character sitting with bowl, NO bubble — just character on green background. Clean frame.
+- Column 2: Character picks up food with chopsticks/hand. A small speech bubble appears above head containing "~" (enjoying food).
+- Column 3: Character chewing, cheeks puffed. Speech bubble now containing "~~" (savoring).
+- Column 4: Character chewing happily, eyes closed with satisfaction. Speech bubble now containing "~~~" (delicious!).
+- Column 5: Character sitting with bowl, NO bubble — bubble disappeared. Identical to Column 1 for seamless loop.
+
+Requirements:
+
+- EXACTLY 160×160 pixels total image size
+- EXACTLY 5×5 grid = 25 cells, each 32×32 pixels
+- Background color: solid #00FF00 (hex 00FF00) for all empty space
+- The character itself must NOT contain #00FF00 pixels
+- Row 1 = Row 2 (identical talking animation)
+- Row 3 = Row 4 = Row 5 (identical eating animation)
+- Speech bubbles: white (#FFFFFF) fill, black (#000000) outline, present only in columns 2-4, absent in columns 1 and 5
+- Text inside bubbles: BLACK (#000000)
+- The standing character (rows 1-2) and eating character (rows 3-5) must be the SAME character with same colors/outfit — only the pose differs
+- Classic 16-bit RPG pixel art style, consistent proportions
+- Game-ready sprite sheet for programmatic slicing with chroma key
+- NO watermark, NO signature

@@ -1,0 +1,116 @@
+[
+  {
+    "id": "pet",
+    "name": "Pet",
+    "description": "Anime style sprite sheets, all frames → 1 GIF",
+    "exportMode": "whole",
+    "discardLastFrame": true,
+    "presets": [
+      {
+        "id": "fish",
+        "name": "Holding Fish",
+        "description": "5x5 sprite sheet, character hugging a big salted fish, idle loop animation",
+        "promptFile": "/prompt/pet/fish.txt",
+        "cols": 5,
+        "rows": 5,
+        "needsRefImage": true
+      },
+      {
+        "id": "work",
+        "name": "Laptop Working",
+        "description": "5x5 sprite sheet, character typing on laptop, work loop animation",
+        "promptFile": "/prompt/pet/work.txt",
+        "cols": 5,
+        "rows": 5,
+        "needsRefImage": true
+      },
+      {
+        "id": "crawl",
+        "name": "Crawl",
+        "description": "5x5 sprite sheet, character dangling from collar, paddling arms loop",
+        "promptFile": "/prompt/pet/crawl.txt",
+        "cols": 5,
+        "rows": 5,
+        "needsRefImage": true
+      },
+      {
+        "id": "sit",
+        "name": "Sit",
+        "description": "5x5 sprite sheet, character sitting cross-legged, idle daydream loop",
+        "promptFile": "/prompt/pet/sit.txt",
+        "cols": 5,
+        "rows": 5,
+        "needsRefImage": true
+      },
+      {
+        "id": "squat",
+        "name": "Squat",
+        "description": "5x5 sprite sheet, character squatting hugging knees, gentle rocking loop",
+        "promptFile": "/prompt/pet/squat.txt",
+        "cols": 5,
+        "rows": 5,
+        "needsRefImage": true
+      }
+    ]
+  },
+  {
+    "id": "mini",
+    "name": "Mini",
+    "description": "Pixel art sprite sheets, each row → separate GIF",
+    "exportMode": "by-row",
+    "discardLastFrame": false,
+    "presets": [
+      {
+        "id": "mini-walk",
+        "name": "Walk",
+        "description": "5x5 pixel art, top-down RPG walking animation (32x32 per cell)",
+        "promptFile": "/prompt/mini/walk.txt",
+        "cols": 5,
+        "rows": 5,
+        "needsRefImage": true,
+        "rowLabels": ["Walk Down", "Walk Up", "Walk Left", "Walk Right", "Idle"],
+        "excludeLastFrameRows": [2, 3]
+      },
+      {
+        "id": "mini-fish",
+        "name": "Slacking Off",
+        "description": "5x5 pixel art, slacking off / relaxing animation (32x32 per cell)",
+        "promptFile": "/prompt/mini/fish.txt",
+        "cols": 5,
+        "rows": 5,
+        "needsRefImage": true,
+        "rowLabels": ["Playing Phone 1", "Playing Phone 2", "Sleeping", "Stretching", "Daydreaming"]
+      },
+      {
+        "id": "mini-sport",
+        "name": "Sport",
+        "description": "5x5 pixel art, sports / exercise animation (32x32 per cell)",
+        "promptFile": "/prompt/mini/sport.txt",
+        "cols": 5,
+        "rows": 5,
+        "needsRefImage": true,
+        "rowLabels": ["Jump Rope", "Dumbbells", "Tai Chi", "Boxing", "Stretching"]
+      }
+    ]
+  },
+  {
+    "id": "top",
+    "name": "Top",
+    "description": "Pixel art for menu bar notch character (work + sleep)",
+    "exportMode": "by-row",
+    "discardLastFrame": false,
+    "presets": [
+      {
+        "id": "top-states",
+        "name": "Top (4 States)",
+        "description": "5x5 pixel art, row1 sleep, row2 work, row3 eat/compact, row4 look/wait, row5 unused (32x32 per cell)",
+        "promptFile": "/prompt/top/sleep.txt",
+        "cols": 5,
+        "rows": 5,
+        "needsRefImage": true,
+        "rowLabels": ["sleep", "work", "eat", "look", "unused"],
+        "excludeLastFrameRows": [4]
+      }
+    ]
+  }
+]

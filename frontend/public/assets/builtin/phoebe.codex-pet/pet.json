@@ -1,0 +1,7 @@
+{
+  "id": "phoebe",
+  "displayName": "Phoebe / 菲比",
+  "description": "A compact Codex digital pet inspired by Phoebe from Wuthering Waves, with pale golden hair, large violet eyes, rosy cheeks, and a simplified white-blue-black cleric outfit.",
+  "spritesheetPath": "spritesheet.webp",
+  "kind": "person"
+}

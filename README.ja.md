@@ -1,0 +1,108 @@
+<p align="center">
+  <img src="icon.png" width="80" />
+</p>
+<h1 align="center">OC-Claw</h1>
+<p align="center">
+  <a href="https://www.oc-claw.ai"><img src="https://img.shields.io/badge/公式サイトからダウンロード-oc--claw.ai-8A2BE2?style=for-the-badge" alt="Download" /></a>
+</p>
+<p align="center">
+  <a href="https://www.producthunt.com/products/oc-claw?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-oc-claw" target="_blank" rel="noopener noreferrer"><img alt="OC-Claw - A desktop pet that monitors your AI coding agents  | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1173374&amp;theme=light&amp;t=1781683113675"></a>
+</p>
+<p align="center">
+  <a href="./README.md">English</a> | <a href="./README.zh.md">中文</a> | <b>日本語</b> | <a href="./README.ko.md">한국어</a> | <a href="./README.es.md">Español</a> | <a href="./README.fr.md">Français</a>
+</p>
+<p align="center">
+  AI コーディングエージェントを監視するデスクトップペット、macOS と Windows に対応。
+</p>
+
+<p align="center">
+  <b>コーディングモード</b><br/>
+  <sub>macOS: OpenClaw, Claude Code, Cursor, Codex, OpenCode, Gemini CLI, Hermes Agent</sub><br/>
+  <sub>Windows: OpenClaw, Claude Code, Cursor, Codex, OpenCode, Gemini CLI, Hermes Agent (リモート SSH)</sub>
+</p>
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/74b8bbf8-ddcf-4149-a91e-d18d5c24fec6" width="600" />
+</p>
+<p align="center">
+  <b>ペットモード</b>
+</p>
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/2a143250-174a-406e-8a43-fd30db7ce071" width="600" />
+</p>
+
+## 機能
+
+- OpenClaw / Claude Code / Codex / Cursor / Gemini CLI / Hermes Agent エージェントの活動にリアルタイムで反応（稼働中・アイドル・待機中）
+- デスクトップにキャラクターが住み着き（macOS / Windows）、エージェント稼働中はアニメーション、アイドル時は居眠り
+- **macOS**：ノッチエリアにホバーするとセッション詳細パネルが表示
+- ローカルの OpenClaw エージェントを自動検出し、セッション一覧・チャット履歴・呼び出し数/トークン統計を表示
+- Hook 経由でローカル Claude Code、Codex、Cursor、Gemini CLI セッションをリッスンし、リアルタイム会話を表示
+- Gemini CLI のトークン使用統計（ローカルテレメトリ経由）
+- SSH 経由でリモートサーバー上の OpenClaw / Hermes Agent インスタンスに接続
+- カスタムアニメーション、エージェントごとに異なるキャラクターを割り当て
+- 島の背景をカスタマイズ可能、クロップツール対応
+- 完了音＆待機音
+
+## 必要条件
+
+- macOS または Windows
+- [OpenClaw](https://github.com/nicepkg/openclaw)、[Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Cursor](https://www.cursor.com)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)、[Hermes Agent](https://github.com/NousResearch/hermes-agent) のいずれかがインストール済み
+
+## 仕組み
+
+```
+OpenClaw Agents ──→ JSONL セッションファイル ──→ ヘルスポーリング ──→ 活動状態
+Claude Code     ──→ Hooks ──→ イベントパーサー ──→ 活動状態
+Codex           ──→ Hooks ──→ イベントパーサー ──→ 活動状態
+Cursor          ──→ Hooks ──→ イベントパーサー ──→ 活動状態
+Gemini CLI      ──→ Hooks ──→ イベントパーサー ──→ 活動状態
+Hermes Agent    ──→ Plugin ──→ イベントパーサー ──→ 活動状態
+                                                      ↓
+                  アニメスプライト ← ステートマシン ← サウンドエフェクト
+```
+
+OC-Claw は OpenClaw のセッションファイルをポーリングしてエージェントの活動を検出し、インストールされた Hook/プラグインを通じて Claude Code、Codex、Cursor、Gemini CLI、Hermes Agent をリッスンします。活動状態がノッチ島（macOS）またはタスクバーエリア（Windows）のキャラクターアニメーションを駆動し、展開パネルでセッション詳細、チャット履歴、メトリクスを表示します。
+
+## 技術スタック
+
+- **Tauri v2** + **React** + **TypeScript** — フロントエンド
+- **Rust** — バックエンド（システム連携、SSH トンネリング、API 通信）
+- macOS / Windows ネイティブ API によるウィンドウ管理
+
+## 開発
+
+```bash
+cd frontend
+npm install
+npx tauri dev
+```
+
+## コントリビュート
+
+バグ報告、機能提案、プルリクエストを歓迎します。
+
+## フレンドシップリンク
+
+[LINUX DO](https://linux.do/) の友人たちからのサポートとフィードバックに感謝します。
+
+## クレジット
+
+- [Notchi](https://github.com/sk-ruban/notchi) — ノッチコンパニオンコンセプトと草地島のデザインインスピレーション
+- [Vibe Island](https://github.com/vibeislandapp/vibe-island) — インタラクションデザインの参考
+
+## ライセンス
+
+MIT
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=rainnoon/oc-claw&type=Date)](https://star-history.com/#rainnoon/oc-claw&Date)
+
+---
+
+<p align="center">
+  <img src="assets/powered-by-kaon.png" height="28" />
+</p>
+<p align="center">
+  <sub>KAON Hackathon にて誕生</sub>
+</p>
