@@ -10252,8 +10252,11 @@ fn live2d_meta_from_dir(app: &tauri::AppHandle, dir: &std::path::Path) -> Option
         .and_then(|v| v.as_str())
         .map(String::from)
         .unwrap_or_default();
-    let model_path = meta.get("modelPath").and_then(|v| v.as_str())?;
-    let abs_model = dir.join(model_path);
+    let model_path = meta
+        .get("modelPath")
+        .and_then(|v| v.as_str())
+        .map(String::from)?;
+    let abs_model = dir.join(&model_path);
     if !abs_model.is_file() {
         return None;
     }
