@@ -4,8 +4,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-#[cfg(target_os = "windows")]
-static FULLSCREEN_HIDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 use percent_encoding::percent_decode_str;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
@@ -3078,10 +3076,8 @@ async fn open_mini(app: tauri::AppHandle) -> Result<(), String> {
                 );
                 let _ = win.set_position(tauri::LogicalPosition::new(x, 0.0));
             }
-            if !FULLSCREEN_HIDING.load(std::sync::atomic::Ordering::SeqCst) {
-                win.show().map_err(|e| e.to_string())?;
-                win.set_focus().map_err(|e| e.to_string())?;
-            }
+            win.show().map_err(|e| e.to_string())?;
+            win.set_focus().map_err(|e| e.to_string())?;
         }
         return Ok(());
     }
@@ -3180,9 +3176,7 @@ async fn open_mini(app: tauri::AppHandle) -> Result<(), String> {
             );
             let _ = win.set_position(tauri::LogicalPosition::new(x, 0.0));
         }
-        if !FULLSCREEN_HIDING.load(std::sync::atomic::Ordering::SeqCst) {
-            let _ = win.show();
-        }
+        let _ = win.show();
     }
 
     Ok(())
@@ -3328,62 +3322,7 @@ fn win_ui_scale(monitor: &tauri::Monitor) -> f64 {
     (logical_h / 1080.0).max(1.0)
 }
 
-/// Returns the HMONITOR of the fullscreen foreground window, or None if the
-/// foreground window is not fullscreen.  Excludes desktop shell windows
-/// (Progman, WorkerW, Shell_TrayWnd) which cover the full screen but are
-/// not real fullscreen apps.
-#[cfg(target_os = "windows")]
-fn fullscreen_foreground_monitor() -> Option<windows::Win32::Graphics::Gdi::HMONITOR> {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowRect, GetClassNameW,
-    };
-    use windows::Win32::Graphics::Gdi::{
-        MonitorFromWindow, GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-    };
-    use windows::Win32::Foundation::RECT;
-    unsafe {
-        let fg = GetForegroundWindow();
-        if fg.0 == std::ptr::null_mut() {
-            return None;
-        }
-
-        let mut class_buf = [0u16; 64];
-        let len = GetClassNameW(fg, &mut class_buf) as usize;
-        if len > 0 {
-            let class_name = String::from_utf16_lossy(&class_buf[..len]);
-            if class_name == "Progman"
-                || class_name == "WorkerW"
-                || class_name == "Shell_TrayWnd"
-            {
-                return None;
-            }
-        }
-
-        let mut fg_rect = RECT::default();
-        if GetWindowRect(fg, &mut fg_rect).is_err() {
-            return None;
-        }
-        let monitor = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
-        let mut mi = MONITORINFO {
-            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        if !GetMonitorInfoW(monitor, &mut mi).as_bool() {
-            return None;
-        }
-        let mr = mi.rcMonitor;
-        if fg_rect.left <= mr.left
-            && fg_rect.top <= mr.top
-            && fg_rect.right >= mr.right
-            && fg_rect.bottom >= mr.bottom
-        {
-            Some(monitor)
-        } else {
-            None
-        }
-    }
-}
-
+/// Get the UI scale factor for Windows DPI-aware sizing.
 #[tauri::command]
 async fn get_ui_scale(app: tauri::AppHandle) -> Result<f64, String> {
     #[cfg(target_os = "windows")]
@@ -4030,9 +3969,7 @@ async fn set_mini_expanded(app: tauri::AppHandle, expanded: bool, position: Opti
                 }
             }
         }
-        if !FULLSCREEN_HIDING.load(std::sync::atomic::Ordering::SeqCst) {
-            let _ = win.set_always_on_top(true);
-        }
+        let _ = win.set_always_on_top(true);
     }
 
     Ok(())
@@ -5478,10 +5415,8 @@ async fn set_pet_mode_window(
                     let _ = win.set_position(tauri::LogicalPosition::new(x, y));
                 }
             }
-            if !FULLSCREEN_HIDING.load(std::sync::atomic::Ordering::SeqCst) {
-                let _ = win.set_always_on_top(true);
-                let _ = win.show();
-            }
+            let _ = win.set_always_on_top(true);
+            let _ = win.show();
         }
 
         // Start the click-through poll thread.
@@ -6263,7 +6198,7 @@ async fn set_mini_size(
                 let win_w = (base_w * ui).round();
                 let win_h = (base_h * ui).round();
                 let _ = win.set_size(tauri::LogicalSize::new(win_w, win_h));
-                let _ = win.set_always_on_top(want_top && !FULLSCREEN_HIDING.load(std::sync::atomic::Ordering::SeqCst));
+                let _ = win.set_always_on_top(want_top);
                 if large_mascot.unwrap_or(false) {
                     let margin = (10.0 * ui).round();
                     let x = mx + sw - win_w - margin;
@@ -6281,7 +6216,7 @@ async fn set_mini_size(
                 let win_w = (sw * 0.85).round();
                 let win_h = (sh * 0.85).round();
                 let x = mx + (sw - win_w) / 2.0;
-                let _ = win.set_always_on_top(want_top && !FULLSCREEN_HIDING.load(std::sync::atomic::Ordering::SeqCst));
+                let _ = win.set_always_on_top(want_top);
                 let _ = win.set_size(tauri::LogicalSize::new(win_w, win_h));
                 let _ = win.set_position(tauri::LogicalPosition::new(x, my));
             }
@@ -18768,90 +18703,8 @@ pub fn run() {
                 let _ = win.show();
             }
 
-            // Windows: move window off-screen when a fullscreen app is on the SAME
-            // monitor as the mini window.  We avoid hide()/show() because show()
-            // triggers a focus event which causes the panel to expand.
-            #[cfg(target_os = "windows")]
-            {
-                let app_handle = app.handle().clone();
-                std::thread::spawn(move || {
-                    use windows::Win32::Graphics::Gdi::{HMONITOR, MonitorFromPoint, MONITOR_DEFAULTTONEAREST};
-                    use windows::Win32::Foundation::POINT;
-
-                    let mut was_hidden = false;
-                    let mut saved_pos: Option<tauri::LogicalPosition<f64>> = None;
-                    let mut hidden_monitor: Option<HMONITOR> = None;
-                    // Debounce counter: require several consecutive non-fullscreen
-                    // polls before restoring, so brief foreground changes (mouse
-                    // movement, overlay popups) during video playback don't cause
-                    // the pet to flicker.
-                    let mut non_fs_streak: u32 = 0;
-                    const RESTORE_THRESHOLD: u32 = 4; // 4 × 500ms = 2s
-                    loop {
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-                        let fs_monitor = fullscreen_foreground_monitor();
-
-                        if let Some(win) = app_handle.get_webview_window("mini") {
-                            let tracked_monitor = if was_hidden {
-                                hidden_monitor
-                            } else if let Ok(pos) = win.outer_position() {
-                                Some(unsafe {
-                                    MonitorFromPoint(
-                                        POINT { x: pos.x, y: pos.y },
-                                        MONITOR_DEFAULTTONEAREST,
-                                    )
-                                })
-                            } else {
-                                None
-                            };
-                            let same_monitor = matches!(
-                                (fs_monitor, tracked_monitor),
-                                (Some(fs_mon), Some(mini_mon)) if mini_mon == fs_mon
-                            );
-
-                            if same_monitor {
-                                non_fs_streak = 0;
-                                if !was_hidden {
-                                    log::info!("[fullscreen] detected fullscreen app on same monitor, moving mini off-screen");
-                                    FULLSCREEN_HIDING.store(true, std::sync::atomic::Ordering::SeqCst);
-                                    if let Ok(pos) = win.outer_position() {
-                                        hidden_monitor = Some(unsafe {
-                                            MonitorFromPoint(
-                                                POINT { x: pos.x, y: pos.y },
-                                                MONITOR_DEFAULTTONEAREST,
-                                            )
-                                        });
-                                    }
-                                    if let Ok(Some(pos)) = win.outer_position().map(|p| {
-                                        win.current_monitor().ok().flatten().map(|m| {
-                                            let s = m.scale_factor();
-                                            tauri::LogicalPosition::new(p.x as f64 / s, p.y as f64 / s)
-                                        })
-                                    }) {
-                                        saved_pos = Some(pos);
-                                    }
-                                    let _ = win.set_always_on_top(false);
-                                    let _ = win.set_position(tauri::LogicalPosition::new(-9999.0_f64, -9999.0_f64));
-                                    was_hidden = true;
-                                }
-                            } else if was_hidden {
-                                non_fs_streak += 1;
-                                if non_fs_streak >= RESTORE_THRESHOLD {
-                                    log::info!("[fullscreen] fullscreen exited or on different monitor, restoring mini position");
-                                    FULLSCREEN_HIDING.store(false, std::sync::atomic::Ordering::SeqCst);
-                                    if let Some(pos) = saved_pos.take() {
-                                        let _ = win.set_position(pos);
-                                    }
-                                    let _ = win.set_always_on_top(true);
-                                    was_hidden = false;
-                                    hidden_monitor = None;
-                                    non_fs_streak = 0;
-                                }
-                            }
-                        }
-                    }
-                });
-            }
+            // Primary mini stays always-on-top over fullscreen apps, same as
+            // extra/demo mascots (no off-screen hide on fullscreen anymore).
 
             // Start Claude Code socket server
             {
@@ -18939,7 +18792,6 @@ pub fn run() {
                             }
                             #[cfg(target_os = "windows")]
                             {
-                                FULLSCREEN_HIDING.store(false, std::sync::atomic::Ordering::SeqCst);
                                 if let Ok(Some(monitor)) = win.primary_monitor() {
                                     let scale = monitor.scale_factor();
                                     let sw = monitor.size().width as f64 / scale;
