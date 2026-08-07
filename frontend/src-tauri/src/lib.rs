@@ -17542,57 +17542,43 @@ try {
     } catch {}
 
     # Best-effort notify-bridge for Multi pets that poll /status (e.g. :9999).
-    try {
-        $notifyUrl = if ($env:CURSOR_NOTIFY_URL) { $env:CURSOR_NOTIFY_URL } else { 'http://127.0.0.1:18765/notify' }
-        $token = if ($env:CURSOR_NOTIFY_TOKEN) { $env:CURSOR_NOTIFY_TOKEN } else { 'G2CfgFeRwiAPDLKOQ6WnNhUbIcjs4z3x' }
-        $status = 'working'
-        $kind = 'working'
-        $bodyText = 'task running'
-        if ($hookName -eq 'stop') {
-            $status = 'completed'
-            $kind = 'completed'
-            if ($payload -and $payload.status) { $status = [string]$payload.status }
-            $completed = [string](-join [char[]](0x4EFB, 0x52A1, 0x5DF2, 0x5B8C, 0x6210))
-            $aborted = [string](-join [char[]](0x4EFB, 0x52A1, 0x5DF2, 0x4E2D, 0x6B62))
-            $errorText = [string](-join [char[]](0x4EFB, 0x52A1, 0x51FA, 0x9519))
-            $map = @{ completed = $completed; aborted = $aborted; error = $errorText }
-            $bodyText = if ($map.ContainsKey($status)) { $map[$status] } else { "Agent stop: $status" }
-        } elseif ($hookName -eq 'afterAgentThought') {
-            $bodyText = 'thinking'
-            $kind = 'thinking'
-        } elseif ($hookName -eq 'beforeShellExecution' -or $hookName -eq 'afterShellExecution') {
-            $bodyText = 'shell'
-            $kind = 'tool'
-        } elseif ($hookName -eq 'beforeMCPExecution' -or $hookName -eq 'afterMCPExecution') {
-            $bodyText = 'mcp'
-            $kind = 'tool'
-        }
-        $generationId = ''
-        $conversationId = ''
-        if ($payload) {
-            if ($payload.generation_id) { $generationId = [string]$payload.generation_id }
-            if ($payload.conversation_id) { $conversationId = [string]$payload.conversation_id }
-            elseif ($payload.session_id) { $conversationId = [string]$payload.session_id }
-        }
-        $json = (@{
-            title = 'Cursor'; body = $bodyText; status = $status; kind = $kind
-            generationId = $generationId; conversationId = $conversationId
-            epochMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-        } | ConvertTo-Json -Compress)
-        $jsonBytes = [Text.Encoding]::UTF8.GetBytes($json)
-        $req = [System.Net.HttpWebRequest]::Create($notifyUrl)
-        $req.Method = 'POST'
-        $req.ContentType = 'application/json; charset=utf-8'
-        $req.Timeout = 1500
-        $req.ReadWriteTimeout = 1500
-        $req.Headers.Add('Authorization', "Bearer $token")
-        $req.ContentLength = $jsonBytes.Length
-        $reqStream = $req.GetRequestStream()
-        $reqStream.Write($jsonBytes, 0, $jsonBytes.Length)
-        $reqStream.Close()
-        $resp = $req.GetResponse()
-        $resp.Close()
-    } catch {}
+    # Build payload first; print Cursor stdout BEFORE HTTP so hooks stay fast.
+    $notifyUrl = if ($env:CURSOR_NOTIFY_URL) { $env:CURSOR_NOTIFY_URL } else { 'http://127.0.0.1:18765/notify' }
+    $token = if ($env:CURSOR_NOTIFY_TOKEN) { $env:CURSOR_NOTIFY_TOKEN } else { 'G2CfgFeRwiAPDLKOQ6WnNhUbIcjs4z3x' }
+    $status = 'working'
+    $kind = 'working'
+    $bodyText = 'task running'
+    if ($hookName -eq 'stop') {
+        $status = 'completed'
+        $kind = 'completed'
+        if ($payload -and $payload.status) { $status = [string]$payload.status }
+        $completed = [string](-join [char[]](0x4EFB, 0x52A1, 0x5DF2, 0x5B8C, 0x6210))
+        $aborted = [string](-join [char[]](0x4EFB, 0x52A1, 0x5DF2, 0x4E2D, 0x6B62))
+        $errorText = [string](-join [char[]](0x4EFB, 0x52A1, 0x51FA, 0x9519))
+        $map = @{ completed = $completed; aborted = $aborted; error = $errorText }
+        $bodyText = if ($map.ContainsKey($status)) { $map[$status] } else { "Agent stop: $status" }
+    } elseif ($hookName -eq 'afterAgentThought') {
+        $bodyText = 'thinking'
+        $kind = 'thinking'
+    } elseif ($hookName -eq 'beforeShellExecution' -or $hookName -eq 'afterShellExecution') {
+        $bodyText = 'shell'
+        $kind = 'tool'
+    } elseif ($hookName -eq 'beforeMCPExecution' -or $hookName -eq 'afterMCPExecution') {
+        $bodyText = 'mcp'
+        $kind = 'tool'
+    }
+    $generationId = ''
+    $conversationId = ''
+    if ($payload) {
+        if ($payload.generation_id) { $generationId = [string]$payload.generation_id }
+        if ($payload.conversation_id) { $conversationId = [string]$payload.conversation_id }
+        elseif ($payload.session_id) { $conversationId = [string]$payload.session_id }
+    }
+    $notifyJson = (@{
+        title = 'Cursor'; body = $bodyText; status = $status; kind = $kind
+        generationId = $generationId; conversationId = $conversationId
+        epochMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    } | ConvertTo-Json -Compress)
 
     # Cursor's required stdout response per hook event type.
     if ($hookName -eq 'beforeSubmitPrompt') {
@@ -17602,6 +17588,19 @@ try {
     } else {
         Write-Output '{}'
     }
+
+    # Detached notify so Cursor is not blocked on HTTP.
+    try {
+        $tmp = [IO.Path]::Combine([IO.Path]::GetTempPath(), ('cursor-notify-' + [guid]::NewGuid().ToString('n') + '.json'))
+        [IO.File]::WriteAllText($tmp, $notifyJson, [Text.UTF8Encoding]::new($false))
+        $curlArgs = @(
+            '-s', '-m', '1', '-X', 'POST', $notifyUrl,
+            '-H', "Authorization: Bearer $token",
+            '-H', 'Content-Type: application/json; charset=utf-8',
+            '--data-binary', "@$tmp"
+        )
+        Start-Process -FilePath 'curl.exe' -ArgumentList $curlArgs -WindowStyle Hidden | Out-Null
+    } catch {}
 } catch {
     Write-Output '{}'
 }

@@ -53,6 +53,34 @@ function isPetStatusTone(v: unknown): v is PetStatusTone {
   )
 }
 
+/** Tunnel / proxy timeouts should keep last UI and retry immediately. */
+function isStatusTimeoutError(err: unknown): boolean {
+  const msg = String(err ?? '').toLowerCase()
+  return (
+    msg.includes('timeout') ||
+    msg.includes('timed out') ||
+    msg.includes('http 408') ||
+    msg.includes('request timeout')
+  )
+}
+
+type RemoteStatusPayload = {
+  state?: string
+  detail?: string
+  status?: string
+  kind?: string
+}
+
+function parseRemoteStatusPayload(text: string): RemoteStatusPayload {
+  const trimmed = (text || '').trim()
+  if (!trimmed) throw new Error('empty status body')
+  const data = JSON.parse(trimmed) as RemoteStatusPayload
+  if (typeof data !== 'object' || data == null) throw new Error('invalid status json')
+  const state = data.state || data.status
+  if (typeof state !== 'string' || !state.trim()) throw new Error('missing status state')
+  return data
+}
+
 // `functional` mascots (coding-mode multi-mascot feature) emit
 // `extra-mascot-activate` to the main mini window on a click (no drag) so the
 // main panel expands — making each extra mascot equivalent to the primary one.
@@ -282,10 +310,30 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
       }
     }
 
-    let inFlight = false
-    let urlReachable = false
-    let pollTimer: number | null = null
-    let probeTimer: number | null = null
+    // Success → next poll in 2s. Timeout / bad body → keep last animation &
+    // bubble, retry immediately until a valid response arrives.
+    const POLL_OK_MS = 2000
+    // After a timeout the HTTP client already waited ~3s; retry ASAP with a
+    // tiny gap so a tight invalid-body loop cannot peg the CPU.
+    const RETRY_TIMEOUT_MS = 200
+    const RETRY_OTHER_MS = 1500
+    let hadSuccess = false
+    let timer: number | null = null
+
+    const clearTimer = () => {
+      if (timer != null) {
+        window.clearTimeout(timer)
+        timer = null
+      }
+    }
+
+    const schedule = (ms: number) => {
+      clearTimer()
+      timer = window.setTimeout(() => {
+        timer = null
+        void tick()
+      }, ms)
+    }
 
     const applyRemoteState = (state: string, detail?: string, kind?: string) => {
       const s = (state || '').toLowerCase()
@@ -325,83 +373,54 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
       })
     }
 
-    const clearPoll = () => {
-      if (pollTimer != null) {
-        window.clearInterval(pollTimer)
-        pollTimer = null
-      }
-    }
-
-    const markUnreachable = () => {
-      urlReachable = false
-      clearPoll()
-      // URL configured but down: stay idle rather than silently mirroring
-      // local primary (would hide that the remote bridge is offline).
-      setWaiting(false)
-      setWorking(false)
-    }
-
-    const pollRemote = async () => {
-      if (cancelled || inFlight || !urlReachable) return
-      inFlight = true
+    const tick = async () => {
+      if (cancelled) return
       try {
-        const { invoke } = await import('@tauri-apps/api/core')
         const text = (await invoke('proxy_get', { url: statusUrlFromUrl })) as string
         if (cancelled) return
-        const data = JSON.parse(text) as {
-          state?: string
-          detail?: string
-          status?: string
-          kind?: string
-        }
+        const data = parseRemoteStatusPayload(text)
         applyRemoteState(data.state || data.status || 'idle', data.detail, data.kind)
+        hadSuccess = true
+        schedule(POLL_OK_MS)
       } catch (e) {
-        if (!cancelled) {
-          console.warn('[extra-mascot] status poll failed:', e)
-          markUnreachable()
-        }
-      } finally {
-        inFlight = false
-      }
-    }
-
-    const startPoll = () => {
-      clearPoll()
-      urlReachable = true
-      void pollRemote()
-      pollTimer = window.setInterval(pollRemote, 5000)
-    }
-
-    const probeRemote = async () => {
-      if (cancelled || inFlight) return
-      if (urlReachable) return
-      inFlight = true
-      try {
-        const { invoke } = await import('@tauri-apps/api/core')
-        const text = (await invoke('proxy_get', { url: statusUrlFromUrl })) as string
         if (cancelled) return
-        const data = JSON.parse(text) as {
-          state?: string
-          detail?: string
-          status?: string
-          kind?: string
+        const soft =
+          isStatusTimeoutError(e) ||
+          (() => {
+            const msg = String(e ?? '').toLowerCase()
+            return (
+              msg.includes('empty status') ||
+              msg.includes('invalid status') ||
+              msg.includes('missing status') ||
+              msg.includes('unexpected') || // JSON.parse
+              msg.includes('is not valid json')
+            )
+          })()
+
+        // Timeout / bad body: keep previous animation & bubble, retry now.
+        if (soft) {
+          console.warn('[extra-mascot] status timeout/invalid, keep last state, retry:', e)
+          schedule(RETRY_TIMEOUT_MS)
+          return
         }
-        applyRemoteState(data.state || data.status || 'idle', data.detail, data.kind)
-        startPoll()
-      } catch {
-        if (!cancelled) markUnreachable()
-      } finally {
-        inFlight = false
+
+        // Hard failure: keep last UI after a good sample; only idle before first success.
+        if (!hadSuccess) {
+          console.warn('[extra-mascot] status probe failed:', e)
+          setWaiting(false)
+          setWorking(false)
+        } else {
+          console.warn('[extra-mascot] status poll failed, keep last state, retry:', e)
+        }
+        schedule(hadSuccess ? RETRY_OTHER_MS : POLL_OK_MS)
       }
     }
 
-    void probeRemote()
-    probeTimer = window.setInterval(probeRemote, 30000)
+    void tick()
 
     return () => {
       cancelled = true
-      clearPoll()
-      if (probeTimer != null) window.clearInterval(probeTimer)
+      clearTimer()
     }
   }, [statusUrlFromUrl])
 
