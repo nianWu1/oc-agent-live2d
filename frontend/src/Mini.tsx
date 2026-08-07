@@ -779,6 +779,7 @@ export default function Mini() {
   const applyMascotMode = useCallback(async (mode: 'lock' | 'drag') => {
     mascotModeRef.current = mode
     setMascotMode(mode)
+    emit('mascot-interaction-mode', { mode }).catch(() => {})
     try {
       const store = await load('settings.json', { defaults: {}, autoSave: true })
       await store.set('mascot_interaction_mode', mode)
@@ -2155,6 +2156,7 @@ export default function Mini() {
       if (mim === 'lock' || mim === 'drag') {
         mascotModeRef.current = mim
         setMascotMode(mim)
+        emit('mascot-interaction-mode', { mode: mim }).catch(() => {})
       }
       const lm = await store.get('large_mascot')
       if (typeof lm === 'boolean' && appModeRef.current !== 'pet') {
@@ -4152,6 +4154,8 @@ export default function Mini() {
   // the current state without waiting for the next change.
   const mainPetStateRef = useRef<PetState>(mainPetState)
   mainPetStateRef.current = mainPetState
+  const petStatusBubbleRef = useRef(petStatusBubble)
+  petStatusBubbleRef.current = petStatusBubble
   // Diagnostic (dev only): emit a backend log line whenever the mascot state
   // changes, including which claude sessions (and other inputs) are pinning
   // it. Helps pinpoint stuck-mascot bugs without opening webview DevTools.
@@ -4170,12 +4174,25 @@ export default function Mini() {
   }, [mainPetState, hasWorking, anySessionActive, healthMap, claudeWorking, claudeWaiting, claudeCompacting, visibleClaudeSessions])
   useEffect(() => {
     if (appMode !== 'coding') return
-    emit('mini-pet-state', { state: mainPetState }).catch(() => {})
-  }, [mainPetState, appMode])
+    const bubble = petStatusBubble
+    emit('mini-pet-state', {
+      state: mainPetState,
+      label: bubble.label,
+      tone: bubble.tone,
+      title: bubble.title ?? null,
+    }).catch(() => {})
+  }, [mainPetState, petStatusBubble, appMode])
   useEffect(() => {
     if (appMode !== 'coding') return
     const t = setInterval(() => {
-      emit('mini-pet-state', { state: mainPetStateRef.current }).catch(() => {})
+      const bubble = petStatusBubbleRef.current
+      emit('mini-pet-state', {
+        state: mainPetStateRef.current,
+        label: bubble.label,
+        tone: bubble.tone,
+        title: bubble.title ?? null,
+      }).catch(() => {})
+      emit('mascot-interaction-mode', { mode: mascotModeRef.current }).catch(() => {})
     }, 2000)
     return () => clearInterval(t)
   }, [appMode])

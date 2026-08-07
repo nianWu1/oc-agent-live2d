@@ -1,11 +1,13 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { emit, listen } from '@tauri-apps/api/event'
 import { load } from '@tauri-apps/plugin-store'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { LogicalSize } from '@tauri-apps/api/dpi'
 import { Maximize2 } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 import { MiniPetMascot } from './components/MiniPetMascot'
+import type { PetStatusTone } from './components/PetStatusBubble'
 import { loadCodexPetById, loadDefaultCodexPet, type CodexPet, type CodexPetState } from './lib/codexPet'
 
 const isWindowsPlatform =
@@ -40,11 +42,23 @@ function clampLargeMascotScale(value: number): number {
   return Math.min(LARGE_MASCOT_SCALE_MAX, Math.max(LARGE_MASCOT_SCALE_MIN, value))
 }
 
+function isPetStatusTone(v: unknown): v is PetStatusTone {
+  return (
+    v === 'idle' ||
+    v === 'working' ||
+    v === 'waiting' ||
+    v === 'thinking' ||
+    v === 'tool' ||
+    v === 'compacting'
+  )
+}
+
 // `functional` mascots (coding-mode multi-mascot feature) emit
 // `extra-mascot-activate` to the main mini window on a click (no drag) so the
 // main panel expands — making each extra mascot equivalent to the primary one.
 // Demo mascots leave `functional` false and stay decorative.
 export function DemoMascot({ functional = false }: { functional?: boolean }) {
+  const { t } = useTranslation()
   const params = new URLSearchParams(window.location.hash.split('?')[1] ?? '')
   const petIdFromUrl = params.get('pet') ?? ''
   const statusUrlFromUrl = params.get('statusUrl') ?? ''
@@ -57,9 +71,16 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
   const [dragging, setDragging] = useState(false)
   const [resizeHandleHovered, setResizeHandleHovered] = useState(false)
   const [size, setSize] = useState(DEFAULT_MASCOT_SIZE)
+  const [mascotMode, setMascotMode] = useState<'lock' | 'drag'>('drag')
+  const [remoteBubble, setRemoteBubble] = useState<{
+    label: string
+    tone: PetStatusTone
+    title?: string
+  } | null>(null)
   const dragActiveRef = useRef(false)
   const baseSizeRef = useRef(MASCOT_BASE_SIZE)
   const largeScaleRef = useRef(5)
+  const mascotModeRef = useRef<'lock' | 'drag'>('drag')
 
   useEffect(() => {
     let cancelled = false
@@ -71,6 +92,34 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
       cancelled = true
     }
   }, [petIdFromUrl])
+
+  // Global lock/drag mode (same setting as primary mini).
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        const store = await load('settings.json', { defaults: {}, autoSave: false })
+        const mim = await store.get('mascot_interaction_mode')
+        if (!cancelled && (mim === 'lock' || mim === 'drag')) {
+          mascotModeRef.current = mim
+          setMascotMode(mim)
+        }
+      } catch {
+        /* default drag */
+      }
+    })()
+    const unlisten = listen<{ mode?: string }>('mascot-interaction-mode', (ev) => {
+      const mode = ev.payload?.mode
+      if (mode === 'lock' || mode === 'drag') {
+        mascotModeRef.current = mode
+        setMascotMode(mode)
+      }
+    })
+    return () => {
+      cancelled = true
+      unlisten.then((fn) => fn())
+    }
+  }, [])
 
   // Match the primary mascot's size. Read the persisted scale on mount and keep
   // in sync with live slider changes broadcast by the main window. The owning
@@ -115,6 +164,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
   }, [])
 
   const handleResizePointerDown = useCallback((e: React.PointerEvent) => {
+    if (mascotModeRef.current === 'lock') return
     if (e.button !== 0 || e.ctrlKey) return
     e.preventDefault()
     e.stopPropagation()
@@ -235,7 +285,12 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
       }
     }
 
-    const unlisten = listen<{ state?: string }>('mini-pet-state', (ev) => {
+    const unlisten = listen<{
+      state?: string
+      label?: string
+      tone?: string
+      title?: string | null
+    }>('mini-pet-state', (ev) => {
       const s = ev.payload?.state
       if (s === 'waiting') {
         setWaiting(true)
@@ -246,6 +301,14 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
       } else {
         setWaiting(false)
         setWorking(false)
+      }
+      const label = ev.payload?.label
+      if (typeof label === 'string' && label.trim()) {
+        setRemoteBubble({
+          label,
+          tone: isPetStatusTone(ev.payload?.tone) ? ev.payload.tone : 'idle',
+          title: typeof ev.payload?.title === 'string' ? ev.payload.title : undefined,
+        })
       }
     })
     return () => {
@@ -258,6 +321,14 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
   // macOS NSWindow Y grows upward while screenY grows downward — invert dy
   // there. (Primary mini avoids this by dragging in Rust translate_mini_frame.)
   const handlePointerDown = useCallback((e: React.PointerEvent) => {
+    if (mascotModeRef.current === 'lock') {
+      // Locked: no drag. Functional extras can still activate the main panel
+      // when click-through is off (e.g. while the primary panel is open).
+      if (functional && isWindowsPlatform && e.button === 0 && !e.ctrlKey) {
+        emit('extra-mascot-activate').catch(() => {})
+      }
+      return
+    }
     if (e.button !== 0 || e.ctrlKey) return
     e.preventDefault()
     dragActiveRef.current = true
@@ -398,11 +469,46 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
     if (k === 'confirm_shell') return '确认 Shell'
     if (k === 'confirm_mcp') return '确认 MCP'
     if (k === 'confirm_tool' || k === 'confirm') return '需要确认'
-    if (waiting) return '需要确认'
+    if (waiting && statusUrlFromUrl) return '需要确认'
     return ''
   })()
 
+  const statusBubble = useMemo(() => {
+    // Independent statusUrl pets: derive bubble from their own bridge.
+    if (statusUrlFromUrl) {
+      if (confirmLabel) {
+        return {
+          label: confirmLabel,
+          tone: 'waiting' as PetStatusTone,
+          title: statusDetail || confirmLabel,
+        }
+      }
+      if (waiting) {
+        return {
+          label: t('mini.statusWaitingTool'),
+          tone: 'waiting' as PetStatusTone,
+          title: statusDetail || undefined,
+        }
+      }
+      if (working) {
+        return { label: t('mini.working'), tone: 'working' as PetStatusTone }
+      }
+      return { label: t('mini.idleBusy'), tone: 'idle' as PetStatusTone }
+    }
+    // Mirror pets: prefer the rich label broadcast from the primary mini.
+    if (remoteBubble) return remoteBubble
+    if (waiting) {
+      return { label: t('mini.statusWaitingTool'), tone: 'waiting' as PetStatusTone }
+    }
+    if (working) {
+      return { label: t('mini.working'), tone: 'working' as PetStatusTone }
+    }
+    return { label: t('mini.idleBusy'), tone: 'idle' as PetStatusTone }
+  }, [statusUrlFromUrl, confirmLabel, waiting, working, statusDetail, remoteBubble, t])
+
   if (!pet) return null
+
+  const locked = mascotMode === 'lock'
 
   return (
     <div
@@ -416,93 +522,64 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
         alignItems: 'center',
         justifyContent: 'center',
         background: 'transparent',
-        cursor: 'grab',
+        cursor: locked ? 'default' : 'grab',
       }}
     >
-      {confirmLabel && (
-        <div
-          style={{
-            position: 'absolute',
-            top: 2,
-            left: '50%',
-            transform: 'translateX(-50%)',
-            zIndex: 20,
-            pointerEvents: 'none',
-            maxWidth: '95%',
-            padding: '3px 8px',
-            borderRadius: 999,
-            background: 'rgba(245, 158, 11, 0.95)',
-            color: '#111',
-            fontSize: 11,
-            fontWeight: 700,
-            lineHeight: 1.2,
-            whiteSpace: 'nowrap',
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            boxShadow: '0 2px 8px rgba(0,0,0,0.28)',
-            animation: 'ocConfirmPulse 1.2s ease-in-out infinite',
-          }}
-          title={statusDetail || confirmLabel}
-        >
-          {confirmLabel}
-        </div>
-      )}
-      <style>{`
-        @keyframes ocConfirmPulse {
-          0%, 100% { transform: translateX(-50%) scale(1); opacity: 1; }
-          50% { transform: translateX(-50%) scale(1.06); opacity: 0.88; }
-        }
-      `}</style>
       <MiniPetMascot
         pet={pet}
         baseState={baseState}
         size={size}
         enableHoverJump
         suppressHover={dragging}
+        statusLabel={statusBubble.label}
+        statusTone={statusBubble.tone}
+        statusTitle={statusBubble.title}
       />
-      <div
-        data-no-drag
-        onPointerEnter={() => setResizeHandleHovered(true)}
-        onPointerLeave={() => setResizeHandleHovered(false)}
-        onPointerDown={handleResizePointerDown}
-        style={{
-          position: 'absolute',
-          right: 0,
-          bottom: 0,
-          width: MASCOT_RESIZE_HANDLE_SIZE,
-          height: MASCOT_RESIZE_HANDLE_SIZE,
-          cursor: MASCOT_RESIZE_CURSOR,
-          pointerEvents: 'auto',
-          zIndex: 12,
-          touchAction: 'none',
-          background: 'rgba(255,255,255,0.01)',
-          display: 'flex',
-          alignItems: 'flex-end',
-          justifyContent: 'flex-end',
-          padding: 4,
-        }}
-      >
+      {!locked && (
         <div
+          data-no-drag
+          onPointerEnter={() => setResizeHandleHovered(true)}
+          onPointerLeave={() => setResizeHandleHovered(false)}
+          onPointerDown={handleResizePointerDown}
           style={{
-            width: MASCOT_RESIZE_ICON_SIZE,
-            height: MASCOT_RESIZE_ICON_SIZE,
-            borderRadius: 8,
-            background: 'rgba(255,255,255,0.94)',
-            boxShadow: '0 3px 10px rgba(0,0,0,0.22)',
-            color: '#1f2937',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
+            position: 'absolute',
+            right: 0,
+            bottom: 0,
+            width: MASCOT_RESIZE_HANDLE_SIZE,
+            height: MASCOT_RESIZE_HANDLE_SIZE,
             cursor: MASCOT_RESIZE_CURSOR,
-            opacity: resizeHandleHovered ? 1 : 0,
-            transform: resizeHandleHovered ? 'translateY(0) scale(1) rotate(90deg)' : 'translateY(3px) scale(0.92) rotate(90deg)',
-            transition: 'opacity 120ms ease, transform 120ms ease',
-            pointerEvents: 'none',
+            pointerEvents: 'auto',
+            zIndex: 12,
+            touchAction: 'none',
+            background: 'rgba(255,255,255,0.01)',
+            display: 'flex',
+            alignItems: 'flex-end',
+            justifyContent: 'flex-end',
+            padding: 4,
           }}
         >
-          <Maximize2 size={15} strokeWidth={2.4} />
+          <div
+            style={{
+              width: MASCOT_RESIZE_ICON_SIZE,
+              height: MASCOT_RESIZE_ICON_SIZE,
+              borderRadius: 8,
+              background: 'rgba(255,255,255,0.94)',
+              boxShadow: '0 3px 10px rgba(0,0,0,0.22)',
+              color: '#1f2937',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              cursor: MASCOT_RESIZE_CURSOR,
+              opacity: resizeHandleHovered ? 1 : 0,
+              transform: resizeHandleHovered ? 'translateY(0) scale(1) rotate(90deg)' : 'translateY(3px) scale(0.92) rotate(90deg)',
+              transition: 'opacity 120ms ease, transform 120ms ease',
+              pointerEvents: 'none',
+            }}
+          >
+            <Maximize2 size={15} strokeWidth={2.4} />
+          </div>
         </div>
-      </div>
+      )}
       {/* Status indicator dot, mirroring the primary mascot's bottom-right
           light so coding-mode extra mascots show the same working/waiting/idle
           status. Decorative demo mascots stay clean. */}

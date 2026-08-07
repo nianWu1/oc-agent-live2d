@@ -5824,6 +5824,46 @@ fn pet_passthrough_poll(app: tauri::AppHandle, mascot_scale: f64, large_mascot_s
     PET_PASSTHROUGH_THREAD_ALIVE.store(false, Ordering::SeqCst);
 }
 
+fn is_satellite_mascot_label(label: &str) -> bool {
+    label.starts_with("extra-mascot-") || label.starts_with("demo-mascot-")
+}
+
+/// Lock/drag applies to every desk pet: while locked, extra/demo mascot windows
+/// fully ignore cursor events (no per-window notch; reopen via the primary mini).
+fn set_satellite_mascots_ignore_cursor(app: &tauri::AppHandle, ignore: bool) {
+    #[cfg(target_os = "windows")]
+    {
+        for (label, win) in app.webview_windows() {
+            if is_satellite_mascot_label(&label) {
+                let _ = win.set_ignore_cursor_events(ignore);
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let app2 = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            for (label, win) in app2.webview_windows() {
+                if !is_satellite_mascot_label(&label) {
+                    continue;
+                }
+                let _ = win.set_ignore_cursor_events(ignore);
+                if let Ok(ns_win) = win.ns_window() {
+                    use objc2::msg_send;
+                    let obj = unsafe { &*(ns_win as *mut objc2::runtime::AnyObject) };
+                    unsafe {
+                        let _: () = msg_send![obj, setIgnoresMouseEvents: ignore];
+                    }
+                }
+            }
+        });
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = (app, ignore);
+    }
+}
+
 /// Enable/disable coding-mode lock passthrough. While active, the mini window
 /// ignores cursor events except over the top-center notch (mode switcher),
 /// so clicks on the mascot body reach apps underneath.
@@ -5831,6 +5871,8 @@ fn pet_passthrough_poll(app: tauri::AppHandle, mascot_scale: f64, large_mascot_s
 async fn set_mascot_lock_passthrough(app: tauri::AppHandle, active: bool) -> Result<(), String> {
     CODING_LOCK_PASSTHROUGH_ACTIVE.store(active, Ordering::SeqCst);
     CODING_MASCOT_LOCKED.store(active, Ordering::SeqCst);
+    // All satellite pets follow the same lock mode immediately.
+    set_satellite_mascots_ignore_cursor(&app, active);
     if active {
         // Don't fight pet-mode passthrough.
         if PET_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst) {
@@ -5873,11 +5915,17 @@ fn coding_lock_passthrough_poll(app: tauri::AppHandle) {
 
     CODING_LOCK_PASSTHROUGH_THREAD_ALIVE.store(true, Ordering::SeqCst);
     let mut last_state: Option<bool> = None;
+    let mut satellite_tick: u32 = 0;
 
     while CODING_LOCK_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst) {
         if PET_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(50));
             continue;
+        }
+        satellite_tick = satellite_tick.wrapping_add(1);
+        // ~1s: keep newly spawned extra/demo pets locked.
+        if satellite_tick % 50 == 0 {
+            set_satellite_mascots_ignore_cursor(&app, true);
         }
         let should_be_interactive = {
             let cursor = unsafe {
@@ -5924,6 +5972,7 @@ fn coding_lock_passthrough_poll(app: tauri::AppHandle) {
         if let Some(win) = app.get_webview_window("mini") {
             let _ = win.set_ignore_cursor_events(false);
         }
+        set_satellite_mascots_ignore_cursor(&app, false);
     }
     CODING_LOCK_PASSTHROUGH_THREAD_ALIVE.store(false, Ordering::SeqCst);
 }
@@ -5933,11 +5982,16 @@ fn coding_lock_passthrough_poll(app: tauri::AppHandle) {
     use std::time::Duration;
     CODING_LOCK_PASSTHROUGH_THREAD_ALIVE.store(true, Ordering::SeqCst);
     let mut was_interactive = true;
+    let mut satellite_tick: u32 = 0;
 
     while CODING_LOCK_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst) {
         if PET_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(50));
             continue;
+        }
+        satellite_tick = satellite_tick.wrapping_add(1);
+        if satellite_tick % 50 == 0 {
+            set_satellite_mascots_ignore_cursor(&app, true);
         }
         let frame = MINI_WINDOW_FRAME.lock().ok().and_then(|g| *g);
         let should_be_interactive = if let Some((fx, fy, fw, fh)) = frame {
@@ -5988,6 +6042,7 @@ fn coding_lock_passthrough_poll(app: tauri::AppHandle) {
                 }
             }
         });
+        set_satellite_mascots_ignore_cursor(&app, false);
     }
     CODING_LOCK_PASSTHROUGH_THREAD_ALIVE.store(false, Ordering::SeqCst);
 }
@@ -9687,6 +9742,27 @@ fn spawn_mascot_window(app: tauri::AppHandle, label: String, url: String, n: u64
     }
     let _ = over_fullscreen;
     let _ = win.show();
+    // Newly spawned pets must inherit the global lock immediately.
+    if CODING_MASCOT_LOCKED.load(Ordering::SeqCst) {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = win.set_ignore_cursor_events(true);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let win_clone = win.clone();
+            let _ = app.run_on_main_thread(move || {
+                let _ = win_clone.set_ignore_cursor_events(true);
+                if let Ok(ns_win) = win_clone.ns_window() {
+                    use objc2::msg_send;
+                    let obj = unsafe { &*(ns_win as *mut objc2::runtime::AnyObject) };
+                    unsafe {
+                        let _: () = msg_send![obj, setIgnoresMouseEvents: true];
+                    }
+                }
+            });
+        }
+    }
     Ok(label)
 }
 
