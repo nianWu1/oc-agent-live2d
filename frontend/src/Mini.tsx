@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { load } from '@tauri-apps/plugin-store'
 import { emit, listen } from '@tauri-apps/api/event'
-import { ChevronDown, Loader2, X, Pin, Bell, BellOff, Settings, Asterisk, Trash2, Cloud, Maximize2 } from 'lucide-react'
+import { ChevronDown, Loader2, X, Pin, Bell, BellOff, Settings, Asterisk, Trash2, Cloud, Maximize2, Lock, Move } from 'lucide-react'
 import { AnimatePresence, motion } from 'motion/react'
 import ReactMarkdown from 'react-markdown'
 import { useTranslation } from 'react-i18next'
@@ -746,6 +746,9 @@ export default function Mini() {
   const [moveMode, _setMoveMode] = useState(false)
   const moveModeRef = useRef(false)
   const moveModeActivatedAtRef = useRef(0)
+  /** Coding collapsed: lock = click-through + no drag; drag = repositionable. */
+  const [mascotMode, setMascotMode] = useState<'lock' | 'drag'>('drag')
+  const mascotModeRef = useRef<'lock' | 'drag'>('drag')
   const mascotDragActiveRef = useRef(false)
   // Mirror of mascotDragActiveRef for React-driven UI (e.g. suppressing the
   // sprite's hover-jump while dragging so walkDir ? run-left/run-right
@@ -772,6 +775,18 @@ export default function Mini() {
     if (v) moveModeActivatedAtRef.current = Date.now()
     _setMoveMode(v)
   }
+
+  const applyMascotMode = useCallback(async (mode: 'lock' | 'drag') => {
+    mascotModeRef.current = mode
+    setMascotMode(mode)
+    try {
+      const store = await load('settings.json', { defaults: {}, autoSave: true })
+      await store.set('mascot_interaction_mode', mode)
+      await store.save()
+    } catch {
+      /* ignore */
+    }
+  }, [])
 
   const { t, i18n } = useTranslation()
   const [updateModalOpen, setUpdateModalOpen] = useState(false)
@@ -2136,6 +2151,11 @@ export default function Mini() {
         setAutoExpandOnTask(aet)
         autoExpandOnTaskRef.current = aet
       }
+      const mim = await store.get('mascot_interaction_mode')
+      if (mim === 'lock' || mim === 'drag') {
+        mascotModeRef.current = mim
+        setMascotMode(mim)
+      }
       const lm = await store.get('large_mascot')
       if (typeof lm === 'boolean' && appModeRef.current !== 'pet') {
         setLargeMascot(lm)
@@ -3116,6 +3136,12 @@ export default function Mini() {
       // sprite via updateWalkDir so the pet visibly runs while moving.
       if (!moveModeRef.current && appModeRef.current !== 'pet') {
         if (e.button !== 0 || e.ctrlKey || collapsingRef.current) return
+        // Lock mode: body clicks pass through natively; if we still get an
+        // event (race), ignore drag/expand so apps underneath stay usable.
+        if (mascotModeRef.current === 'lock') {
+          e.preventDefault()
+          return
+        }
         // On macOS the cursor poll in lib.rs (efficiency_hover_poll) drives
         // the drag itself via translate_mini_frame + mini-mascot-walk events.
         // Letting the webview path also call move_mini_by would double the
@@ -3602,7 +3628,14 @@ export default function Mini() {
   useEffect(() => {
     if (appMode === 'pet') {
       invoke('set_efficiency_hover_tracking', { active: false }).catch(() => {})
-    } else if (viewMode === 'efficiency' && !moveMode && !updateModalOpen && !settingsMode && !settingsTransitioning) {
+    } else if (
+      viewMode === 'efficiency' &&
+      !moveMode &&
+      mascotMode !== 'lock' &&
+      !updateModalOpen &&
+      !settingsMode &&
+      !settingsTransitioning
+    ) {
       invoke('set_efficiency_hover_tracking', { active: true }).catch(() => {})
     } else {
       invoke('set_efficiency_hover_tracking', { active: false }).catch(() => {})
@@ -3610,7 +3643,23 @@ export default function Mini() {
     return () => {
       invoke('set_efficiency_hover_tracking', { active: false }).catch(() => {})
     }
-  }, [viewMode, moveMode, updateModalOpen, settingsMode, settingsTransitioning, appMode])
+  }, [viewMode, moveMode, mascotMode, updateModalOpen, settingsMode, settingsTransitioning, appMode])
+
+  // Coding lock: pass clicks through the mascot body; keep only the top
+  // notch interactive so the user can switch back to drag / expand.
+  useEffect(() => {
+    const wantLock =
+      appMode !== 'pet' &&
+      !expanded &&
+      !settingsMode &&
+      !settingsTransitioning &&
+      !updateModalOpen &&
+      mascotMode === 'lock'
+    invoke('set_mascot_lock_passthrough', { active: wantLock }).catch(() => {})
+    return () => {
+      invoke('set_mascot_lock_passthrough', { active: false }).catch(() => {})
+    }
+  }, [appMode, expanded, settingsMode, settingsTransitioning, updateModalOpen, mascotMode])
 
   // Bridge the Rust cursor poll's `mini-mascot-hover` event to local state
   // so the codex sprite can play its jump animation on hover even before
@@ -3667,6 +3716,7 @@ export default function Mini() {
   useEffect(() => {
     if (viewMode !== 'efficiency' || appMode === 'pet') return
     const unlisten = listen<boolean>('efficiency-hover', (event) => {
+      if (mascotModeRef.current === 'lock') return
       if (settingsModeRef.current || settingsTransitioningRef.current) {
         return
       }
@@ -3973,7 +4023,7 @@ export default function Mini() {
   }, [expanded, pinned, settingsMode, updateModalOpen, collapse, exitSettings, debugToTerminal, isSettingsPickerBlockingClose])
 
   useEffect(() => {
-    if (expanded || moveMode || updateModalOpen) return
+    if (expanded || moveMode || updateModalOpen || mascotMode === 'lock') return
     // Auto-expand on window focus is Windows-only. macOS opens the panel
     // through the notch-hover poll, and clicking the mascot will focus the
     // mini window ? auto-expanding here would re-introduce the popup that
@@ -3981,6 +4031,7 @@ export default function Mini() {
     if (!isWindowsPlatform) return
     const onFocus = () => {
       if (appModeRef.current === 'pet') return // no auto-expand in pet mode
+      if (mascotModeRef.current === 'lock') return
       if (collapsingRef.current || moveModeRef.current || mascotDragActiveRef.current) return
       // Large mascot uses long-press to expand; auto-expand on focus
       // would race with the pointerdown handler and steal the click.
@@ -4015,7 +4066,7 @@ export default function Mini() {
       window.removeEventListener('focus', onFocus)
       cancelFocusExpand()
     }
-  }, [expanded, expand, moveMode, updateModalOpen, cancelFocusExpand])
+  }, [expanded, expand, moveMode, mascotMode, updateModalOpen, cancelFocusExpand])
 
   // Exit move mode when clicking outside mascot or when window loses focus.
   // Use a debounced blur so that programmatic window moves (which briefly
@@ -4463,6 +4514,112 @@ export default function Mini() {
             cursor: 'default',
           }}
         >
+          {appMode !== 'pet' && (
+            <div
+              data-no-drag
+              data-mascot-mode-notch="1"
+              onPointerDown={(e) => {
+                e.stopPropagation()
+              }}
+              style={{
+                position: 'absolute',
+                top: 2,
+                left: '50%',
+                transform: 'translateX(-50%)',
+                zIndex: 60,
+                width: 152,
+                height: 30,
+                display: 'flex',
+                alignItems: 'center',
+                gap: 2,
+                padding: 2,
+                borderRadius: 999,
+                background: 'rgba(10,10,12,0.92)',
+                border: '1px solid rgba(255,255,255,0.14)',
+                boxShadow: '0 4px 14px rgba(0,0,0,0.35)',
+                pointerEvents: 'auto',
+              }}
+              title={t('mini.mascotModeHint')}
+            >
+              <button
+                type="button"
+                data-no-drag
+                onClick={(e) => {
+                  e.stopPropagation()
+                  void applyMascotMode('lock')
+                }}
+                style={{
+                  flex: 1,
+                  height: '100%',
+                  border: 'none',
+                  borderRadius: 999,
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: 4,
+                  fontSize: 10,
+                  fontWeight: 700,
+                  color: mascotMode === 'lock' ? '#111' : 'rgba(255,255,255,0.7)',
+                  background: mascotMode === 'lock' ? 'rgba(251,191,36,0.95)' : 'transparent',
+                }}
+              >
+                <Lock className="w-3 h-3" strokeWidth={2.5} />
+                {t('mini.mascotLock')}
+              </button>
+              <button
+                type="button"
+                data-no-drag
+                onClick={(e) => {
+                  e.stopPropagation()
+                  void applyMascotMode('drag')
+                }}
+                style={{
+                  flex: 1,
+                  height: '100%',
+                  border: 'none',
+                  borderRadius: 999,
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: 4,
+                  fontSize: 10,
+                  fontWeight: 700,
+                  color: mascotMode === 'drag' ? '#111' : 'rgba(255,255,255,0.7)',
+                  background: mascotMode === 'drag' ? 'rgba(52,211,153,0.95)' : 'transparent',
+                }}
+              >
+                <Move className="w-3 h-3" strokeWidth={2.5} />
+                {t('mini.mascotDrag')}
+              </button>
+              <button
+                type="button"
+                data-no-drag
+                onClick={(e) => {
+                  e.stopPropagation()
+                  hoverExpandedRef.current = false
+                  setCompletionSessionId(null)
+                  expand()
+                }}
+                title={t('mini.expand')}
+                style={{
+                  width: 26,
+                  height: '100%',
+                  border: 'none',
+                  borderRadius: 999,
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  color: 'rgba(255,255,255,0.75)',
+                  background: 'rgba(255,255,255,0.06)',
+                }}
+              >
+                <ChevronDown className="w-3.5 h-3.5" strokeWidth={2.5} />
+              </button>
+            </div>
+          )}
           <div
             onPointerDown={handleMascotPointerDown}
             onContextMenu={handleMascotContextMenu}

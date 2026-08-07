@@ -394,7 +394,10 @@ async function runMotionLoop(
   const hasAnyMotion = Object.values(pet.availableMotions ?? {}).some(
     (files) => Array.isArray(files) && files.length > 0,
   )
-  const groupFiles = binding.group
+  // Mao uses Cubism group "" (empty string) for action motions — do NOT
+  // treat "" as missing.
+  const hasGroupKey = typeof binding.group === 'string'
+  const groupFiles = hasGroupKey
     ? pet.availableMotions?.[binding.group]
     : undefined
   const groupHasMotion =
@@ -404,14 +407,17 @@ async function runMotionLoop(
   const playMotion = (() => {
     if (motionGroupsKnown) {
       if (!hasAnyMotion) return false
-      if (!binding.group) return false
-      if (pet.availableMotions && Object.prototype.hasOwnProperty.call(pet.availableMotions, binding.group)) {
+      if (!hasGroupKey) return false
+      if (
+        pet.availableMotions &&
+        Object.prototype.hasOwnProperty.call(pet.availableMotions, binding.group)
+      ) {
         return groupHasMotion
       }
       // Group not listed in availableMotions — still attempt play.
       return true
     }
-    return !!binding.group
+    return hasGroupKey
   })()
 
   if (!playMotion) {
