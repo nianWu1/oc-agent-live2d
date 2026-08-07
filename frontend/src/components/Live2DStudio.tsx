@@ -71,6 +71,9 @@ export function Live2DStudio() {
   const [saving, setSaving] = useState(false)
   const [savedFlash, setSavedFlash] = useState(false)
   const [tab, setTab] = useState<'preview' | 'map'>('preview')
+  // Opt-in: mounting Pixi in the shared mini webview is expensive and used
+  // to freeze the whole UI on unmount. Keep canvas off until the user asks.
+  const [previewOn, setPreviewOn] = useState(false)
 
   useEffect(() => {
     void (async () => {
@@ -90,7 +93,6 @@ export function Live2DStudio() {
     setForceBinding(null)
     setDraftMap(effectiveLive2DMotionMap(pet))
     void discoverFromModel(pet.modelUrl).then((d) => {
-      // Prefer pet.json declarations when present (stable labels).
       const fromPet: Record<string, number> = {}
       for (const [g, files] of Object.entries(pet.availableMotions ?? {})) {
         fromPet[g] = files.length
@@ -105,9 +107,18 @@ export function Live2DStudio() {
     })
   }, [pet])
 
+  // Tear down WebGL when leaving the studio host (settings tab switch / close).
+  useEffect(() => {
+    return () => {
+      setPreviewOn(false)
+      setForceBinding(null)
+    }
+  }, [])
+
   const motionGroups = useMemo(() => Object.keys(discovered.motions), [discovered.motions])
 
   const play = useCallback((binding: Live2DMotionBinding) => {
+    setPreviewOn(true)
     setForceBinding({ ...binding, loop: binding.loop ?? false })
   }, [])
 
@@ -162,6 +173,24 @@ export function Live2DStudio() {
             </option>
           ))}
         </select>
+        <button
+          type="button"
+          onClick={() => {
+            if (previewOn) {
+              setPreviewOn(false)
+              setForceBinding(null)
+            } else {
+              setPreviewOn(true)
+            }
+          }}
+          className={`px-3 py-1.5 rounded-lg text-xs font-medium border ${
+            previewOn
+              ? 'bg-rose-500/20 border-rose-400/40 text-rose-100'
+              : 'bg-sky-500/80 border-sky-400/50 text-white'
+          }`}
+        >
+          {previewOn ? '关闭预览' : '启动预览'}
+        </button>
         <div className="flex rounded-lg overflow-hidden border border-white/10">
           <button
             type="button"
@@ -185,13 +214,19 @@ export function Live2DStudio() {
           className="shrink-0 rounded-xl bg-gradient-to-b from-sky-950/40 to-black/60 border border-white/10 flex items-end justify-center overflow-hidden"
           style={{ width: 220, height: 260 }}
         >
-          {pet && (
+          {pet && previewOn ? (
             <Live2DPet
               pet={pet}
               state="idle"
               size={200}
               forceBinding={forceBinding}
             />
+          ) : (
+            <div className="text-[11px] text-white/35 px-4 text-center self-center">
+              点击「启动预览」后加载模型
+              <br />
+              （避免占用桌宠同一窗口的 GPU）
+            </div>
           )}
         </div>
 

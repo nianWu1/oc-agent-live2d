@@ -1033,7 +1033,7 @@ export function SettingsTab({ notifySound, onChangeNotifySound, waitingSound, on
         <h2 className="text-lg font-medium text-white">Live2D 预览</h2>
         <div className="bg-[#0f0f0f] border border-white/5 rounded-2xl overflow-hidden p-4">
           <p className="text-xs text-white/40 mb-4">
-            试播模型自带动作，再把 oc-claw 的 idle / working / waiting 等状态映射过去。映射保存在本地，不改仓库文件。
+            先点「启动预览」再试播动作；映射保存到本地。离开设置前请先「关闭预览」，避免占用桌宠窗口的 GPU。
           </p>
           <Live2DStudio />
         </div>

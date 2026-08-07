@@ -191,13 +191,16 @@ export function Live2DPet({
       cancelled = true
       loopTokenRef.current += 1
       try {
-        modelRef.current?.destroy?.()
+        modelRef.current?.destroy?.(true)
       } catch {
         /* ignore */
       }
       modelRef.current = null
       try {
-        app?.destroy(true, { children: true, texture: true, baseTexture: true })
+        // Never pass texture/baseTexture:true — this webview is shared with the
+        // main mini UI. Aggressively freeing GL resources after settings
+        // preview unmount left the mascot/notch UI frozen until process kill.
+        app?.destroy(true, { children: true })
       } catch {
         /* ignore */
       }
