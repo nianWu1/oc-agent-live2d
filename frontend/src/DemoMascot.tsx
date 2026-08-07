@@ -255,6 +255,8 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
 
   // Match primary Mini drag: absolute origin via native get/set_webview_origin
   // with confine=false so extra mascots can cross monitors / macOS Spaces.
+  // macOS NSWindow Y grows upward while screenY grows downward — invert dy
+  // there. (Primary mini avoids this by dragging in Rust translate_mini_frame.)
   const handlePointerDown = useCallback((e: React.PointerEvent) => {
     if (e.button !== 0 || e.ctrlKey) return
     e.preventDefault()
@@ -274,13 +276,20 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
     let latestDyTotal = 0
     let positionInFlight = false
     let positionDirty = false
+    // Windows: top-left logical coords → add screen dy.
+    // macOS: NSWindow bottom-left → subtract screen dy.
+    const ySign = isWindowsPlatform ? 1 : -1
+
+    const applyTargets = () => {
+      targetX = originX + latestDxTotal
+      targetY = originY + ySign * latestDyTotal
+    }
 
     invoke<[number, number]>('get_webview_origin')
       .then(([x, y]) => {
         originX = x
         originY = y
-        targetX = originX + latestDxTotal
-        targetY = originY + latestDyTotal
+        applyTargets()
         originReady = true
         if (dragging) schedulePosition()
       })
@@ -329,8 +338,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
       latestDxTotal = dxTotal
       latestDyTotal = dyTotal
       if (originReady) {
-        targetX = originX + latestDxTotal
-        targetY = originY + latestDyTotal
+        applyTargets()
         schedulePosition()
       }
       const dx = ev.screenX - lastX
