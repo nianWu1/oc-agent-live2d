@@ -169,12 +169,11 @@ export async function saveMiniPetId(id: string): Promise<void> {
 
 // ─── Coding-mode extra mascots (multi-mascot feature) ───
 //
-// Each extra mascot can either mirror the primary mini's local agent state
-// (statusUrl empty) OR, when statusUrl is set and reachable, poll that bridge
-// (e.g. http://127.0.0.1:9999/status). Primary never polls tunnel URLs.
+// statusUrl empty → local only (mirror primary mini-pet-state).
+// statusUrl set   → poll that GET /status (e.g. tunnel :9999) when reachable.
 export interface ExtraMascotConfig {
   petId: string
-  /** Empty = mirror primary. Non-empty = poll only while URL is reachable. */
+  /** Empty = local/mirror primary. Non-empty = sync from this /status URL. */
   statusUrl?: string
   /** Optional label shown in the picker (e.g. "Windows"). */
   label?: string

@@ -240,72 +240,52 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
     window.addEventListener('pointercancel', onCancel, { once: true })
   }, [size])
 
-  // Multi pet: poll statusUrl only when filled AND reachable (e.g. tunnel
-  // :9999). If URL missing/down, mirror primary via mini-pet-state — never
-  // keep hammering a dead tunnel.
+  // Configured statusUrl → poll that bridge (e.g. tunnel :9999).
+  // Empty statusUrl → local only: mirror primary via mini-pet-state.
   useEffect(() => {
     let cancelled = false
-    let inFlight = false
-    let urlReachable = false
-    let pollTimer: number | null = null
-    let probeTimer: number | null = null
-    let unlistenFn: (() => void) | null = null
 
-    const applyMirrorPayload = (payload: {
-      state?: string
-      label?: string
-      tone?: string
-      title?: string | null
-    }) => {
-      const s = (payload?.state || '').toLowerCase()
-      let nextWaiting = false
-      let nextWorking = false
-      if (s === 'waiting') {
-        nextWaiting = true
-      } else if (s === 'working' || s === 'compacting') {
-        nextWorking = true
-      }
-      setWaiting(nextWaiting)
-      setWorking(nextWorking)
-
-      // Always refresh bubble from this event so a stale "空闲中" label cannot
-      // stick after state flips to working (label may be briefly missing).
-      const label = typeof payload?.label === 'string' ? payload.label.trim() : ''
-      const toneFromPayload = isPetStatusTone(payload?.tone) ? payload.tone : null
-      const tone: PetStatusTone = toneFromPayload
-        ?? (nextWaiting ? 'waiting' : nextWorking ? 'working' : 'idle')
-      setRemoteBubble({
-        label: label || (nextWaiting ? 'waiting' : nextWorking ? 'working' : 'idle'),
-        tone,
-        title: typeof payload?.title === 'string' ? payload.title : undefined,
-      })
-    }
-
-    const startMirror = () => {
-      if (unlistenFn) return
-      void listen<{
+    if (!statusUrlFromUrl) {
+      const unlisten = listen<{
         state?: string
         label?: string
         tone?: string
         title?: string | null
       }>('mini-pet-state', (ev) => {
-        if (cancelled || urlReachable) return
-        applyMirrorPayload(ev.payload || {})
-      }).then((fn) => {
-        if (cancelled) {
-          fn()
-          return
+        if (cancelled) return
+        const payload = ev.payload || {}
+        const s = (payload.state || '').toLowerCase()
+        let nextWaiting = false
+        let nextWorking = false
+        if (s === 'waiting') {
+          nextWaiting = true
+        } else if (s === 'working' || s === 'compacting') {
+          nextWorking = true
         }
-        unlistenFn = fn
-      })
-    }
+        setWaiting(nextWaiting)
+        setWorking(nextWorking)
 
-    const stopMirror = () => {
-      if (unlistenFn) {
-        unlistenFn()
-        unlistenFn = null
+        const label = typeof payload.label === 'string' ? payload.label.trim() : ''
+        const toneFromPayload = isPetStatusTone(payload.tone) ? payload.tone : null
+        const tone: PetStatusTone = toneFromPayload
+          ?? (nextWaiting ? 'waiting' : nextWorking ? 'working' : 'idle')
+        setRemoteBubble({
+          label: label || (nextWaiting ? 'waiting' : nextWorking ? 'working' : 'idle'),
+          tone,
+          title: typeof payload.title === 'string' ? payload.title : undefined,
+        })
+        if (typeof payload.title === 'string') setStatusDetail(payload.title)
+      })
+      return () => {
+        cancelled = true
+        unlisten.then((fn) => fn())
       }
     }
+
+    let inFlight = false
+    let urlReachable = false
+    let pollTimer: number | null = null
+    let probeTimer: number | null = null
 
     const applyRemoteState = (state: string, detail?: string, kind?: string) => {
       const s = (state || '').toLowerCase()
@@ -326,12 +306,23 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
         setWaiting(false)
         setWorking(true)
       } else {
-        // completed / idle / error / unknown → idle animation
         setWaiting(false)
         setWorking(false)
       }
       if (typeof detail === 'string') setStatusDetail(detail)
       if (typeof kind === 'string') setStatusKind(kind)
+      const tone: PetStatusTone =
+        s === 'waiting' || s === 'awaiting' || k.startsWith('confirm')
+          ? 'waiting'
+          : (s === 'working' || s === 'compacting' || s === 'running' || s === 'busy' || s === 'active'
+            || k === 'working' || k === 'tool' || k === 'thinking')
+            ? 'working'
+            : 'idle'
+      setRemoteBubble({
+        label: detail || (tone === 'waiting' ? 'waiting' : tone === 'working' ? 'working' : 'idle'),
+        tone,
+        title: detail || undefined,
+      })
     }
 
     const clearPoll = () => {
@@ -341,21 +332,17 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
       }
     }
 
-    const clearProbe = () => {
-      if (probeTimer != null) {
-        window.clearInterval(probeTimer)
-        probeTimer = null
-      }
-    }
-
     const markUnreachable = () => {
       urlReachable = false
       clearPoll()
-      startMirror()
+      // URL configured but down: stay idle rather than silently mirroring
+      // local primary (would hide that the remote bridge is offline).
+      setWaiting(false)
+      setWorking(false)
     }
 
     const pollRemote = async () => {
-      if (cancelled || inFlight || !statusUrlFromUrl || !urlReachable) return
+      if (cancelled || inFlight || !urlReachable) return
       inFlight = true
       try {
         const { invoke } = await import('@tauri-apps/api/core')
@@ -370,7 +357,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
         applyRemoteState(data.state || data.status || 'idle', data.detail, data.kind)
       } catch (e) {
         if (!cancelled) {
-          console.warn('[extra-mascot] status poll failed, fall back to primary:', e)
+          console.warn('[extra-mascot] status poll failed:', e)
           markUnreachable()
         }
       } finally {
@@ -380,14 +367,13 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
 
     const startPoll = () => {
       clearPoll()
-      stopMirror()
       urlReachable = true
       void pollRemote()
       pollTimer = window.setInterval(pollRemote, 5000)
     }
 
     const probeRemote = async () => {
-      if (cancelled || !statusUrlFromUrl || inFlight) return
+      if (cancelled || inFlight) return
       if (urlReachable) return
       inFlight = true
       try {
@@ -409,20 +395,13 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
       }
     }
 
-    if (statusUrlFromUrl) {
-      startMirror()
-      void probeRemote()
-      // Soft re-probe while down — do not 5s-spam a dead UU map.
-      probeTimer = window.setInterval(probeRemote, 30000)
-    } else {
-      startMirror()
-    }
+    void probeRemote()
+    probeTimer = window.setInterval(probeRemote, 30000)
 
     return () => {
       cancelled = true
       clearPoll()
-      clearProbe()
-      stopMirror()
+      if (probeTimer != null) window.clearInterval(probeTimer)
     }
   }, [statusUrlFromUrl])
 

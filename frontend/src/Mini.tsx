@@ -2008,59 +2008,12 @@ export default function Mini() {
     }
   }, [fetchAgents, pollHealth, appMode])
 
-  // Primary mascot: local Cursor notify-bridge only (same machine as Cursor).
-  // Remote / tunnel URLs (e.g. Mac :9999 → Windows :18765) belong on Multi
-  // pets that explicitly set statusUrl — never on the primary.
+  // Primary status comes from oc-claw Cursor hooks → get_claude_sessions
+  // (see poll below), not from cursor-notify-bridge. Bridge polls caused
+  // false idle when stop hooks raced; extras mirror mini-pet-state instead.
   useEffect(() => {
-    if (appMode !== 'coding' || !enableCursor || !isWindowsPlatform) {
-      setBridgePetState('idle')
-      return
-    }
-    const LOCAL_STATUS_URL = 'http://127.0.0.1:18765/status'
-    let cancelled = false
-    let inFlight = false
-    const pollBridge = async () => {
-      if (cancelled || inFlight) return
-      inFlight = true
-      try {
-        const text = (await invoke('proxy_get', { url: LOCAL_STATUS_URL })) as string
-        if (cancelled) return
-        const data = JSON.parse(text) as {
-          state?: string
-          status?: string
-          kind?: string
-        }
-        const s = (data.state || data.status || '').toLowerCase()
-        const k = (data.kind || '').toLowerCase()
-        if (s === 'waiting' || s === 'awaiting' || k.startsWith('confirm')) {
-          setBridgePetState('waiting')
-        } else if (
-          s === 'working' ||
-          s === 'compacting' ||
-          s === 'running' ||
-          s === 'busy' ||
-          s === 'active' ||
-          k === 'working' ||
-          k === 'tool' ||
-          k === 'thinking'
-        ) {
-          setBridgePetState('working')
-        } else {
-          setBridgePetState('idle')
-        }
-      } catch {
-        if (!cancelled) setBridgePetState('idle')
-      } finally {
-        inFlight = false
-      }
-    }
-    void pollBridge()
-    const id = window.setInterval(pollBridge, 5000)
-    return () => {
-      cancelled = true
-      window.clearInterval(id)
-    }
-  }, [appMode, enableCursor, isWindowsPlatform])
+    setBridgePetState('idle')
+  }, [appMode, enableCursor])
 
   // Update allSessions active states from pollHealth session data
   const syncSessionActiveStates = useCallback(() => {

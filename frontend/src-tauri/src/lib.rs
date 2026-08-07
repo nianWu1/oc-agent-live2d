@@ -17497,6 +17497,7 @@ else:
         // to inject `source` here — and trying to inject via PowerShell string
         // concatenation has bitten us with off-by-one errors in the past.
         let hook_script = r#"$ErrorActionPreference = 'SilentlyContinue'
+# Unified Cursor hook (primary oc-claw :19284 + notify-bridge :18765).
 try {
     $stdin = [System.Console]::OpenStandardInput()
     $ms = New-Object System.IO.MemoryStream
@@ -17521,8 +17522,16 @@ try {
     # Decode for hook-event sniffing only; the wire payload stays raw bytes.
     $raw = [System.Text.Encoding]::UTF8.GetString($bytes, $offset, $count)
     $hookName = ''
-    try { $hookName = ($raw | ConvertFrom-Json).hook_event_name } catch {}
+    $payload = $null
+    try {
+        $payload = $raw | ConvertFrom-Json
+        $hookName = [string]$payload.hook_event_name
+    } catch {}
 
+    # Forward the raw JSON unchanged. The cursor socket server passes
+    # source_override="cursor" to process_claude_event, so we don't need
+    # to inject `source` here — and trying to inject via PowerShell string
+    # concatenation has bitten us with off-by-one errors in the past.
     try {
         $client = [System.Net.Sockets.TcpClient]::new('127.0.0.1', 19284)
         $stream = $client.GetStream()
@@ -17530,6 +17539,59 @@ try {
         $stream.Flush()
         $client.Client.Shutdown([System.Net.Sockets.SocketShutdown]::Send)
         $client.Close()
+    } catch {}
+
+    # Best-effort notify-bridge for Multi pets that poll /status (e.g. :9999).
+    try {
+        $notifyUrl = if ($env:CURSOR_NOTIFY_URL) { $env:CURSOR_NOTIFY_URL } else { 'http://127.0.0.1:18765/notify' }
+        $token = if ($env:CURSOR_NOTIFY_TOKEN) { $env:CURSOR_NOTIFY_TOKEN } else { 'G2CfgFeRwiAPDLKOQ6WnNhUbIcjs4z3x' }
+        $status = 'working'
+        $kind = 'working'
+        $bodyText = 'task running'
+        if ($hookName -eq 'stop') {
+            $status = 'completed'
+            $kind = 'completed'
+            if ($payload -and $payload.status) { $status = [string]$payload.status }
+            $completed = [string](-join [char[]](0x4EFB, 0x52A1, 0x5DF2, 0x5B8C, 0x6210))
+            $aborted = [string](-join [char[]](0x4EFB, 0x52A1, 0x5DF2, 0x4E2D, 0x6B62))
+            $errorText = [string](-join [char[]](0x4EFB, 0x52A1, 0x51FA, 0x9519))
+            $map = @{ completed = $completed; aborted = $aborted; error = $errorText }
+            $bodyText = if ($map.ContainsKey($status)) { $map[$status] } else { "Agent stop: $status" }
+        } elseif ($hookName -eq 'afterAgentThought') {
+            $bodyText = 'thinking'
+            $kind = 'thinking'
+        } elseif ($hookName -eq 'beforeShellExecution' -or $hookName -eq 'afterShellExecution') {
+            $bodyText = 'shell'
+            $kind = 'tool'
+        } elseif ($hookName -eq 'beforeMCPExecution' -or $hookName -eq 'afterMCPExecution') {
+            $bodyText = 'mcp'
+            $kind = 'tool'
+        }
+        $generationId = ''
+        $conversationId = ''
+        if ($payload) {
+            if ($payload.generation_id) { $generationId = [string]$payload.generation_id }
+            if ($payload.conversation_id) { $conversationId = [string]$payload.conversation_id }
+            elseif ($payload.session_id) { $conversationId = [string]$payload.session_id }
+        }
+        $json = (@{
+            title = 'Cursor'; body = $bodyText; status = $status; kind = $kind
+            generationId = $generationId; conversationId = $conversationId
+            epochMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        } | ConvertTo-Json -Compress)
+        $jsonBytes = [Text.Encoding]::UTF8.GetBytes($json)
+        $req = [System.Net.HttpWebRequest]::Create($notifyUrl)
+        $req.Method = 'POST'
+        $req.ContentType = 'application/json; charset=utf-8'
+        $req.Timeout = 1500
+        $req.ReadWriteTimeout = 1500
+        $req.Headers.Add('Authorization', "Bearer $token")
+        $req.ContentLength = $jsonBytes.Length
+        $reqStream = $req.GetRequestStream()
+        $reqStream.Write($jsonBytes, 0, $jsonBytes.Length)
+        $reqStream.Close()
+        $resp = $req.GetResponse()
+        $resp.Close()
     } catch {}
 
     # Cursor's required stdout response per hook event type.
