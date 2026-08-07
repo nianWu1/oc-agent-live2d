@@ -396,6 +396,31 @@ export function PetPicker({
                     pet={pet}
                     selected={pet.id === selectedId}
                     onSelect={() => onSelect(pet)}
+                    onDelete={
+                      isLive2DPet(pet)
+                        ? async () => {
+                            if (!window.confirm(`删除导入的 Live2D 模型「${pet.displayName}」？`)) {
+                              return
+                            }
+                            try {
+                              await invoke('delete_live2d_pet', { id: pet.id })
+                              const { clearLive2DMotionOverride } = await import(
+                                '../lib/live2dMotionOverrides'
+                              )
+                              await clearLive2DMotionOverride(pet.id).catch(() => {})
+                              await loadAll()
+                            } catch (e: unknown) {
+                              const msg =
+                                typeof e === 'string'
+                                  ? e
+                                  : e instanceof Error
+                                    ? e.message
+                                    : 'delete failed'
+                              setImportError(msg)
+                            }
+                          }
+                        : undefined
+                    }
                   />
                 ))}
               </>
@@ -691,9 +716,10 @@ interface PetRowProps {
   pet: CodexPet
   selected: boolean
   onSelect: () => void
+  onDelete?: () => void | Promise<void>
 }
 
-function PetRow({ pet, selected, onSelect }: PetRowProps) {
+function PetRow({ pet, selected, onSelect, onDelete }: PetRowProps) {
   const { t } = useTranslation()
   // Look up a localised description; fall back to whatever pet.json
   // shipped (typically English) when no translation key exists.
@@ -719,6 +745,20 @@ function PetRow({ pet, selected, onSelect }: PetRowProps) {
           <div className="text-[11px] text-white/40 truncate">{description}</div>
         )}
       </div>
+      {onDelete && (
+        <button
+          data-no-drag
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation()
+            void onDelete()
+          }}
+          className="shrink-0 px-2.5 py-1.5 rounded-md text-xs font-medium bg-rose-500/10 hover:bg-rose-500/20 text-rose-300/90 transition-colors"
+          title="删除导入的模型"
+        >
+          删除
+        </button>
+      )}
       <button
         data-no-drag
         onClick={onSelect}

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { emit } from '@tauri-apps/api/event'
+import { invoke } from '@tauri-apps/api/core'
 import { Check, RotateCcw } from 'lucide-react'
 import { Live2DPet } from './Live2DPet'
 import {
@@ -65,6 +66,7 @@ function groupLabel(group: string): string {
  */
 export function Live2DStudio() {
   const [pets, setPets] = useState<CodexPet[]>([])
+  const [customIds, setCustomIds] = useState<Set<string>>(new Set())
   const [petId, setPetId] = useState('')
   const [discovered, setDiscovered] = useState<Discovered>({ motions: {}, expressions: [] })
   const [forceBinding, setForceBinding] = useState<Live2DMotionBinding | null>(null)
@@ -75,26 +77,64 @@ export function Live2DStudio() {
   // Opt-in: mounting Pixi in the shared mini webview is expensive and used
   // to freeze the whole UI on unmount. Keep canvas off until the user asks.
   const [previewOn, setPreviewOn] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [deleting, setDeleting] = useState(false)
 
-  useEffect(() => {
-    void (async () => {
-      await ensureLive2DMotionOverridesLoaded()
-      clearCodexPetCache()
-      const [builtins, customs] = await Promise.all([
-        loadCodexPets(),
-        loadCustomLive2DPets(),
-      ])
-      const builtinIds = new Set(builtins.map((p) => p.id))
-      const live = [
-        ...builtins.filter(isLive2DPet),
-        ...customs.filter((p) => isLive2DPet(p) && !builtinIds.has(p.id)),
-      ]
-      setPets(live)
-      if (live[0]) setPetId(live[0].id)
-    })()
+  const reloadPets = useCallback(async () => {
+    await ensureLive2DMotionOverridesLoaded()
+    clearCodexPetCache()
+    const [builtins, customs] = await Promise.all([
+      loadCodexPets(),
+      loadCustomLive2DPets(),
+    ])
+    const builtinIds = new Set(builtins.map((p) => p.id))
+    const customLive = customs.filter((p) => isLive2DPet(p) && !builtinIds.has(p.id))
+    const live = [...builtins.filter(isLive2DPet), ...customLive]
+    setCustomIds(new Set(customLive.map((p) => p.id)))
+    setPets(live)
+    setPetId((prev) => {
+      if (prev && live.some((p) => p.id === prev)) return prev
+      return live[0]?.id ?? ''
+    })
   }, [])
 
+  useEffect(() => {
+    void reloadPets()
+  }, [reloadPets])
+
   const pet = useMemo(() => pets.find((p) => p.id === petId) ?? null, [pets, petId])
+  const isCustomPet = !!pet && customIds.has(pet.id)
+  const motionCount = useMemo(() => {
+    if (!pet?.availableMotions) return 0
+    return Object.values(pet.availableMotions).reduce((n, files) => n + (files?.length ?? 0), 0)
+  }, [pet])
+
+  useEffect(() => {
+    setLoadError(null)
+    setPreviewOn(false)
+    setForceBinding(null)
+  }, [petId])
+
+  const handleDelete = useCallback(async () => {
+    if (!pet || !isCustomPet || deleting) return
+    if (!window.confirm(`删除导入的 Live2D 模型「${pet.displayName}」？删除后可重新导入。`)) {
+      return
+    }
+    setDeleting(true)
+    try {
+      setPreviewOn(false)
+      await invoke('delete_live2d_pet', { id: pet.id })
+      await clearLive2DMotionOverride(pet.id).catch(() => {})
+      emit('live2d-motion-map-changed', { petId: pet.id }).catch(() => {})
+      await reloadPets()
+    } catch (e: unknown) {
+      const msg =
+        typeof e === 'string' ? e : e instanceof Error ? e.message : 'delete failed'
+      setLoadError(msg)
+    } finally {
+      setDeleting(false)
+    }
+  }, [pet, isCustomPet, deleting, reloadPets])
 
   useEffect(() => {
     if (!pet?.modelUrl) return
@@ -199,6 +239,17 @@ export function Live2DStudio() {
         >
           {previewOn ? '关闭预览' : '启动预览'}
         </button>
+        {isCustomPet && (
+          <button
+            type="button"
+            disabled={deleting}
+            onClick={() => void handleDelete()}
+            className="px-3 py-1.5 rounded-lg text-xs font-medium border bg-rose-500/15 border-rose-400/30 text-rose-200 hover:bg-rose-500/25 disabled:opacity-50"
+            title="删除后可重新导入同名文件夹"
+          >
+            {deleting ? '删除中…' : '删除导入'}
+          </button>
+        )}
         <div className="flex rounded-lg overflow-hidden border border-white/10">
           <button
             type="button"
@@ -228,6 +279,8 @@ export function Live2DStudio() {
               state="idle"
               size={200}
               forceBinding={forceBinding}
+              onLoadError={(msg) => setLoadError(msg)}
+              onLoadOk={() => setLoadError(null)}
             />
           ) : (
             <div className="text-[11px] text-white/35 px-4 text-center self-center">
@@ -239,6 +292,20 @@ export function Live2DStudio() {
         </div>
 
         <div className="flex-1 min-w-0 flex flex-col gap-3">
+          {loadError && (
+            <div className="text-[11px] text-rose-300/90 bg-rose-500/10 border border-rose-500/20 rounded-lg px-3 py-2 break-all">
+              加载失败：{loadError}
+              <div className="text-white/40 mt-1">
+                可尝试重新导入该文件夹（会自动去掉文件名空格并修补 Motions）。
+              </div>
+            </div>
+          )}
+          {pet && motionCount === 0 && (
+            <div className="text-[11px] text-amber-200/80 bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2">
+              此模型没有 <code className="text-white/70">*.motion3.json</code>
+              （如 maho / MAY）。可以静态显示，但无法播放 idle/working 动作。
+            </div>
+          )}
           {tab === 'preview' && (
             <>
               <div className="text-[11px] text-white/40">

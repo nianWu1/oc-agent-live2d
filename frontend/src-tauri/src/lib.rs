@@ -9887,9 +9887,148 @@ fn live2d_asset_url(app: &tauri::AppHandle, abs: &std::path::Path) -> String {
         .components()
         .map(|c| utf8_percent_encode(&c.as_os_str().to_string_lossy(), LIVE2D_SEGMENT).to_string())
         .collect();
-    // Use the http://<scheme>.localhost form on every platform so Vite-dev
-    // (http://localhost:5222) can fetch model/textures with CORS.
-    format!("http://live2dpet.localhost/{}", parts.join("/"))
+    // Tauri custom schemes:
+    // - Windows/Android: http://<scheme>.localhost/...
+    // - macOS/Linux: <scheme>://localhost/...
+    let prefix = if cfg!(target_os = "windows") || cfg!(target_os = "android") {
+        "http://live2dpet.localhost"
+    } else {
+        "live2dpet://localhost"
+    };
+    format!("{}/{}", prefix, parts.join("/"))
+}
+
+/// Replace spaces / unsafe chars in a single path component.
+fn sanitize_live2d_filename(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_us = false;
+    for ch in name.chars() {
+        let ok = ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_';
+        if ok {
+            out.push(ch);
+            prev_us = false;
+        } else if !prev_us {
+            out.push('_');
+            prev_us = true;
+        }
+    }
+    let trimmed = out.trim_matches('_').to_string();
+    if trimmed.is_empty() {
+        "file".into()
+    } else {
+        trimmed
+    }
+}
+
+fn live2d_name_needs_sanitize(name: &str) -> bool {
+    sanitize_live2d_filename(name) != name
+}
+
+/// Rename files/dirs that contain spaces (e.g. `tako m.moc3`) and rewrite
+/// JSON path references so Cubism relative loads work via asset/custom URLs.
+fn normalize_live2d_pack_filenames(root: &std::path::Path) -> Result<usize, String> {
+    fn collect(dir: &std::path::Path, depth: u32, out: &mut Vec<(u32, PathBuf)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                collect(&p, depth + 1, out);
+            }
+            out.push((depth, p));
+        }
+    }
+
+    let mut entries: Vec<(u32, PathBuf)> = Vec::new();
+    collect(root, 0, &mut entries);
+    if !entries
+        .iter()
+        .any(|(_, p)| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(live2d_name_needs_sanitize)
+                .unwrap_or(false)
+        })
+    {
+        return Ok(0);
+    }
+
+    // Deepest paths first so children rename before parents.
+    entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+
+    let mut replacements: Vec<(String, String)> = Vec::new();
+    for (_, path) in &entries {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()) else {
+            continue;
+        };
+        if !live2d_name_needs_sanitize(&name) {
+            continue;
+        }
+        let mut new_name = sanitize_live2d_filename(&name);
+        let parent = path.parent().unwrap_or(root);
+        let mut dest = parent.join(&new_name);
+        let mut n = 2u32;
+        while dest.exists() && dest != *path {
+            new_name = format!("{}_{}", sanitize_live2d_filename(&name), n);
+            dest = parent.join(&new_name);
+            n += 1;
+        }
+        if dest == *path {
+            continue;
+        }
+        let old_rel = path_to_unix_rel(path.strip_prefix(root).unwrap_or(path.as_path()));
+        std::fs::rename(path, &dest).map_err(|e| {
+            format!("rename '{}' -> '{}': {}", path.display(), dest.display(), e)
+        })?;
+        let new_rel = path_to_unix_rel(dest.strip_prefix(root).unwrap_or(dest.as_path()));
+        log::info!("[live2d] renamed '{}' -> '{}'", old_rel, new_rel);
+        replacements.push((old_rel, new_rel));
+    }
+
+    if replacements.is_empty() {
+        return Ok(0);
+    }
+    // Longest paths first so nested replacements stay correct.
+    replacements.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+    fn rewrite_json_paths(dir: &std::path::Path, replacements: &[(String, String)]) -> Result<(), String> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Ok(());
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                rewrite_json_paths(&p, replacements)?;
+                continue;
+            }
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
+            if !(name.ends_with(".json")) {
+                continue;
+            }
+            let Ok(mut text) = std::fs::read_to_string(&p) else {
+                continue;
+            };
+            let before = text.clone();
+            for (old, new) in replacements {
+                if old == new {
+                    continue;
+                }
+                text = text.replace(old, new);
+                // Also replace Windows-style separators if present.
+                let old_win = old.replace('/', "\\");
+                if old_win != *old {
+                    text = text.replace(&old_win, new);
+                }
+            }
+            if text != before {
+                std::fs::write(&p, text).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+    rewrite_json_paths(root, &replacements)?;
+    Ok(replacements.len())
 }
 
 fn find_model3_json(root: &std::path::Path) -> Option<PathBuf> {
@@ -10224,6 +10363,8 @@ fn discover_live2d_pet_json(src: &std::path::Path) -> Result<serde_json::Value, 
 }
 
 fn live2d_meta_from_dir(app: &tauri::AppHandle, dir: &std::path::Path) -> Option<Live2DPetMeta> {
+    // Repair older imports that still have spaces in filenames.
+    let _ = normalize_live2d_pack_filenames(dir);
     let pet_json = dir.join("pet.json");
     if !pet_json.is_file() {
         return None;
@@ -10232,6 +10373,21 @@ fn live2d_meta_from_dir(app: &tauri::AppHandle, dir: &std::path::Path) -> Option
     let mut meta: serde_json::Value = serde_json::from_str(&raw).ok()?;
     if meta.get("kind").and_then(|v| v.as_str()) != Some("live2d") {
         return None;
+    }
+    // After rename, modelPath in pet.json may be stale — rediscover.
+    if let Some(found) = find_model3_json(dir) {
+        if let Ok(rel) = found.strip_prefix(dir) {
+            let rel_s = path_to_unix_rel(rel);
+            if meta.get("modelPath").and_then(|v| v.as_str()) != Some(rel_s.as_str()) {
+                if let Some(obj) = meta.as_object_mut() {
+                    obj.insert("modelPath".into(), serde_json::json!(rel_s));
+                    let _ = std::fs::write(
+                        &pet_json,
+                        serde_json::to_string_pretty(&meta).unwrap_or_default(),
+                    );
+                }
+            }
+        }
     }
     let id = meta
         .get("id")
@@ -10401,18 +10557,15 @@ async fn import_live2d_pet(app: tauri::AppHandle, src_path: String) -> Result<Li
     if !src.is_dir() {
         return Err(format!("not a directory: {}", src_path));
     }
-    let meta = discover_live2d_pet_json(&src)?;
-    let id = meta
-        .get("id")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| {
-            sanitize_live2d_id(
-                &src.file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "live2d".into()),
-            )
-        });
+    // Quick validate source has a model3 before copying.
+    if find_model3_json(&src).is_none() {
+        return Err("no .model3.json found in folder (need Cubism 4 Live2D model)".into());
+    }
+    let folder_name = src
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "live2d".into());
+    let id = sanitize_live2d_id(&folder_name);
     let root = live2d_pets_dir(&app)?;
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let dst = root.join(&id);
@@ -10420,23 +10573,39 @@ async fn import_live2d_pet(app: tauri::AppHandle, src_path: String) -> Result<Li
         let _ = std::fs::remove_dir_all(&dst);
     }
     copy_dir_recursive(&src, &dst)?;
-    // Always write/normalize pet.json so auto-detected imports persist.
-    let mut normalized = meta.clone();
+    // Critical for packs like `tango` (`tako m.moc3`): spaces break relative
+    // URL resolution in WebView / convertFileSrc.
+    let renamed = normalize_live2d_pack_filenames(&dst)?;
+    if renamed > 0 {
+        log::info!("[live2d] normalized {} path(s) with unsafe characters", renamed);
+    }
+    // Drop any copied pet.json and rebuild from the (possibly renamed) tree.
+    let _ = std::fs::remove_file(dst.join("pet.json"));
+    let mut normalized = discover_live2d_pet_json(&dst)?;
     if let Some(obj) = normalized.as_object_mut() {
         obj.insert("id".into(), serde_json::json!(id));
         obj.insert("kind".into(), serde_json::json!("live2d"));
+        obj.insert("displayName".into(), serde_json::json!(folder_name));
+        let has_motions = obj
+            .get("availableMotions")
+            .and_then(|v| v.as_object())
+            .map(|m| m.values().any(|v| v.as_array().map(|a| !a.is_empty()).unwrap_or(false)))
+            .unwrap_or(false);
+        if !has_motions {
+            obj.insert(
+                "description".into(),
+                serde_json::json!("Imported Live2D model (static — no motion3.json in pack)"),
+            );
+        }
     }
-    // Patch destination model3.json Motions when the pack only ships loose
-    // motion files (common for kurisu / community models).
-    if let Some(model_rel) = normalized.get("modelPath").and_then(|v| v.as_str()) {
-        let dst_model = dst.join(model_rel);
+    if let Some(model_rel) = normalized.get("modelPath").and_then(|v| v.as_str()).map(String::from) {
+        let dst_model = dst.join(&model_rel);
         if dst_model.is_file() {
             match collect_motions_map(&dst_model) {
                 Ok(motions) => {
                     if let Err(e) = patch_model3_motions(&dst_model, &motions) {
                         log::warn!("[live2d] patch Motions failed: {}", e);
                     }
-                    // Refresh availableMotions / motionMap from the patched set.
                     if let Some(obj) = normalized.as_object_mut() {
                         let mut available = serde_json::Map::new();
                         for (group, list) in &motions {
@@ -10452,8 +10621,8 @@ async fn import_live2d_pet(app: tauri::AppHandle, src_path: String) -> Result<Li
                                 .unwrap_or_default();
                             available.insert(group.clone(), serde_json::json!(files));
                         }
-                        if !available.is_empty() {
-                            obj.insert("availableMotions".into(), serde_json::Value::Object(available));
+                        obj.insert("availableMotions".into(), serde_json::Value::Object(available));
+                        if !motions.is_empty() {
                             obj.insert(
                                 "motionMap".into(),
                                 build_default_live2d_motion_map(&motions),
@@ -10472,6 +10641,35 @@ async fn import_live2d_pet(app: tauri::AppHandle, src_path: String) -> Result<Li
     .map_err(|e| e.to_string())?;
 
     live2d_meta_from_dir(&app, &dst).ok_or_else(|| "import succeeded but pet meta could not be read".into())
+}
+
+/// Delete a previously imported Live2D pet under `app_data_dir/live2d/<id>`.
+#[tauri::command]
+async fn delete_live2d_pet(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let id = id.trim();
+    if id.is_empty()
+        || id.contains("..")
+        || id.contains('/')
+        || id.contains('\\')
+        || id.contains('\0')
+    {
+        return Err("invalid live2d pet id".into());
+    }
+    let root = live2d_pets_dir(&app)?;
+    let dir = root.join(id);
+    // Must stay inside the live2d root.
+    let canon_root = root.canonicalize().unwrap_or(root.clone());
+    let canon_dir = dir.canonicalize().map_err(|_| format!("live2d pet not found: {}", id))?;
+    if !canon_dir.starts_with(&canon_root) {
+        return Err("invalid live2d pet path".into());
+    }
+    if !canon_dir.is_dir() {
+        return Err(format!("live2d pet not found: {}", id));
+    }
+    std::fs::remove_dir_all(&canon_dir).map_err(|e| e.to_string())?;
+    log::info!("[live2d] deleted imported pet {}", id);
+    let _ = app.emit("live2d-pet-deleted", serde_json::json!({ "petId": id }));
+    Ok(())
 }
 
 /// Activate a macOS app by its name (e.g. "Feishu", "Telegram", "Lark").
@@ -18331,7 +18529,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, get_webview_origin, set_webview_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_get, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, list_custom_live2d_pets, open_live2d_pets_dir, import_live2d_pet, pick_live2d_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs])
+        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, get_webview_origin, set_webview_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_get, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, list_custom_live2d_pets, open_live2d_pets_dir, import_live2d_pet, pick_live2d_pet_folder, delete_live2d_pet, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs])
         .manage(ActiveAgentPid { pid: Mutex::new(None) })
         .manage(ClaudeState { sessions: Arc::new(Mutex::new(HashMap::new())), pending_permissions: Arc::new(Mutex::new(HashMap::new())), dismissed: Arc::new(Mutex::new(std::collections::HashSet::new())) })
         .run(tauri::generate_context!())

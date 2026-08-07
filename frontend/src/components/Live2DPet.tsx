@@ -23,6 +23,9 @@ interface Live2DPetProps {
   style?: React.CSSProperties
   /** When set, ignore oc-claw state and play this binding (settings studio). */
   forceBinding?: Live2DMotionBinding | null
+  /** Surface load failures to the parent (studio). */
+  onLoadError?: (message: string) => void
+  onLoadOk?: () => void
 }
 
 let cubismCorePromise: Promise<void> | null = null
@@ -71,6 +74,8 @@ export function Live2DPet({
   className,
   style,
   forceBinding = null,
+  onLoadError,
+  onLoadOk,
 }: Live2DPetProps) {
   const hostRef = useRef<HTMLDivElement>(null)
   const appRef = useRef<import('pixi.js').Application | null>(null)
@@ -82,6 +87,7 @@ export function Live2DPet({
   const loopTokenRef = useRef(0)
   const forceBindingRef = useRef(forceBinding)
   const [mapRevision, setMapRevision] = useState(0)
+  const [loadError, setLoadError] = useState<string | null>(null)
 
   useEffect(() => {
     const unlisten = listen<{ petId?: string }>('live2d-motion-map-changed', (ev) => {
@@ -138,6 +144,7 @@ export function Live2DPet({
 
     let cancelled = false
     let app: import('pixi.js').Application | null = null
+    setLoadError(null)
 
     ;(async () => {
       try {
@@ -161,6 +168,7 @@ export function Live2DPet({
         host.appendChild(app.view as HTMLCanvasElement)
         appRef.current = app
 
+        console.info('[Live2DPet] loading', pet.id, pet.modelUrl)
         const model = await Live2DModel.from(pet.modelUrl!, {
           autoInteract: false,
         })
@@ -171,6 +179,8 @@ export function Live2DPet({
         modelRef.current = model
         app.stage.addChild(model)
         fitModel(model, sizeRef.current)
+        setLoadError(null)
+        onLoadOk?.()
         const token = ++loopTokenRef.current
         void runMotionLoop(
           model,
@@ -183,7 +193,10 @@ export function Live2DPet({
           forceBindingRef,
         )
       } catch (e) {
-        console.warn('[Live2DPet] load failed:', e)
+        const msg = e instanceof Error ? e.message : String(e)
+        console.warn('[Live2DPet] load failed:', pet.id, pet.modelUrl, e)
+        setLoadError(msg)
+        onLoadError?.(msg)
       }
     })()
 
@@ -219,6 +232,7 @@ export function Live2DPet({
         height,
         overflow: 'hidden',
         pointerEvents: 'none',
+        position: 'relative',
         ...style,
       }}
     >
@@ -230,6 +244,26 @@ export function Live2DPet({
           marginTop: Math.max(0, height - size),
         }}
       />
+      {loadError && (
+        <div
+          style={{
+            position: 'absolute',
+            inset: 8,
+            fontSize: 10,
+            lineHeight: 1.35,
+            color: '#fda4af',
+            background: 'rgba(0,0,0,0.55)',
+            borderRadius: 8,
+            padding: 8,
+            overflow: 'auto',
+            pointerEvents: 'none',
+          }}
+        >
+          模型加载失败
+          <br />
+          {loadError}
+        </div>
+      )}
     </div>
   )
 }
@@ -339,6 +373,16 @@ async function runMotionLoop(
   const forced = forceBindingRef.current
   const binding = forced ?? resolveLive2DMotion(pet, state)
   applyExpression(model, binding)
+
+  const motionGroupsKnown = pet.availableMotions != null
+  const hasAnyMotion = Object.values(pet.availableMotions ?? {}).some(
+    (files) => Array.isArray(files) && files.length > 0,
+  )
+  // Packs like maho / MAY ship only moc+texture (no motion3). Keep the
+  // static model on stage; do not spam failed motion() calls.
+  if (!forced && motionGroupsKnown && !hasAnyMotion) {
+    return
+  }
 
   const priority = forced ? 3 : state === 'jumping' ? 3 : 2
   const index =
