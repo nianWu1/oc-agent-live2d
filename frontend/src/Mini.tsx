@@ -1793,6 +1793,15 @@ export default function Mini() {
     pollHealthBusyRef.current = true
     try {
       const connections = await loadOcConnections()
+      // No OpenClaw connections → clear stale busy flags so the mascot
+      // returns to idle instead of forever replaying the last working state.
+      if (connections.length === 0) {
+        prevHealthRef.current = {}
+        prevSessionHealthRef.current = {}
+        setHealthMap({})
+        setAnySessionActive(false)
+        return
+      }
       // Start with previous data ? only overwrite for connections that succeed
       const hMap: Record<string, boolean> = { ...prevHealthRef.current }
       const sMap: Record<string, boolean> = { ...prevSessionHealthRef.current }

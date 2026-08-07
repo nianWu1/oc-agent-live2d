@@ -325,7 +325,12 @@ export function Live2DStudio() {
                   const row = draftMap[key] ?? {
                     group: motionGroups[0] ?? 'Idle',
                     index: 0,
-                    loop: key === 'working' || key === 'run-left' || key === 'run-right',
+                    loop:
+                      key === 'working' ||
+                      key === 'run-left' ||
+                      key === 'run-right' ||
+                      key === 'idle' ||
+                      key === 'waiting',
                   }
                   const count = discovered.motions[row.group ?? ''] ?? 0
                   return (

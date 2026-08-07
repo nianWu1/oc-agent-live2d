@@ -9840,6 +9840,11 @@ pub struct Live2DPetMeta {
     pub model_url: String,
     #[serde(rename = "previewUrl")]
     pub preview_url: String,
+    /// Absolute filesystem path — frontend prefers `convertFileSrc` for loading.
+    #[serde(rename = "modelAbsPath")]
+    pub model_abs_path: String,
+    #[serde(rename = "previewAbsPath", skip_serializing_if = "Option::is_none")]
+    pub preview_abs_path: Option<String>,
     #[serde(rename = "motionMap", skip_serializing_if = "Option::is_none")]
     pub motion_map: Option<serde_json::Value>,
     #[serde(rename = "availableMotions", skip_serializing_if = "Option::is_none")]
@@ -9856,7 +9861,21 @@ fn live2d_pets_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 
 fn live2d_asset_url(app: &tauri::AppHandle, abs: &std::path::Path) -> String {
-    use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+    use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+    // Keep `.` `_` `-` unencoded so Cubism relative paths resolve cleanly.
+    const LIVE2D_SEGMENT: &AsciiSet = &CONTROLS
+        .add(b' ')
+        .add(b'"')
+        .add(b'#')
+        .add(b'<')
+        .add(b'>')
+        .add(b'?')
+        .add(b'`')
+        .add(b'{')
+        .add(b'}')
+        .add(b'/')
+        .add(b'\\')
+        .add(b'%');
     let Ok(root) = live2d_pets_dir(app) else {
         return String::new();
     };
@@ -9866,14 +9885,11 @@ fn live2d_asset_url(app: &tauri::AppHandle, abs: &std::path::Path) -> String {
     };
     let parts: Vec<String> = rel
         .components()
-        .map(|c| utf8_percent_encode(&c.as_os_str().to_string_lossy(), NON_ALPHANUMERIC).to_string())
+        .map(|c| utf8_percent_encode(&c.as_os_str().to_string_lossy(), LIVE2D_SEGMENT).to_string())
         .collect();
-    let prefix = if cfg!(target_os = "windows") {
-        "http://live2dpet.localhost"
-    } else {
-        "live2dpet://localhost"
-    };
-    format!("{}/{}", prefix, parts.join("/"))
+    // Use the http://<scheme>.localhost form on every platform so Vite-dev
+    // (http://localhost:5222) can fetch model/textures with CORS.
+    format!("http://live2dpet.localhost/{}", parts.join("/"))
 }
 
 fn find_model3_json(root: &std::path::Path) -> Option<PathBuf> {
@@ -9882,8 +9898,8 @@ fn find_model3_json(root: &std::path::Path) -> Option<PathBuf> {
         for entry in entries.flatten() {
             let p = entry.path();
             if p.is_file()
-                && p.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("json")).unwrap_or(false)
-                && p.file_name()
+                && p
+                    .file_name()
                     .and_then(|n| n.to_str())
                     .map(|n| n.to_ascii_lowercase().ends_with(".model3.json"))
                     .unwrap_or(false)
@@ -9917,6 +9933,136 @@ fn find_model3_json(root: &std::path::Path) -> Option<PathBuf> {
         None
     }
     walk(root, 0)
+}
+
+fn collect_motion3_files(model_abs: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Some(model_dir) = model_abs.parent() else {
+        return out;
+    };
+    fn walk(dir: &std::path::Path, depth: u32, out: &mut Vec<PathBuf>) {
+        if depth > 3 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file() {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
+                if name.ends_with(".motion3.json") && !name.ends_with(".bak") && !name.contains(".bak.") {
+                    out.push(p);
+                }
+            } else if p.is_dir() {
+                let dir_name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
+                // Prefer motions / motion folders but still scan siblings lightly.
+                if depth == 0 || dir_name.contains("motion") {
+                    walk(&p, depth + 1, out);
+                } else if depth < 2 {
+                    walk(&p, depth + 1, out);
+                }
+            }
+        }
+    }
+    walk(model_dir, 0, &mut out);
+    out.sort();
+    out
+}
+
+fn motion_group_for_file(path: &std::path::Path) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("idle")
+        .to_ascii_lowercase();
+    // amadeus idle.motion3.json → stem "idle.motion3" on some platforms; normalize.
+    let stem = stem.trim_end_matches(".motion3").trim_end_matches(".motion");
+    if stem.contains("idle") || stem.contains("rest") || stem.contains("loop") {
+        "Idle".into()
+    } else if stem.contains("tap") || stem.contains("touch") || stem.contains("hit") {
+        "Tap".into()
+    } else {
+        "Idle".into()
+    }
+}
+
+/// Read Motions from model3.json, or invent groups from on-disk `*.motion3.json`
+/// files when FileReferences.Motions is empty. Does not write the model file.
+fn collect_motions_map(model_abs: &std::path::Path) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let model_raw = std::fs::read_to_string(model_abs).map_err(|e| e.to_string())?;
+    let model_json: serde_json::Value =
+        serde_json::from_str(&model_raw).map_err(|e| format!("invalid model3.json: {}", e))?;
+
+    let existing = model_json
+        .pointer("/FileReferences/Motions")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let has_any = existing.values().any(|v| v.as_array().map(|a| !a.is_empty()).unwrap_or(false));
+    if has_any {
+        return Ok(existing);
+    }
+
+    let model_dir = model_abs.parent().ok_or_else(|| "model has no parent dir".to_string())?;
+    let mut motions = serde_json::Map::new();
+    for file in collect_motion3_files(model_abs) {
+        let rel = file
+            .strip_prefix(model_dir)
+            .map(path_to_unix_rel)
+            .unwrap_or_else(|_| {
+                file.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            });
+        if rel.is_empty() {
+            continue;
+        }
+        let group = motion_group_for_file(&file);
+        let entry = serde_json::json!({ "File": rel });
+        let list = motions.entry(group).or_insert_with(|| serde_json::json!([]));
+        if let Some(arr) = list.as_array_mut() {
+            let already = arr
+                .iter()
+                .any(|item| item.get("File").and_then(|f| f.as_str()) == Some(rel.as_str()));
+            if !already {
+                arr.push(entry);
+            }
+        }
+    }
+    Ok(motions)
+}
+
+/// Persist Motions into the destination model3.json so Cubism can load them.
+fn patch_model3_motions(
+    model_abs: &std::path::Path,
+    motions: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    if motions.is_empty() {
+        return Ok(());
+    }
+    let model_raw = std::fs::read_to_string(model_abs).map_err(|e| e.to_string())?;
+    let mut model_json: serde_json::Value =
+        serde_json::from_str(&model_raw).map_err(|e| format!("invalid model3.json: {}", e))?;
+    let existing_has = model_json
+        .pointer("/FileReferences/Motions")
+        .and_then(|v| v.as_object())
+        .map(|m| m.values().any(|v| v.as_array().map(|a| !a.is_empty()).unwrap_or(false)))
+        .unwrap_or(false);
+    if existing_has {
+        return Ok(());
+    }
+    if let Some(file_refs) = model_json.get_mut("FileReferences").and_then(|v| v.as_object_mut()) {
+        file_refs.insert("Motions".into(), serde_json::Value::Object(motions.clone()));
+        let pretty = serde_json::to_string_pretty(&model_json).map_err(|e| e.to_string())?;
+        std::fs::write(model_abs, pretty).map_err(|e| e.to_string())?;
+        log::info!(
+            "[live2d] patched Motions into {} (groups={:?})",
+            model_abs.display(),
+            motions.keys().collect::<Vec<_>>()
+        );
+    }
+    Ok(())
 }
 
 fn sanitize_live2d_id(raw: &str) -> String {
@@ -9954,19 +10100,31 @@ fn build_default_live2d_motion_map(motions: &serde_json::Map<String, serde_json:
         .find(|k| k.eq_ignore_ascii_case("idle"))
         .cloned()
         .or_else(|| keys.first().cloned())
-        .unwrap_or_default();
+        .unwrap_or_else(|| "Idle".into());
+    // Prefer a non-idle action group when available; otherwise reuse Idle so
+    // "working" does not point at a missing Cubism group.
     let action_key = keys
         .iter()
         .find(|k| !k.eq_ignore_ascii_case("idle"))
         .cloned()
         .unwrap_or_else(|| idle_key.clone());
+    let action_index = if action_key.eq_ignore_ascii_case(&idle_key) {
+        // Same group as idle: use next index when possible so working ≠ idle.
+        motions
+            .get(&action_key)
+            .and_then(|v| v.as_array())
+            .map(|a| if a.len() > 1 { 1 } else { 0 })
+            .unwrap_or(0)
+    } else {
+        0
+    };
     serde_json::json!({
         "idle": { "group": idle_key, "index": 0, "loop": true },
-        "working": { "group": action_key, "index": 0, "loop": true },
+        "working": { "group": action_key, "index": action_index, "loop": true },
         "waiting": { "group": idle_key, "index": 0, "loop": true },
-        "jumping": { "group": action_key, "index": 0 },
-        "run-left": { "group": action_key, "index": 0, "loop": true },
-        "run-right": { "group": action_key, "index": 0, "loop": true }
+        "jumping": { "group": action_key, "index": action_index },
+        "run-left": { "group": action_key, "index": action_index, "loop": true },
+        "run-right": { "group": action_key, "index": action_index, "loop": true }
     })
 }
 
@@ -9994,6 +10152,7 @@ fn discover_live2d_pet_json(src: &std::path::Path) -> Result<serde_json::Value, 
     let model_abs = find_model3_json(src).ok_or_else(|| {
         "no .model3.json found in folder (need Cubism 4 Live2D model)".to_string()
     })?;
+    let motions = collect_motions_map(&model_abs)?;
     let model_rel = model_abs
         .strip_prefix(src)
         .map_err(|_| "model path outside selected folder".to_string())?;
@@ -10002,11 +10161,6 @@ fn discover_live2d_pet_json(src: &std::path::Path) -> Result<serde_json::Value, 
     let model_json: serde_json::Value =
         serde_json::from_str(&model_raw).map_err(|e| format!("invalid model3.json: {}", e))?;
 
-    let motions = model_json
-        .pointer("/FileReferences/Motions")
-        .and_then(|v| v.as_object())
-        .cloned()
-        .unwrap_or_default();
     let mut available_motions = serde_json::Map::new();
     for (group, list) in &motions {
         let files: Vec<String> = list
@@ -10075,7 +10229,7 @@ fn live2d_meta_from_dir(app: &tauri::AppHandle, dir: &std::path::Path) -> Option
         return None;
     }
     let raw = std::fs::read_to_string(&pet_json).ok()?;
-    let meta: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let mut meta: serde_json::Value = serde_json::from_str(&raw).ok()?;
     if meta.get("kind").and_then(|v| v.as_str()) != Some("live2d") {
         return None;
     }
@@ -10103,6 +10257,42 @@ fn live2d_meta_from_dir(app: &tauri::AppHandle, dir: &std::path::Path) -> Option
     if !abs_model.is_file() {
         return None;
     }
+    // Repair previously imported packs that shipped loose motion files but
+    // empty FileReferences.Motions (preview/play would otherwise fail).
+    if let Ok(motions) = collect_motions_map(&abs_model) {
+        let _ = patch_model3_motions(&abs_model, &motions);
+        if !motions.is_empty() {
+            let needs_map = meta
+                .get("availableMotions")
+                .and_then(|v| v.as_object())
+                .map(|m| m.is_empty())
+                .unwrap_or(true);
+            if needs_map {
+                if let Some(obj) = meta.as_object_mut() {
+                    let mut available = serde_json::Map::new();
+                    for (group, list) in &motions {
+                        let files: Vec<String> = list
+                            .as_array()
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|item| {
+                                        item.get("File").and_then(|f| f.as_str()).map(String::from)
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        available.insert(group.clone(), serde_json::json!(files));
+                    }
+                    obj.insert("availableMotions".into(), serde_json::Value::Object(available));
+                    obj.insert("motionMap".into(), build_default_live2d_motion_map(&motions));
+                    let _ = std::fs::write(
+                        &pet_json,
+                        serde_json::to_string_pretty(&meta).unwrap_or_default(),
+                    );
+                }
+            }
+        }
+    }
     let preview_path = meta
         .get("previewPath")
         .and_then(|v| v.as_str())
@@ -10120,6 +10310,12 @@ fn live2d_meta_from_dir(app: &tauri::AppHandle, dir: &std::path::Path) -> Option
         description,
         model_url: live2d_asset_url(app, &abs_model),
         preview_url,
+        model_abs_path: abs_model.to_string_lossy().into_owned(),
+        preview_abs_path: if abs_preview.is_file() {
+            Some(abs_preview.to_string_lossy().into_owned())
+        } else {
+            None
+        },
         motion_map: meta.get("motionMap").cloned(),
         available_motions: meta.get("availableMotions").cloned(),
         available_expressions: meta.get("availableExpressions").cloned(),
@@ -10226,6 +10422,45 @@ async fn import_live2d_pet(app: tauri::AppHandle, src_path: String) -> Result<Li
     if let Some(obj) = normalized.as_object_mut() {
         obj.insert("id".into(), serde_json::json!(id));
         obj.insert("kind".into(), serde_json::json!("live2d"));
+    }
+    // Patch destination model3.json Motions when the pack only ships loose
+    // motion files (common for kurisu / community models).
+    if let Some(model_rel) = normalized.get("modelPath").and_then(|v| v.as_str()) {
+        let dst_model = dst.join(model_rel);
+        if dst_model.is_file() {
+            match collect_motions_map(&dst_model) {
+                Ok(motions) => {
+                    if let Err(e) = patch_model3_motions(&dst_model, &motions) {
+                        log::warn!("[live2d] patch Motions failed: {}", e);
+                    }
+                    // Refresh availableMotions / motionMap from the patched set.
+                    if let Some(obj) = normalized.as_object_mut() {
+                        let mut available = serde_json::Map::new();
+                        for (group, list) in &motions {
+                            let files: Vec<String> = list
+                                .as_array()
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|item| {
+                                            item.get("File").and_then(|f| f.as_str()).map(String::from)
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            available.insert(group.clone(), serde_json::json!(files));
+                        }
+                        if !available.is_empty() {
+                            obj.insert("availableMotions".into(), serde_json::Value::Object(available));
+                            obj.insert(
+                                "motionMap".into(),
+                                build_default_live2d_motion_map(&motions),
+                            );
+                        }
+                    }
+                }
+                Err(e) => log::warn!("[live2d] collect Motions failed: {}", e),
+            }
+        }
     }
     std::fs::write(
         dst.join("pet.json"),
@@ -17577,6 +17812,18 @@ fn asset_mime_for_path(path: &str) -> &'static str {
         "video/mp4"
     } else if lower.ends_with(".mov") {
         "video/quicktime"
+    } else if lower.ends_with(".json")
+        || lower.ends_with(".model3.json")
+        || lower.ends_with(".motion3.json")
+        || lower.ends_with(".exp3.json")
+        || lower.ends_with(".physics3.json")
+        || lower.ends_with(".pose3.json")
+        || lower.ends_with(".cdi3.json")
+    {
+        // Live2D / Cubism metadata must be JSON so WKWebView + fetch().json() work.
+        "application/json"
+    } else if lower.ends_with(".moc3") {
+        "application/octet-stream"
     } else {
         "application/octet-stream"
     }
@@ -17712,7 +17959,7 @@ pub fn run() {
             let path = percent_decode_str(raw_path).decode_utf8_lossy();
             let root = codex_pets_dir().unwrap_or_default();
             let file_path = root.join(path.trim_start_matches('/'));
-            build_asset_response(&req, path.as_ref(), &file_path, cfg!(target_os = "windows"), "codexpet")
+            build_asset_response(&req, path.as_ref(), &file_path, true, "codexpet")
         })
         .register_uri_scheme_protocol("live2dpet", |ctx, req| {
             // Custom Live2D models imported into app_data_dir/live2d/.
@@ -17720,7 +17967,7 @@ pub fn run() {
             let path = percent_decode_str(raw_path).decode_utf8_lossy();
             let data_dir = ctx.app_handle().path().app_data_dir().unwrap_or_default();
             let file_path = data_dir.join("live2d").join(path.trim_start_matches('/'));
-            build_asset_response(&req, path.as_ref(), &file_path, cfg!(target_os = "windows"), "live2dpet")
+            build_asset_response(&req, path.as_ref(), &file_path, true, "live2dpet")
         })
         .setup(|app| {
             // Fix PATH so openclaw (Node.js script) and node are both reachable
