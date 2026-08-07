@@ -70,6 +70,8 @@
     "thinking": "thinking...",
     "working": "working...",
     "compacting": "compacting...",
+    "statusWaitingTool": "waiting for tool",
+    "statusToolRunning": "running tool",
     "local": "Local",
     "remote": "Remote",
     "custom": "Custom",

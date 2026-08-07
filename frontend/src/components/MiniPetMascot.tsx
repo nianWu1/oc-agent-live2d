@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { PetAvatar } from './PetAvatar'
+import { PetStatusBubble, type PetStatusTone } from './PetStatusBubble'
 import { ANIMATION_ROWS, fpsFor, isLive2DPet } from '../lib/codexPet'
 import type { CodexPet, CodexPetState } from '../lib/codexPet'
 
@@ -27,6 +28,10 @@ interface MiniPetMascotProps {
   // it). Without this, walkDir → run-left/run-right is hidden by the
   // continuous jump animation.
   suppressHover?: boolean
+  /** Status text shown in a pill above the pet's head. */
+  statusLabel?: string | null
+  statusTone?: PetStatusTone
+  statusTitle?: string
   className?: string
   style?: React.CSSProperties
 }
@@ -44,6 +49,9 @@ export function MiniPetMascot({
   externalHover = false,
   useExternalHover = false,
   suppressHover = false,
+  statusLabel = null,
+  statusTone = 'idle',
+  statusTitle,
   className,
   style,
 }: MiniPetMascotProps) {
@@ -129,8 +137,11 @@ export function MiniPetMascot({
       className={className}
       onMouseEnter={enableHoverJump && !useExternalHover ? onEnter : undefined}
       onMouseLeave={enableHoverJump && !useExternalHover ? onLeave : undefined}
-      style={{ display: 'inline-block', lineHeight: 0, ...style }}
+      style={{ display: 'inline-block', lineHeight: 0, position: 'relative', ...style }}
     >
+      {statusLabel ? (
+        <PetStatusBubble label={statusLabel} tone={statusTone} title={statusTitle} />
+      ) : null}
       <PetAvatar
         key={avatarKey}
         pet={pet}

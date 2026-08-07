@@ -56,6 +56,8 @@
     "thinking": "réflexion...",
     "working": "en cours...",
     "compacting": "compactage...",
+    "statusWaitingTool": "attente outil",
+    "statusToolRunning": "outil en cours",
     "local": "Local",
     "remote": "Distant",
     "custom": "Personnalisé",

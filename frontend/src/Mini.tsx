@@ -40,6 +40,7 @@ import { MiniPetMascot } from './components/MiniPetMascot'
 import { SpritePet } from './components/SpritePet'
 import { PetThumb } from './components/PetAvatar'
 import { PetPicker } from './components/PetPicker'
+import { PetStatusBubble, type PetStatusTone } from './components/PetStatusBubble'
 
 /** Session-list icon: animate sprites, but keep Live2D as a static thumb (no per-row Pixi). */
 function SessionPetIcon({
@@ -4050,6 +4051,39 @@ export default function Mini() {
   const hasWorking = anySessionActive || Object.values(healthMap).some(Boolean) || claudeWorking || claudeCompacting || claudeWaiting
   // Priority: waiting > compacting > working > idle
   const mainPetState: PetState = claudeWaiting ? 'waiting' : claudeCompacting ? 'compacting' : hasWorking ? 'working' : 'idle'
+  // Richer label for the head status bubble (tool / thinking / confirm, etc.).
+  const petStatusBubble = useMemo(() => {
+    const waitingCs = visibleClaudeSessions.find((cs) => cs.status === 'waiting')
+    if (waitingCs) {
+      const base = t('mini.statusWaitingTool')
+      const label = waitingCs.tool ? `${base} · ${waitingCs.tool}` : base
+      return {
+        label,
+        tone: 'waiting' as PetStatusTone,
+        title: waitingCs.tool || waitingCs.userPrompt || label,
+      }
+    }
+    if (claudeCompacting) {
+      return { label: t('mini.compacting'), tone: 'compacting' as PetStatusTone }
+    }
+    const toolCs = visibleClaudeSessions.find((cs) => cs.status === 'tool_running')
+    if (toolCs) {
+      const base = t('mini.statusToolRunning')
+      const label = toolCs.tool ? `${base} · ${toolCs.tool}` : base
+      return {
+        label,
+        tone: 'tool' as PetStatusTone,
+        title: toolCs.tool || label,
+      }
+    }
+    if (visibleClaudeSessions.some((cs) => cs.status === 'processing')) {
+      return { label: t('mini.thinking'), tone: 'thinking' as PetStatusTone }
+    }
+    if (hasWorking) {
+      return { label: t('mini.working'), tone: 'working' as PetStatusTone }
+    }
+    return { label: t('mini.idle'), tone: 'idle' as PetStatusTone }
+  }, [visibleClaudeSessions, claudeCompacting, hasWorking, t])
   // Sprite resting state for the main mascot. Walking direction (set by
   // the walk timer) overrides the working/waiting/idle mapping so the pet
   // visibly runs left/right while the native window is moving.
@@ -4471,6 +4505,13 @@ export default function Mini() {
           >
             {largeMascot && largeVideoUrl ? (
               <div style={{ position: 'relative', width: largeMascotVisualSize, height: largeMascotVisualSize }}>
+              {appMode !== 'pet' && (
+                <PetStatusBubble
+                  label={petStatusBubble.label}
+                  tone={petStatusBubble.tone}
+                  title={petStatusBubble.title}
+                />
+              )}
               {currentPetAction === 'peek' && !moveMode && (() => {
                 // Narrow cursor:pointer strip aligned to the actual peeking side.
                 // The strip width is a small fraction of the mascot visual size to
@@ -4589,6 +4630,9 @@ export default function Mini() {
                   externalHover={mascotHover}
                   useExternalHover={!isWindowsPlatform}
                   suppressHover={mascotDragActive}
+                  statusLabel={appMode === 'pet' ? null : petStatusBubble.label}
+                  statusTone={petStatusBubble.tone}
+                  statusTitle={petStatusBubble.title}
                 />
               </div>
             ) : (

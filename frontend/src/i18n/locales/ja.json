@@ -56,6 +56,8 @@
     "thinking": "思考中...",
     "working": "作業中...",
     "compacting": "圧縮中...",
+    "statusWaitingTool": "ツール確認待ち",
+    "statusToolRunning": "ツール実行中",
     "local": "ローカル",
     "remote": "リモート",
     "custom": "カスタム",
