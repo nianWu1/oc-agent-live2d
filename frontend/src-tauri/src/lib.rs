@@ -8,6 +8,7 @@ use std::time::SystemTime;
 static FULLSCREEN_HIDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 use percent_encoding::percent_decode_str;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 /// Whether the efficiency-mode notch hover tracking thread should be running.
 static EFFICIENCY_HOVER_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -7046,15 +7047,25 @@ async fn open_detail_panel(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Shared HTTP client for webview proxy helpers. Reusing one client keeps
+/// connection pooling / keep-alive; building a new Client per call forced a
+/// fresh TCP handshake through UU tunnels on every pet status poll.
+fn proxy_http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .pool_max_idle_per_host(2)
+            .build()
+            .expect("proxy http client")
+    })
+}
+
 /// Proxy a GET request to bypass CORS restrictions in the webview.
 #[tauri::command]
 async fn proxy_get(url: String) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .connect_timeout(std::time::Duration::from_secs(2))
-        .build()
-        .map_err(|e| format!("client build: {}", e))?;
-    let resp = client
+    let resp = proxy_http_client()
         .get(&url)
         .send()
         .await
@@ -7070,8 +7081,7 @@ async fn proxy_get(url: String) -> Result<String, String> {
 /// Proxy a POST request to bypass CORS restrictions in the webview.
 #[tauri::command]
 async fn proxy_post(url: String, body: String) -> Result<String, String> {
-    let client = reqwest::Client::new();
-    let resp = client
+    let resp = proxy_http_client()
         .post(&url)
         .header("Content-Type", "application/json")
         .body(body)

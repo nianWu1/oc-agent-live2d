@@ -240,67 +240,24 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
     window.addEventListener('pointercancel', onCancel, { once: true })
   }, [size])
 
-  // Independent Cursor status bridge (statusUrl query) OR mirror primary mini.
+  // Multi pet: poll statusUrl only when filled AND reachable (e.g. tunnel
+  // :9999). If URL missing/down, mirror primary via mini-pet-state — never
+  // keep hammering a dead tunnel.
   useEffect(() => {
-    if (statusUrlFromUrl) {
-      let cancelled = false
-      const applyState = (state: string, detail?: string, kind?: string) => {
-        const s = (state || '').toLowerCase()
-        const k = (kind || '').toLowerCase()
-        if (s === 'waiting' || s === 'awaiting' || k.startsWith('confirm')) {
-          setWaiting(true)
-          setWorking(false)
-        } else if (
-          s === 'working' ||
-          s === 'compacting' ||
-          s === 'running' ||
-          s === 'busy' ||
-          s === 'active' ||
-          k === 'working' ||
-          k === 'tool' ||
-          k === 'thinking'
-        ) {
-          setWaiting(false)
-          setWorking(true)
-        } else {
-          // completed / idle / error / unknown → idle animation
-          setWaiting(false)
-          setWorking(false)
-        }
-        if (typeof detail === 'string') setStatusDetail(detail)
-        if (typeof kind === 'string') setStatusKind(kind)
-      }
-      const poll = async () => {
-        try {
-          const { invoke } = await import('@tauri-apps/api/core')
-          const text = (await invoke('proxy_get', { url: statusUrlFromUrl })) as string
-          if (cancelled) return
-          const data = JSON.parse(text) as {
-            state?: string
-            detail?: string
-            status?: string
-            kind?: string
-          }
-          applyState(data.state || data.status || 'idle', data.detail, data.kind)
-        } catch (e) {
-          if (!cancelled) console.warn('[extra-mascot] status poll failed:', e)
-        }
-      }
-      void poll()
-      const id = window.setInterval(poll, 2000)
-      return () => {
-        cancelled = true
-        window.clearInterval(id)
-      }
-    }
+    let cancelled = false
+    let inFlight = false
+    let urlReachable = false
+    let pollTimer: number | null = null
+    let probeTimer: number | null = null
+    let unlistenFn: (() => void) | null = null
 
-    const unlisten = listen<{
+    const applyMirrorPayload = (payload: {
       state?: string
       label?: string
       tone?: string
       title?: string | null
-    }>('mini-pet-state', (ev) => {
-      const s = (ev.payload?.state || '').toLowerCase()
+    }) => {
+      const s = (payload?.state || '').toLowerCase()
       let nextWaiting = false
       let nextWorking = false
       if (s === 'waiting') {
@@ -313,18 +270,159 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
 
       // Always refresh bubble from this event so a stale "空闲中" label cannot
       // stick after state flips to working (label may be briefly missing).
-      const label = typeof ev.payload?.label === 'string' ? ev.payload.label.trim() : ''
-      const toneFromPayload = isPetStatusTone(ev.payload?.tone) ? ev.payload.tone : null
+      const label = typeof payload?.label === 'string' ? payload.label.trim() : ''
+      const toneFromPayload = isPetStatusTone(payload?.tone) ? payload.tone : null
       const tone: PetStatusTone = toneFromPayload
         ?? (nextWaiting ? 'waiting' : nextWorking ? 'working' : 'idle')
       setRemoteBubble({
         label: label || (nextWaiting ? 'waiting' : nextWorking ? 'working' : 'idle'),
         tone,
-        title: typeof ev.payload?.title === 'string' ? ev.payload.title : undefined,
+        title: typeof payload?.title === 'string' ? payload.title : undefined,
       })
-    })
+    }
+
+    const startMirror = () => {
+      if (unlistenFn) return
+      void listen<{
+        state?: string
+        label?: string
+        tone?: string
+        title?: string | null
+      }>('mini-pet-state', (ev) => {
+        if (cancelled || urlReachable) return
+        applyMirrorPayload(ev.payload || {})
+      }).then((fn) => {
+        if (cancelled) {
+          fn()
+          return
+        }
+        unlistenFn = fn
+      })
+    }
+
+    const stopMirror = () => {
+      if (unlistenFn) {
+        unlistenFn()
+        unlistenFn = null
+      }
+    }
+
+    const applyRemoteState = (state: string, detail?: string, kind?: string) => {
+      const s = (state || '').toLowerCase()
+      const k = (kind || '').toLowerCase()
+      if (s === 'waiting' || s === 'awaiting' || k.startsWith('confirm')) {
+        setWaiting(true)
+        setWorking(false)
+      } else if (
+        s === 'working' ||
+        s === 'compacting' ||
+        s === 'running' ||
+        s === 'busy' ||
+        s === 'active' ||
+        k === 'working' ||
+        k === 'tool' ||
+        k === 'thinking'
+      ) {
+        setWaiting(false)
+        setWorking(true)
+      } else {
+        // completed / idle / error / unknown → idle animation
+        setWaiting(false)
+        setWorking(false)
+      }
+      if (typeof detail === 'string') setStatusDetail(detail)
+      if (typeof kind === 'string') setStatusKind(kind)
+    }
+
+    const clearPoll = () => {
+      if (pollTimer != null) {
+        window.clearInterval(pollTimer)
+        pollTimer = null
+      }
+    }
+
+    const clearProbe = () => {
+      if (probeTimer != null) {
+        window.clearInterval(probeTimer)
+        probeTimer = null
+      }
+    }
+
+    const markUnreachable = () => {
+      urlReachable = false
+      clearPoll()
+      startMirror()
+    }
+
+    const pollRemote = async () => {
+      if (cancelled || inFlight || !statusUrlFromUrl || !urlReachable) return
+      inFlight = true
+      try {
+        const { invoke } = await import('@tauri-apps/api/core')
+        const text = (await invoke('proxy_get', { url: statusUrlFromUrl })) as string
+        if (cancelled) return
+        const data = JSON.parse(text) as {
+          state?: string
+          detail?: string
+          status?: string
+          kind?: string
+        }
+        applyRemoteState(data.state || data.status || 'idle', data.detail, data.kind)
+      } catch (e) {
+        if (!cancelled) {
+          console.warn('[extra-mascot] status poll failed, fall back to primary:', e)
+          markUnreachable()
+        }
+      } finally {
+        inFlight = false
+      }
+    }
+
+    const startPoll = () => {
+      clearPoll()
+      stopMirror()
+      urlReachable = true
+      void pollRemote()
+      pollTimer = window.setInterval(pollRemote, 5000)
+    }
+
+    const probeRemote = async () => {
+      if (cancelled || !statusUrlFromUrl || inFlight) return
+      if (urlReachable) return
+      inFlight = true
+      try {
+        const { invoke } = await import('@tauri-apps/api/core')
+        const text = (await invoke('proxy_get', { url: statusUrlFromUrl })) as string
+        if (cancelled) return
+        const data = JSON.parse(text) as {
+          state?: string
+          detail?: string
+          status?: string
+          kind?: string
+        }
+        applyRemoteState(data.state || data.status || 'idle', data.detail, data.kind)
+        startPoll()
+      } catch {
+        if (!cancelled) markUnreachable()
+      } finally {
+        inFlight = false
+      }
+    }
+
+    if (statusUrlFromUrl) {
+      startMirror()
+      void probeRemote()
+      // Soft re-probe while down — do not 5s-spam a dead UU map.
+      probeTimer = window.setInterval(probeRemote, 30000)
+    } else {
+      startMirror()
+    }
+
     return () => {
-      unlisten.then((fn) => fn())
+      cancelled = true
+      clearPoll()
+      clearProbe()
+      stopMirror()
     }
   }, [statusUrlFromUrl])
 

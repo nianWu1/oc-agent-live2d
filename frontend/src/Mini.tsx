@@ -2008,93 +2008,54 @@ export default function Mini() {
     }
   }, [fetchAgents, pollHealth, appMode])
 
-  // Poll Cursor notify-bridge /status so primary mascot animation + bubble
-  // track agent work even when oc-claw Cursor hooks are quiet.
-  // Architecture: Cursor machine runs cursor-notify-bridge (often :18765);
-  // the pet machine polls the *local* tunnel port (often Mac :9999 → Windows
-  // :18765). Never assume the pet can reach 18765 directly.
+  // Primary mascot: local Cursor notify-bridge only (same machine as Cursor).
+  // Remote / tunnel URLs (e.g. Mac :9999 → Windows :18765) belong on Multi
+  // pets that explicitly set statusUrl — never on the primary.
   useEffect(() => {
-    if (appMode !== 'coding' || !enableCursor) {
+    if (appMode !== 'coding' || !enableCursor || !isWindowsPlatform) {
       setBridgePetState('idle')
       return
     }
+    const LOCAL_STATUS_URL = 'http://127.0.0.1:18765/status'
     let cancelled = false
-    const collectUrls = async (): Promise<string[]> => {
-      const urls = new Set<string>()
-      try {
-        const store = await load('settings.json', { defaults: {}, autoSave: false })
-        const configured = await store.get('cursor_status_url')
-        if (typeof configured === 'string' && configured.trim()) {
-          urls.add(configured.trim())
-        }
-      } catch {
-        /* ignore */
-      }
-      try {
-        const extras = await loadExtraMascots()
-        for (const cfg of extras) {
-          const u = cfg.statusUrl?.trim()
-          if (u) urls.add(u)
-        }
-      } catch {
-        /* ignore */
-      }
-      // No explicit URL: use the local tunnel endpoint the pet can actually reach.
-      // Mac/Linux pet → 9999 (typical UU/SSH map of Windows :18765).
-      // Windows pet on the same box as Cursor → 18765 directly.
-      if (urls.size === 0) {
-        urls.add(
-          isWindowsPlatform
-            ? 'http://127.0.0.1:18765/status'
-            : 'http://127.0.0.1:9999/status',
-        )
-      }
-      return Array.from(urls)
-    }
+    let inFlight = false
     const pollBridge = async () => {
-      const urls = await collectUrls()
-      if (cancelled || urls.length === 0) {
+      if (cancelled || inFlight) return
+      inFlight = true
+      try {
+        const text = (await invoke('proxy_get', { url: LOCAL_STATUS_URL })) as string
+        if (cancelled) return
+        const data = JSON.parse(text) as {
+          state?: string
+          status?: string
+          kind?: string
+        }
+        const s = (data.state || data.status || '').toLowerCase()
+        const k = (data.kind || '').toLowerCase()
+        if (s === 'waiting' || s === 'awaiting' || k.startsWith('confirm')) {
+          setBridgePetState('waiting')
+        } else if (
+          s === 'working' ||
+          s === 'compacting' ||
+          s === 'running' ||
+          s === 'busy' ||
+          s === 'active' ||
+          k === 'working' ||
+          k === 'tool' ||
+          k === 'thinking'
+        ) {
+          setBridgePetState('working')
+        } else {
+          setBridgePetState('idle')
+        }
+      } catch {
         if (!cancelled) setBridgePetState('idle')
-        return
+      } finally {
+        inFlight = false
       }
-      let waiting = false
-      let working = false
-      await Promise.all(
-        urls.map(async (url) => {
-          try {
-            const text = (await invoke('proxy_get', { url })) as string
-            if (cancelled) return
-            const data = JSON.parse(text) as {
-              state?: string
-              status?: string
-              kind?: string
-            }
-            const s = (data.state || data.status || '').toLowerCase()
-            const k = (data.kind || '').toLowerCase()
-            if (s === 'waiting' || s === 'awaiting' || k.startsWith('confirm')) {
-              waiting = true
-            } else if (
-              s === 'working' ||
-              s === 'compacting' ||
-              s === 'running' ||
-              s === 'busy' ||
-              s === 'active' ||
-              k === 'working' ||
-              k === 'tool' ||
-              k === 'thinking'
-            ) {
-              working = true
-            }
-          } catch {
-            /* bridge/tunnel offline — ignore this URL */
-          }
-        }),
-      )
-      if (cancelled) return
-      setBridgePetState(waiting ? 'waiting' : working ? 'working' : 'idle')
     }
     void pollBridge()
-    const id = window.setInterval(pollBridge, 2000)
+    const id = window.setInterval(pollBridge, 5000)
     return () => {
       cancelled = true
       window.clearInterval(id)

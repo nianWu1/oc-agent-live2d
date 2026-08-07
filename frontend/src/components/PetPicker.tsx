@@ -835,7 +835,7 @@ function ExtraMascotControls({
   >(null)
   const [busy, setBusy] = useState(false)
   // Cursor status bridge URL for the next extra mascot (empty = mirror primary).
-  const [draftStatusUrl, setDraftStatusUrl] = useState('http://127.0.0.1:9999/status')
+  const [draftStatusUrl, setDraftStatusUrl] = useState('')
 
   const findPet = useCallback(
     (id: string) => allPets.find((p) => p.id === id) ?? null,
@@ -1096,7 +1096,7 @@ function ExtraMascotControls({
                 data-no-drag
                 type="text"
                 defaultValue={entry.statusUrl ?? ''}
-                placeholder="本机镜像（空）或 http://127.0.0.1:9999/status"
+                placeholder="空=跟主宠；填隧道才远程同步，如 http://127.0.0.1:9999/status"
                 onBlur={(ev) => {
                   const v = ev.target.value.trim()
                   if (v !== (entry.statusUrl ?? '')) void handleUpdateStatusUrl(entry.label, v)
@@ -1117,7 +1117,9 @@ function ExtraMascotControls({
           )
         })}
         <div className="px-1 pb-1">
-          <label className="block text-[11px] text-white/35 mb-1">新增桌宠的状态地址（远程机器经隧道后的 /status）</label>
+          <label className="block text-[11px] text-white/35 mb-1">
+            新增 Multi 宠状态地址（留空=跟主宠本机状态；填了且隧道可用才轮询，例如 http://127.0.0.1:9999/status）
+          </label>
           <input
             data-no-drag
             type="text"
