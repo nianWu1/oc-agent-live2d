@@ -3631,11 +3631,12 @@ export default function Mini() {
     } else if (
       viewMode === 'efficiency' &&
       !moveMode &&
-      mascotMode !== 'lock' &&
       !updateModalOpen &&
       !settingsMode &&
       !settingsTransitioning
     ) {
+      // Keep hover tracking even in lock mode so macOS can still open the
+      // panel; native drag is suppressed separately via CODING_MASCOT_LOCKED.
       invoke('set_efficiency_hover_tracking', { active: true }).catch(() => {})
     } else {
       invoke('set_efficiency_hover_tracking', { active: false }).catch(() => {})
@@ -3643,7 +3644,7 @@ export default function Mini() {
     return () => {
       invoke('set_efficiency_hover_tracking', { active: false }).catch(() => {})
     }
-  }, [viewMode, moveMode, mascotMode, updateModalOpen, settingsMode, settingsTransitioning, appMode])
+  }, [viewMode, moveMode, updateModalOpen, settingsMode, settingsTransitioning, appMode])
 
   // Coding lock: pass clicks through the mascot body; keep only the top
   // notch interactive so the user can switch back to drag / expand.
@@ -3716,7 +3717,6 @@ export default function Mini() {
   useEffect(() => {
     if (viewMode !== 'efficiency' || appMode === 'pet') return
     const unlisten = listen<boolean>('efficiency-hover', (event) => {
-      if (mascotModeRef.current === 'lock') return
       if (settingsModeRef.current || settingsTransitioningRef.current) {
         return
       }
@@ -4133,7 +4133,7 @@ export default function Mini() {
     if (hasWorking) {
       return { label: t('mini.working'), tone: 'working' as PetStatusTone }
     }
-    return { label: t('mini.idle'), tone: 'idle' as PetStatusTone }
+    return { label: t('mini.idleBusy'), tone: 'idle' as PetStatusTone }
   }, [visibleClaudeSessions, claudeCompacting, hasWorking, t])
   // Sprite resting state for the main mascot. Walking direction (set by
   // the walk timer) overrides the working/waiting/idle mapping so the pet
@@ -4485,7 +4485,7 @@ export default function Mini() {
         width: '100vw',
         height: '100vh',
         background: 'transparent',
-        overflow: (appMode === 'pet' && largeMascot) ? 'visible' : 'hidden',
+        overflow: 'visible',
         userSelect: 'none',
       }}
     >
@@ -4512,112 +4512,46 @@ export default function Mini() {
             background: undefined,
             pointerEvents: 'auto',
             cursor: 'default',
+            overflow: 'visible',
           }}
         >
-          {appMode !== 'pet' && (
+          {/* Lock mode: tiny top strip stays hittable so user can reopen panel
+              (body clicks pass through). No mode UI here — mode lives in panel. */}
+          {appMode !== 'pet' && mascotMode === 'lock' && (
             <div
               data-no-drag
-              data-mascot-mode-notch="1"
+              data-mascot-expand-strip="1"
               onPointerDown={(e) => {
                 e.stopPropagation()
+                e.preventDefault()
+                hoverExpandedRef.current = false
+                setCompletionSessionId(null)
+                expand()
               }}
+              title={t('mini.expand')}
               style={{
                 position: 'absolute',
-                top: 2,
+                top: 0,
                 left: '50%',
                 transform: 'translateX(-50%)',
                 zIndex: 60,
-                width: 152,
-                height: 30,
+                width: 120,
+                height: 28,
+                borderRadius: '0 0 10px 10px',
+                background: 'rgba(0,0,0,0.55)',
+                border: '1px solid rgba(255,255,255,0.12)',
+                borderTop: 'none',
                 display: 'flex',
                 alignItems: 'center',
-                gap: 2,
-                padding: 2,
-                borderRadius: 999,
-                background: 'rgba(10,10,12,0.92)',
-                border: '1px solid rgba(255,255,255,0.14)',
-                boxShadow: '0 4px 14px rgba(0,0,0,0.35)',
+                justifyContent: 'center',
+                color: 'rgba(255,255,255,0.75)',
+                fontSize: 10,
+                fontWeight: 700,
                 pointerEvents: 'auto',
+                cursor: 'pointer',
               }}
-              title={t('mini.mascotModeHint')}
             >
-              <button
-                type="button"
-                data-no-drag
-                onClick={(e) => {
-                  e.stopPropagation()
-                  void applyMascotMode('lock')
-                }}
-                style={{
-                  flex: 1,
-                  height: '100%',
-                  border: 'none',
-                  borderRadius: 999,
-                  cursor: 'pointer',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  gap: 4,
-                  fontSize: 10,
-                  fontWeight: 700,
-                  color: mascotMode === 'lock' ? '#111' : 'rgba(255,255,255,0.7)',
-                  background: mascotMode === 'lock' ? 'rgba(251,191,36,0.95)' : 'transparent',
-                }}
-              >
-                <Lock className="w-3 h-3" strokeWidth={2.5} />
-                {t('mini.mascotLock')}
-              </button>
-              <button
-                type="button"
-                data-no-drag
-                onClick={(e) => {
-                  e.stopPropagation()
-                  void applyMascotMode('drag')
-                }}
-                style={{
-                  flex: 1,
-                  height: '100%',
-                  border: 'none',
-                  borderRadius: 999,
-                  cursor: 'pointer',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  gap: 4,
-                  fontSize: 10,
-                  fontWeight: 700,
-                  color: mascotMode === 'drag' ? '#111' : 'rgba(255,255,255,0.7)',
-                  background: mascotMode === 'drag' ? 'rgba(52,211,153,0.95)' : 'transparent',
-                }}
-              >
-                <Move className="w-3 h-3" strokeWidth={2.5} />
-                {t('mini.mascotDrag')}
-              </button>
-              <button
-                type="button"
-                data-no-drag
-                onClick={(e) => {
-                  e.stopPropagation()
-                  hoverExpandedRef.current = false
-                  setCompletionSessionId(null)
-                  expand()
-                }}
-                title={t('mini.expand')}
-                style={{
-                  width: 26,
-                  height: '100%',
-                  border: 'none',
-                  borderRadius: 999,
-                  cursor: 'pointer',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  color: 'rgba(255,255,255,0.75)',
-                  background: 'rgba(255,255,255,0.06)',
-                }}
-              >
-                <ChevronDown className="w-3.5 h-3.5" strokeWidth={2.5} />
-              </button>
+              <ChevronDown className="w-3.5 h-3.5" strokeWidth={2.5} />
             </div>
           )}
           <div
@@ -4660,15 +4594,8 @@ export default function Mini() {
                 : {}),
             }}
           >
-            {largeMascot && largeVideoUrl ? (
-              <div style={{ position: 'relative', width: largeMascotVisualSize, height: largeMascotVisualSize }}>
-              {appMode !== 'pet' && (
-                <PetStatusBubble
-                  label={petStatusBubble.label}
-                  tone={petStatusBubble.tone}
-                  title={petStatusBubble.title}
-                />
-              )}
+              {largeMascot && largeVideoUrl ? (
+              <div style={{ position: 'relative', width: largeMascotVisualSize, height: largeMascotVisualSize, overflow: 'visible' }}>
               {currentPetAction === 'peek' && !moveMode && (() => {
                 // Narrow cursor:pointer strip aligned to the actual peeking side.
                 // The strip width is a small fraction of the mascot visual size to
@@ -4771,12 +4698,20 @@ export default function Mini() {
                   />
                 )
               })}
+              {appMode !== 'pet' && (
+                <PetStatusBubble
+                  label={petStatusBubble.label}
+                  tone={petStatusBubble.tone}
+                  title={petStatusBubble.title}
+                />
+              )}
             </div>) : miniPet ? (
               <div
                 style={{
                   position: 'relative',
                   width: largeMascotVisualSize,
                   height: Math.round(largeMascotVisualSize * (208 / 192)),
+                  overflow: 'visible',
                 }}
               >
                 <MiniPetMascot
@@ -5079,6 +5014,45 @@ export default function Mini() {
               </button>
             </div>
             <div className="flex items-center gap-4">
+              {/* Desktop-pet lock / drag — applies to the collapsed mascot. */}
+              <div
+                data-no-drag
+                className="flex items-center rounded-full p-0.5 border border-white/10 bg-white/[0.04]"
+                title={t('mini.mascotModeHint')}
+              >
+                <button
+                  type="button"
+                  data-no-drag
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    void applyMascotMode('lock')
+                  }}
+                  className={`flex items-center gap-1 px-2 py-1 rounded-full text-[11px] font-semibold transition-colors ${
+                    mascotMode === 'lock'
+                      ? 'bg-amber-400 text-black'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <Lock className="w-3 h-3" strokeWidth={2.5} />
+                  {t('mini.mascotLock')}
+                </button>
+                <button
+                  type="button"
+                  data-no-drag
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    void applyMascotMode('drag')
+                  }}
+                  className={`flex items-center gap-1 px-2 py-1 rounded-full text-[11px] font-semibold transition-colors ${
+                    mascotMode === 'drag'
+                      ? 'bg-emerald-400 text-black'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <Move className="w-3 h-3" strokeWidth={2.5} />
+                  {t('mini.mascotDrag')}
+                </button>
+              </div>
               {/* Move-mode toggle has been retired on Windows now that the
                   collapsed mascot supports direct drag-to-move. macOS never
                   showed it (it has its own native drag path), and pet mode

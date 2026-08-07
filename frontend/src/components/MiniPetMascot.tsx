@@ -137,11 +137,8 @@ export function MiniPetMascot({
       className={className}
       onMouseEnter={enableHoverJump && !useExternalHover ? onEnter : undefined}
       onMouseLeave={enableHoverJump && !useExternalHover ? onLeave : undefined}
-      style={{ display: 'inline-block', lineHeight: 0, position: 'relative', ...style }}
+      style={{ display: 'inline-block', lineHeight: 0, position: 'relative', overflow: 'visible', ...style }}
     >
-      {statusLabel ? (
-        <PetStatusBubble label={statusLabel} tone={statusTone} title={statusTitle} />
-      ) : null}
       <PetAvatar
         key={avatarKey}
         pet={pet}
@@ -149,6 +146,9 @@ export function MiniPetMascot({
         size={size}
         onOneShotEnd={handleJumpEnd}
       />
+      {statusLabel ? (
+        <PetStatusBubble label={statusLabel} tone={statusTone} title={statusTitle} />
+      ) : null}
     </div>
   )
 }

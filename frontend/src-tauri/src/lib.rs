@@ -49,9 +49,11 @@ static PET_PASSTHROUGH_THREAD_ALIVE: AtomicBool = AtomicBool::new(false);
 /// Coding-mode mascot "lock": clicks pass through except the top notch control.
 static CODING_LOCK_PASSTHROUGH_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CODING_LOCK_PASSTHROUGH_THREAD_ALIVE: AtomicBool = AtomicBool::new(false);
-/// Notch hitbox (logical CSS px) — keep in sync with Mini.tsx mascot mode pill.
-const CODING_LOCK_NOTCH_W: f64 = 152.0;
-const CODING_LOCK_NOTCH_H: f64 = 30.0;
+/// When true, macOS efficiency_hover_poll must not start a mascot drag.
+static CODING_MASCOT_LOCKED: AtomicBool = AtomicBool::new(false);
+/// Notch hitbox (logical CSS px) — keep in sync with Mini.tsx expand strip.
+const CODING_LOCK_NOTCH_W: f64 = 120.0;
+const CODING_LOCK_NOTCH_H: f64 = 28.0;
 /// Whether the pet-mode context menu is currently open. When true the poll
 /// thread disables ignoresMouseEvents so the entire expanded window accepts
 /// clicks (for the menu buttons). When false, only the mascot area accepts
@@ -4270,6 +4272,8 @@ fn efficiency_hover_poll(app: tauri::AppHandle) {
                         let _ = app.emit("mini-mascot-drag-end", ());
                     }
                 } else if over_mascot && left_pressed && !was_pressed {
+                    // Locked coding mascot: never start a native drag.
+                    if !CODING_MASCOT_LOCKED.load(Ordering::SeqCst) {
                     drag_active = true;
                     last_cursor = cursor;
                     // Capture the cursor-to-origin offset at drag start so
@@ -4286,6 +4290,7 @@ fn efficiency_hover_poll(app: tauri::AppHandle) {
                     if was_over_mascot {
                         let _ = app.emit("mini-mascot-hover", false);
                         was_over_mascot = false;
+                    }
                     }
                 }
             } else if drag_active {
@@ -5825,6 +5830,7 @@ fn pet_passthrough_poll(app: tauri::AppHandle, mascot_scale: f64, large_mascot_s
 #[tauri::command]
 async fn set_mascot_lock_passthrough(app: tauri::AppHandle, active: bool) -> Result<(), String> {
     CODING_LOCK_PASSTHROUGH_ACTIVE.store(active, Ordering::SeqCst);
+    CODING_MASCOT_LOCKED.store(active, Ordering::SeqCst);
     if active {
         // Don't fight pet-mode passthrough.
         if PET_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst) {

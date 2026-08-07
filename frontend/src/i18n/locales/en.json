@@ -66,6 +66,7 @@
     "showMore": "Show {{count}} more",
     "collapse": "Collapse",
     "idle": "idle",
+    "idleBusy": "idle",
     "waiting": "waiting...",
     "thinking": "thinking...",
     "working": "working...",

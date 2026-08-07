@@ -66,6 +66,7 @@
     "showMore": "展开其余 {{count}} 个会话",
     "collapse": "收起列表",
     "idle": "空闲",
+    "idleBusy": "空闲中",
     "waiting": "等待中...",
     "thinking": "思考中...",
     "working": "工作中...",

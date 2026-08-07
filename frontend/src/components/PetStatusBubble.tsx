@@ -37,26 +37,27 @@ export function PetStatusBubble({
       <div
         style={{
           position: 'absolute',
-          // Keep inside the mascot window so the OS webview does not clip it.
-          top: 2,
+          // Sit over the head area; must paint ABOVE the Live2D/sprite canvas.
+          top: 18,
           left: '50%',
           transform: 'translateX(-50%)',
-          zIndex: 20,
+          zIndex: 40,
           pointerEvents: 'none',
-          maxWidth: 'min(220px, 96%)',
-          padding: '3px 9px',
+          maxWidth: 'min(240px, 98%)',
+          padding: '4px 10px',
           borderRadius: 999,
           background: style.bg,
           color: style.color,
-          fontSize: 11,
-          fontWeight: 700,
+          fontSize: 12,
+          fontWeight: 800,
+          letterSpacing: '0.02em',
           lineHeight: 1.25,
           whiteSpace: 'nowrap',
           overflow: 'hidden',
           textOverflow: 'ellipsis',
-          boxShadow: '0 2px 8px rgba(0,0,0,0.28)',
+          boxShadow: '0 3px 12px rgba(0,0,0,0.45)',
           animation: style.pulse ? 'ocPetStatusPulse 1.2s ease-in-out infinite' : undefined,
-          border: '1px solid rgba(255,255,255,0.18)',
+          border: '1px solid rgba(255,255,255,0.28)',
         }}
         title={title || label}
       >
