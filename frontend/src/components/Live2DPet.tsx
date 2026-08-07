@@ -463,13 +463,20 @@ async function runMotionLoop(
   if (token !== loopTokenRef.current) return
 
   if (!started) {
-    // Fallback: if motion group is missing, still show expression transition.
-    if (binding.expression) {
+    // Fallback: if motion group is missing/fails, still show expression transition.
+    const fallbackExpr =
+      binding.expression ||
+      (state === 'waiting'
+        ? pet.availableExpressions?.[2] || pet.availableExpressions?.[0]
+        : state === 'running' || state === 'run-left' || state === 'run-right'
+          ? pet.availableExpressions?.[1] || pet.availableExpressions?.[0]
+          : undefined)
+    if (fallbackExpr) {
       await runExpressionOnlyHold(
         model,
         pet,
         state,
-        binding,
+        { ...binding, expression: fallbackExpr, loop: binding.loop ?? true },
         forced,
         token,
         loopTokenRef,

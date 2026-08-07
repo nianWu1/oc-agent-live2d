@@ -250,7 +250,16 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
         if (s === 'waiting' || s === 'awaiting' || k.startsWith('confirm')) {
           setWaiting(true)
           setWorking(false)
-        } else if (s === 'working' || s === 'compacting') {
+        } else if (
+          s === 'working' ||
+          s === 'compacting' ||
+          s === 'running' ||
+          s === 'busy' ||
+          s === 'active' ||
+          k === 'working' ||
+          k === 'tool' ||
+          k === 'thinking'
+        ) {
           setWaiting(false)
           setWorking(true)
         } else {
@@ -291,25 +300,28 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
       tone?: string
       title?: string | null
     }>('mini-pet-state', (ev) => {
-      const s = ev.payload?.state
+      const s = (ev.payload?.state || '').toLowerCase()
+      let nextWaiting = false
+      let nextWorking = false
       if (s === 'waiting') {
-        setWaiting(true)
-        setWorking(false)
+        nextWaiting = true
       } else if (s === 'working' || s === 'compacting') {
-        setWaiting(false)
-        setWorking(true)
-      } else {
-        setWaiting(false)
-        setWorking(false)
+        nextWorking = true
       }
-      const label = ev.payload?.label
-      if (typeof label === 'string' && label.trim()) {
-        setRemoteBubble({
-          label,
-          tone: isPetStatusTone(ev.payload?.tone) ? ev.payload.tone : 'idle',
-          title: typeof ev.payload?.title === 'string' ? ev.payload.title : undefined,
-        })
-      }
+      setWaiting(nextWaiting)
+      setWorking(nextWorking)
+
+      // Always refresh bubble from this event so a stale "空闲中" label cannot
+      // stick after state flips to working (label may be briefly missing).
+      const label = typeof ev.payload?.label === 'string' ? ev.payload.label.trim() : ''
+      const toneFromPayload = isPetStatusTone(ev.payload?.tone) ? ev.payload.tone : null
+      const tone: PetStatusTone = toneFromPayload
+        ?? (nextWaiting ? 'waiting' : nextWorking ? 'working' : 'idle')
+      setRemoteBubble({
+        label: label || (nextWaiting ? 'waiting' : nextWorking ? 'working' : 'idle'),
+        tone,
+        title: typeof ev.payload?.title === 'string' ? ev.payload.title : undefined,
+      })
     })
     return () => {
       unlisten.then((fn) => fn())
@@ -474,8 +486,9 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
   })()
 
   const statusBubble = useMemo(() => {
-    // Independent statusUrl pets: derive bubble from their own bridge.
-    if (statusUrlFromUrl) {
+    // Local working/waiting flags are the source of truth for phase; remote
+    // labels only enrich text when they match that phase (avoids sticky 空闲中).
+    if (waiting) {
       if (confirmLabel) {
         return {
           label: confirmLabel,
@@ -483,28 +496,30 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
           title: statusDetail || confirmLabel,
         }
       }
-      if (waiting) {
-        return {
-          label: t('mini.statusWaitingTool'),
-          tone: 'waiting' as PetStatusTone,
-          title: statusDetail || undefined,
-        }
+      if (remoteBubble?.tone === 'waiting' && remoteBubble.label && remoteBubble.label !== 'waiting') {
+        return { ...remoteBubble, title: remoteBubble.title || statusDetail || undefined }
       }
-      if (working) {
-        return { label: t('mini.working'), tone: 'working' as PetStatusTone }
+      return {
+        label: t('mini.statusWaitingTool'),
+        tone: 'waiting' as PetStatusTone,
+        title: statusDetail || undefined,
       }
-      return { label: t('mini.idleBusy'), tone: 'idle' as PetStatusTone }
-    }
-    // Mirror pets: prefer the rich label broadcast from the primary mini.
-    if (remoteBubble) return remoteBubble
-    if (waiting) {
-      return { label: t('mini.statusWaitingTool'), tone: 'waiting' as PetStatusTone }
     }
     if (working) {
+      if (
+        remoteBubble &&
+        remoteBubble.tone !== 'idle' &&
+        remoteBubble.tone !== 'waiting' &&
+        remoteBubble.label &&
+        remoteBubble.label !== 'working' &&
+        remoteBubble.label !== 'idle'
+      ) {
+        return remoteBubble
+      }
       return { label: t('mini.working'), tone: 'working' as PetStatusTone }
     }
     return { label: t('mini.idleBusy'), tone: 'idle' as PetStatusTone }
-  }, [statusUrlFromUrl, confirmLabel, waiting, working, statusDetail, remoteBubble, t])
+  }, [confirmLabel, waiting, working, statusDetail, remoteBubble, t])
 
   if (!pet) return null
 

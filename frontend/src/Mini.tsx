@@ -547,6 +547,10 @@ export default function Mini() {
   const [enableClaudeDesktop, setEnableClaudeDesktop] = useState(true)
   const [enableCodex, setEnableCodex] = useState(true)
   const [enableCursor, setEnableCursor] = useState(true)
+  // Cursor status-bridge snapshot (notify server GET /status). Complements
+  // oc-claw Cursor hooks so the primary mascot still moves when only the
+  // bridge is wired (common with multi-machine / tunnel setups).
+  const [bridgePetState, setBridgePetState] = useState<'idle' | 'working' | 'waiting'>('idle')
   const [enableGemini, setEnableGemini] = useState(true)
   const [enableOpencode, setEnableOpencode] = useState(true)
   const [hermesConns, setHermesConns] = useState<{ id: string; type: 'local' | 'remote'; host?: string; user?: string }[]>([])
@@ -2004,6 +2008,99 @@ export default function Mini() {
     }
   }, [fetchAgents, pollHealth, appMode])
 
+  // Poll Cursor notify-bridge /status so primary mascot animation + bubble
+  // track agent work even when oc-claw Cursor hooks are quiet.
+  // Architecture: Cursor machine runs cursor-notify-bridge (often :18765);
+  // the pet machine polls the *local* tunnel port (often Mac :9999 → Windows
+  // :18765). Never assume the pet can reach 18765 directly.
+  useEffect(() => {
+    if (appMode !== 'coding' || !enableCursor) {
+      setBridgePetState('idle')
+      return
+    }
+    let cancelled = false
+    const collectUrls = async (): Promise<string[]> => {
+      const urls = new Set<string>()
+      try {
+        const store = await load('settings.json', { defaults: {}, autoSave: false })
+        const configured = await store.get('cursor_status_url')
+        if (typeof configured === 'string' && configured.trim()) {
+          urls.add(configured.trim())
+        }
+      } catch {
+        /* ignore */
+      }
+      try {
+        const extras = await loadExtraMascots()
+        for (const cfg of extras) {
+          const u = cfg.statusUrl?.trim()
+          if (u) urls.add(u)
+        }
+      } catch {
+        /* ignore */
+      }
+      // No explicit URL: use the local tunnel endpoint the pet can actually reach.
+      // Mac/Linux pet → 9999 (typical UU/SSH map of Windows :18765).
+      // Windows pet on the same box as Cursor → 18765 directly.
+      if (urls.size === 0) {
+        urls.add(
+          isWindowsPlatform
+            ? 'http://127.0.0.1:18765/status'
+            : 'http://127.0.0.1:9999/status',
+        )
+      }
+      return Array.from(urls)
+    }
+    const pollBridge = async () => {
+      const urls = await collectUrls()
+      if (cancelled || urls.length === 0) {
+        if (!cancelled) setBridgePetState('idle')
+        return
+      }
+      let waiting = false
+      let working = false
+      await Promise.all(
+        urls.map(async (url) => {
+          try {
+            const text = (await invoke('proxy_get', { url })) as string
+            if (cancelled) return
+            const data = JSON.parse(text) as {
+              state?: string
+              status?: string
+              kind?: string
+            }
+            const s = (data.state || data.status || '').toLowerCase()
+            const k = (data.kind || '').toLowerCase()
+            if (s === 'waiting' || s === 'awaiting' || k.startsWith('confirm')) {
+              waiting = true
+            } else if (
+              s === 'working' ||
+              s === 'compacting' ||
+              s === 'running' ||
+              s === 'busy' ||
+              s === 'active' ||
+              k === 'working' ||
+              k === 'tool' ||
+              k === 'thinking'
+            ) {
+              working = true
+            }
+          } catch {
+            /* bridge/tunnel offline — ignore this URL */
+          }
+        }),
+      )
+      if (cancelled) return
+      setBridgePetState(waiting ? 'waiting' : working ? 'working' : 'idle')
+    }
+    void pollBridge()
+    const id = window.setInterval(pollBridge, 2000)
+    return () => {
+      cancelled = true
+      window.clearInterval(id)
+    }
+  }, [appMode, enableCursor, isWindowsPlatform])
+
   // Update allSessions active states from pollHealth session data
   const syncSessionActiveStates = useCallback(() => {
     const sMap = prevSessionHealthRef.current
@@ -2577,7 +2674,10 @@ export default function Mini() {
   const claudeSlots: SessionSlot[] = visibleClaudeSessions.map((cs, i) => {
     const isWaiting = cs.status === 'waiting'
     const isCompacting = cs.status === 'compacting'
-    const isActive = cs.status === 'processing' || cs.status === 'tool_running'
+    const isActive =
+      cs.status === 'processing' ||
+      cs.status === 'tool_running' ||
+      cs.status === 'running'
     const qName = charQueue[i % charQueue.length]
     const char = characters.find((c) => c.name === qName) || DEFAULT_CHAR
     const petState: PetState = isWaiting ? 'waiting' : isCompacting ? 'compacting' : isActive ? 'working' : 'idle'
@@ -3138,10 +3238,31 @@ export default function Mini() {
       // sprite via updateWalkDir so the pet visibly runs while moving.
       if (!moveModeRef.current && appModeRef.current !== 'pet') {
         if (e.button !== 0 || e.ctrlKey || collapsingRef.current) return
-        // Lock mode: body clicks pass through natively; if we still get an
-        // event (race), ignore drag/expand so apps underneath stay usable.
+        // Lock mode: position fixed (no drag). Click still opens the panel
+        // so we don't need a separate expand chrome on the pet.
         if (mascotModeRef.current === 'lock') {
+          if (e.button !== 0 || e.ctrlKey) return
           e.preventDefault()
+          cancelFocusExpand()
+          if (isWindowsPlatform) {
+            const pid = e.pointerId
+            const onUp = (ev: PointerEvent) => {
+              if (ev.pointerId !== pid) return
+              window.removeEventListener('pointerup', onUp)
+              window.removeEventListener('pointercancel', onCancel)
+              if (mascotModeRef.current !== 'lock' || collapsingRef.current) return
+              hoverExpandedRef.current = false
+              setCompletionSessionId(null)
+              expand()
+            }
+            const onCancel = (ev: PointerEvent) => {
+              if (ev.pointerId !== pid) return
+              window.removeEventListener('pointerup', onUp)
+              window.removeEventListener('pointercancel', onCancel)
+            }
+            window.addEventListener('pointerup', onUp, { once: true })
+            window.addEventListener('pointercancel', onCancel, { once: true })
+          }
           return
         }
         // On macOS the cursor poll in lib.rs (efficiency_hover_poll) drives
@@ -3648,8 +3769,8 @@ export default function Mini() {
     }
   }, [viewMode, moveMode, updateModalOpen, settingsMode, settingsTransitioning, appMode])
 
-  // Coding lock: pass clicks through the mascot body; keep only the top
-  // notch interactive so the user can switch back to drag / expand.
+  // Coding lock: satellite pets pass clicks through; primary stays clickable
+  // (no drag) so the panel can reopen without an expand chrome on the pet.
   useEffect(() => {
     const wantLock =
       appMode !== 'pet' &&
@@ -4100,43 +4221,62 @@ export default function Mini() {
 
   const claudeWaiting = visibleClaudeSessions.some((cs) => cs.status === 'waiting')
   const claudeCompacting = visibleClaudeSessions.some((cs) => cs.status === 'compacting')
-  const claudeWorking = visibleClaudeSessions.some((cs) => cs.status === 'processing' || cs.status === 'tool_running')
-  const hasWorking = anySessionActive || Object.values(healthMap).some(Boolean) || claudeWorking || claudeCompacting || claudeWaiting
+  const claudeWorking = visibleClaudeSessions.some(
+    (cs) => cs.status === 'processing' || cs.status === 'tool_running' || cs.status === 'running',
+  )
+  const bridgeWaiting = bridgePetState === 'waiting'
+  const bridgeWorking = bridgePetState === 'working'
+  const hasWorking =
+    anySessionActive ||
+    Object.values(healthMap).some(Boolean) ||
+    claudeWorking ||
+    claudeCompacting ||
+    claudeWaiting ||
+    bridgeWorking ||
+    bridgeWaiting
   // Priority: waiting > compacting > working > idle
-  const mainPetState: PetState = claudeWaiting ? 'waiting' : claudeCompacting ? 'compacting' : hasWorking ? 'working' : 'idle'
+  const mainPetState: PetState =
+    claudeWaiting || bridgeWaiting
+      ? 'waiting'
+      : claudeCompacting
+        ? 'compacting'
+        : hasWorking
+          ? 'working'
+          : 'idle'
   // Richer label for the head status bubble (tool / thinking / confirm, etc.).
+  // Driven by mainPetState so the bubble cannot disagree with the sprite phase.
   const petStatusBubble = useMemo(() => {
-    const waitingCs = visibleClaudeSessions.find((cs) => cs.status === 'waiting')
-    if (waitingCs) {
+    if (mainPetState === 'waiting') {
+      const waitingCs = visibleClaudeSessions.find((cs) => cs.status === 'waiting')
       const base = t('mini.statusWaitingTool')
-      const label = waitingCs.tool ? `${base} · ${waitingCs.tool}` : base
+      const label = waitingCs?.tool ? `${base} · ${waitingCs.tool}` : base
       return {
         label,
         tone: 'waiting' as PetStatusTone,
-        title: waitingCs.tool || waitingCs.userPrompt || label,
+        title: waitingCs?.tool || waitingCs?.userPrompt || label,
       }
     }
-    if (claudeCompacting) {
+    if (mainPetState === 'compacting') {
       return { label: t('mini.compacting'), tone: 'compacting' as PetStatusTone }
     }
-    const toolCs = visibleClaudeSessions.find((cs) => cs.status === 'tool_running')
-    if (toolCs) {
-      const base = t('mini.statusToolRunning')
-      const label = toolCs.tool ? `${base} · ${toolCs.tool}` : base
-      return {
-        label,
-        tone: 'tool' as PetStatusTone,
-        title: toolCs.tool || label,
+    if (mainPetState === 'working') {
+      const toolCs = visibleClaudeSessions.find((cs) => cs.status === 'tool_running')
+      if (toolCs) {
+        const base = t('mini.statusToolRunning')
+        const label = toolCs.tool ? `${base} · ${toolCs.tool}` : base
+        return {
+          label,
+          tone: 'tool' as PetStatusTone,
+          title: toolCs.tool || label,
+        }
       }
-    }
-    if (visibleClaudeSessions.some((cs) => cs.status === 'processing')) {
-      return { label: t('mini.thinking'), tone: 'thinking' as PetStatusTone }
-    }
-    if (hasWorking) {
+      if (visibleClaudeSessions.some((cs) => cs.status === 'processing')) {
+        return { label: t('mini.thinking'), tone: 'thinking' as PetStatusTone }
+      }
       return { label: t('mini.working'), tone: 'working' as PetStatusTone }
     }
     return { label: t('mini.idleBusy'), tone: 'idle' as PetStatusTone }
-  }, [visibleClaudeSessions, claudeCompacting, hasWorking, t])
+  }, [mainPetState, visibleClaudeSessions, t])
   // Sprite resting state for the main mascot. Walking direction (set by
   // the walk timer) overrides the working/waiting/idle mapping so the pet
   // visibly runs left/right while the native window is moving.
@@ -4181,10 +4321,10 @@ export default function Mini() {
       tone: bubble.tone,
       title: bubble.title ?? null,
     }).catch(() => {})
-  }, [mainPetState, petStatusBubble, appMode])
+  }, [mainPetState, petStatusBubble.label, petStatusBubble.tone, petStatusBubble.title, appMode])
   useEffect(() => {
     if (appMode !== 'coding') return
-    const t = setInterval(() => {
+    const id = setInterval(() => {
       const bubble = petStatusBubbleRef.current
       emit('mini-pet-state', {
         state: mainPetStateRef.current,
@@ -4194,7 +4334,7 @@ export default function Mini() {
       }).catch(() => {})
       emit('mascot-interaction-mode', { mode: mascotModeRef.current }).catch(() => {})
     }, 2000)
-    return () => clearInterval(t)
+    return () => clearInterval(id)
   }, [appMode])
 
   const fallbackLargeActions = useMemo(() => {
@@ -4532,45 +4672,6 @@ export default function Mini() {
             overflow: 'visible',
           }}
         >
-          {/* Lock mode: tiny top strip stays hittable so user can reopen panel
-              (body clicks pass through). No mode UI here — mode lives in panel. */}
-          {appMode !== 'pet' && mascotMode === 'lock' && (
-            <div
-              data-no-drag
-              data-mascot-expand-strip="1"
-              onPointerDown={(e) => {
-                e.stopPropagation()
-                e.preventDefault()
-                hoverExpandedRef.current = false
-                setCompletionSessionId(null)
-                expand()
-              }}
-              title={t('mini.expand')}
-              style={{
-                position: 'absolute',
-                top: 0,
-                left: '50%',
-                transform: 'translateX(-50%)',
-                zIndex: 60,
-                width: 120,
-                height: 28,
-                borderRadius: '0 0 10px 10px',
-                background: 'rgba(0,0,0,0.55)',
-                border: '1px solid rgba(255,255,255,0.12)',
-                borderTop: 'none',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                color: 'rgba(255,255,255,0.75)',
-                fontSize: 10,
-                fontWeight: 700,
-                pointerEvents: 'auto',
-                cursor: 'pointer',
-              }}
-            >
-              <ChevronDown className="w-3.5 h-3.5" strokeWidth={2.5} />
-            </div>
-          )}
           <div
             onPointerDown={handleMascotPointerDown}
             onContextMenu={handleMascotContextMenu}

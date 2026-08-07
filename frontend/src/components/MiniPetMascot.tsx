@@ -147,7 +147,12 @@ export function MiniPetMascot({
         onOneShotEnd={handleJumpEnd}
       />
       {statusLabel ? (
-        <PetStatusBubble label={statusLabel} tone={statusTone} title={statusTitle} />
+        <PetStatusBubble
+          key={`${statusTone ?? 'idle'}:${statusLabel}`}
+          label={statusLabel}
+          tone={statusTone}
+          title={statusTitle}
+        />
       ) : null}
     </div>
   )

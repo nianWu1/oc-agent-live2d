@@ -46,14 +46,10 @@ static PET_ALPHA_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 static PET_PASSTHROUGH_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Whether the pet-mode click-through poll thread is alive.
 static PET_PASSTHROUGH_THREAD_ALIVE: AtomicBool = AtomicBool::new(false);
-/// Coding-mode mascot "lock": clicks pass through except the top notch control.
-static CODING_LOCK_PASSTHROUGH_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Coding-mode mascot lock: satellites pass clicks through; primary stays hittable.
 static CODING_LOCK_PASSTHROUGH_THREAD_ALIVE: AtomicBool = AtomicBool::new(false);
 /// When true, macOS efficiency_hover_poll must not start a mascot drag.
 static CODING_MASCOT_LOCKED: AtomicBool = AtomicBool::new(false);
-/// Notch hitbox (logical CSS px) — keep in sync with Mini.tsx expand strip.
-const CODING_LOCK_NOTCH_W: f64 = 120.0;
-const CODING_LOCK_NOTCH_H: f64 = 28.0;
 /// Whether the pet-mode context menu is currently open. When true the poll
 /// thread disables ignoresMouseEvents so the entire expanded window accepts
 /// clicks (for the menu buttons). When false, only the mascot area accepts
@@ -5864,26 +5860,23 @@ fn set_satellite_mascots_ignore_cursor(app: &tauri::AppHandle, ignore: bool) {
     }
 }
 
-/// Enable/disable coding-mode lock passthrough. While active, the mini window
-/// ignores cursor events except over the top-center notch (mode switcher),
-/// so clicks on the mascot body reach apps underneath.
+/// Enable/disable coding-mode lock. Primary mini stays clickable (click opens
+/// panel; FE blocks drag). Extra/demo satellite windows ignore cursor so they
+/// don't cover the desktop while locked.
 #[tauri::command]
 async fn set_mascot_lock_passthrough(app: tauri::AppHandle, active: bool) -> Result<(), String> {
-    CODING_LOCK_PASSTHROUGH_ACTIVE.store(active, Ordering::SeqCst);
     CODING_MASCOT_LOCKED.store(active, Ordering::SeqCst);
-    // All satellite pets follow the same lock mode immediately.
     set_satellite_mascots_ignore_cursor(&app, active);
+
     if active {
-        // Don't fight pet-mode passthrough.
-        if PET_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst) {
-            return Ok(());
-        }
         if !CODING_LOCK_PASSTHROUGH_THREAD_ALIVE.load(Ordering::SeqCst) {
             let app2 = app.clone();
             std::thread::spawn(move || coding_lock_passthrough_poll(app2));
         }
-    } else if !PET_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst) {
-        // Restore hit-testing immediately when leaving lock mode.
+    }
+
+    // Primary mini must always receive clicks in coding lock mode.
+    if !PET_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst) {
         #[cfg(target_os = "windows")]
         if let Some(win) = app.get_webview_window("mini") {
             let _ = win.set_ignore_cursor_events(false);
@@ -5893,6 +5886,7 @@ async fn set_mascot_lock_passthrough(app: tauri::AppHandle, active: bool) -> Res
             let win = app.get_webview_window("mini");
             let _ = app.run_on_main_thread(move || {
                 if let Some(win) = win {
+                    let _ = win.set_ignore_cursor_events(false);
                     if let Ok(ns_win) = win.ns_window() {
                         use objc2::msg_send;
                         let obj = unsafe { &*(ns_win as *mut objc2::runtime::AnyObject) };
@@ -5907,148 +5901,16 @@ async fn set_mascot_lock_passthrough(app: tauri::AppHandle, active: bool) -> Res
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
-fn coding_lock_passthrough_poll(app: tauri::AppHandle) {
-    use std::time::Duration;
-    use windows::Win32::Foundation::POINT;
-    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
-
-    CODING_LOCK_PASSTHROUGH_THREAD_ALIVE.store(true, Ordering::SeqCst);
-    let mut last_state: Option<bool> = None;
-    let mut satellite_tick: u32 = 0;
-
-    while CODING_LOCK_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst) {
-        if PET_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(50));
-            continue;
-        }
-        satellite_tick = satellite_tick.wrapping_add(1);
-        // ~1s: keep newly spawned extra/demo pets locked.
-        if satellite_tick % 50 == 0 {
-            set_satellite_mascots_ignore_cursor(&app, true);
-        }
-        let should_be_interactive = {
-            let cursor = unsafe {
-                let mut pt = POINT::default();
-                if GetCursorPos(&mut pt).is_ok() {
-                    Some((pt.x as f64, pt.y as f64))
-                } else {
-                    None
-                }
-            };
-            match (app.get_webview_window("mini"), cursor) {
-                (Some(win), Some((cx, cy))) => {
-                    let pos = win.outer_position().ok();
-                    let size = win.outer_size().ok();
-                    let scale = win.scale_factor().unwrap_or(1.0);
-                    if let (Some(pos), Some(size)) = (pos, size) {
-                        let fx = pos.x as f64;
-                        let fy = pos.y as f64;
-                        let fw = size.width as f64;
-                        let notch_w = CODING_LOCK_NOTCH_W * scale;
-                        let notch_h = CODING_LOCK_NOTCH_H * scale;
-                        let left = fx + (fw - notch_w) * 0.5;
-                        let right = left + notch_w;
-                        let top = fy;
-                        let bottom = fy + notch_h;
-                        cx >= left && cx <= right && cy >= top && cy <= bottom
-                    } else {
-                        false
-                    }
-                }
-                _ => false,
-            }
-        };
-        if last_state != Some(should_be_interactive) {
-            if let Some(win) = app.get_webview_window("mini") {
-                let _ = win.set_ignore_cursor_events(!should_be_interactive);
-            }
-            last_state = Some(should_be_interactive);
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-
-    if !PET_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst) {
-        if let Some(win) = app.get_webview_window("mini") {
-            let _ = win.set_ignore_cursor_events(false);
-        }
-        set_satellite_mascots_ignore_cursor(&app, false);
-    }
-    CODING_LOCK_PASSTHROUGH_THREAD_ALIVE.store(false, Ordering::SeqCst);
-}
-
-#[cfg(target_os = "macos")]
+/// While lock is active, periodically re-apply satellite click-through so
+/// newly spawned extra/demo pets inherit lock without a mini notch UI.
 fn coding_lock_passthrough_poll(app: tauri::AppHandle) {
     use std::time::Duration;
     CODING_LOCK_PASSTHROUGH_THREAD_ALIVE.store(true, Ordering::SeqCst);
-    let mut was_interactive = true;
-    let mut satellite_tick: u32 = 0;
-
-    while CODING_LOCK_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst) {
-        if PET_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(50));
-            continue;
-        }
-        satellite_tick = satellite_tick.wrapping_add(1);
-        if satellite_tick % 50 == 0 {
-            set_satellite_mascots_ignore_cursor(&app, true);
-        }
-        let frame = MINI_WINDOW_FRAME.lock().ok().and_then(|g| *g);
-        let should_be_interactive = if let Some((fx, fy, fw, fh)) = frame {
-            let cursor = macos_cursor_position();
-            let notch_w = CODING_LOCK_NOTCH_W.min(fw);
-            let notch_h = CODING_LOCK_NOTCH_H.min(fh);
-            let left = fx + (fw - notch_w) * 0.5;
-            let right = left + notch_w;
-            // macOS bottom-left origin: top of window is fy + fh
-            let top = fy + fh;
-            let bottom = top - notch_h;
-            cursor.0 >= left && cursor.0 <= right && cursor.1 >= bottom && cursor.1 <= top
-        } else {
-            false
-        };
-
-        if should_be_interactive != was_interactive {
-            let app1 = app.clone();
-            let app2 = app.clone();
-            let val = should_be_interactive;
-            let _ = app1.run_on_main_thread(move || {
-                if let Some(win) = app2.get_webview_window("mini") {
-                    if let Ok(ns_win) = win.ns_window() {
-                        use objc2::msg_send;
-                        let obj = unsafe { &*(ns_win as *mut objc2::runtime::AnyObject) };
-                        unsafe {
-                            let _: () = msg_send![obj, setIgnoresMouseEvents: !val];
-                        }
-                    }
-                }
-            });
-            was_interactive = should_be_interactive;
-        }
-        std::thread::sleep(Duration::from_millis(20));
+    while CODING_MASCOT_LOCKED.load(Ordering::SeqCst) {
+        set_satellite_mascots_ignore_cursor(&app, true);
+        std::thread::sleep(Duration::from_millis(1000));
     }
-
-    if !PET_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst) {
-        let app1 = app.clone();
-        let app2 = app.clone();
-        let _ = app1.run_on_main_thread(move || {
-            if let Some(win) = app2.get_webview_window("mini") {
-                if let Ok(ns_win) = win.ns_window() {
-                    use objc2::msg_send;
-                    let obj = unsafe { &*(ns_win as *mut objc2::runtime::AnyObject) };
-                    unsafe {
-                        let _: () = msg_send![obj, setIgnoresMouseEvents: false];
-                    }
-                }
-            }
-        });
-        set_satellite_mascots_ignore_cursor(&app, false);
-    }
-    CODING_LOCK_PASSTHROUGH_THREAD_ALIVE.store(false, Ordering::SeqCst);
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
-fn coding_lock_passthrough_poll(_app: tauri::AppHandle) {
+    set_satellite_mascots_ignore_cursor(&app, false);
     CODING_LOCK_PASSTHROUGH_THREAD_ALIVE.store(false, Ordering::SeqCst);
 }
 
