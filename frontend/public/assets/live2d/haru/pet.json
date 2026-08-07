@@ -5,10 +5,17 @@
   "kind": "live2d",
   "modelPath": "haru_greeter_t03.model3.json",
   "previewPath": "haru_greeter_t03.2048/texture_00.png",
-  "motionGroups": {
-    "idle": "Idle",
-    "working": "Tap",
-    "waiting": "Idle",
-    "jumping": "Tap"
+  "availableMotions": {
+    "Idle": ["motion/haru_g_idle.motion3.json", "motion/haru_g_m07.motion3.json", "motion/haru_g_m15.motion3.json"],
+    "Tap": ["motion/haru_g_m14.motion3.json", "motion/haru_g_m05.motion3.json"]
+  },
+  "availableExpressions": ["f00", "f01", "f02", "f03", "f04", "f05", "f06", "f07"],
+  "motionMap": {
+    "idle": { "group": "Idle", "index": 0 },
+    "working": { "group": "Tap", "loop": true },
+    "waiting": { "group": "Idle", "index": 1, "expression": "f03" },
+    "jumping": { "group": "Tap", "index": 0 },
+    "run-left": { "group": "Tap", "index": 1, "loop": true },
+    "run-right": { "group": "Tap", "index": 1, "loop": true }
   }
 }

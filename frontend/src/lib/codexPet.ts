@@ -16,6 +16,28 @@ export type CodexPetState =
 
 export type PetKind = 'sprite' | 'live2d'
 
+/** One oc-claw pet state → Live2D motion/expression binding. */
+export interface Live2DMotionBinding {
+  /** Cubism motion group name ("" is valid for some models like Mao). */
+  group: string
+  /** Optional index within the group; omit / null = random. */
+  index?: number | null
+  /** Keep replaying while the oc-claw state remains active. */
+  loop?: boolean
+  /** Optional expression name from model3.json Expressions. */
+  expression?: string | null
+}
+
+/**
+ * Map oc-claw animation states to a model's real Cubism motions.
+ * Keys are CodexPetState names used by Mini/DemoMascot, plus the friendly
+ * alias `working` (treated as `running`).
+ */
+export type Live2DMotionMap = Partial<
+  Record<CodexPetState | 'working', Live2DMotionBinding>
+>
+
+/** @deprecated Prefer motionMap; kept for older pet.json files. */
 export interface Live2DMotionGroups {
   idle?: string
   working?: string
@@ -33,11 +55,68 @@ export interface CodexPet {
   kind?: PetKind
   // Absolute URL to `.model3.json` when kind === 'live2d'.
   modelUrl?: string
+  /** Preferred: explicit oc-claw state → Cubism motion/expression map. */
+  motionMap?: Live2DMotionMap
+  /** Legacy group-name-only map. */
   motionGroups?: Live2DMotionGroups
+  /** Declared for editors / docs; not required at runtime. */
+  availableMotions?: Record<string, string[]>
+  availableExpressions?: string[]
 }
 
 export function isLive2DPet(pet: CodexPet | null | undefined): boolean {
   return !!pet && pet.kind === 'live2d' && !!pet.modelUrl
+}
+
+/** Resolve the Live2D binding for a given oc-claw sprite state. */
+export function resolveLive2DMotion(
+  pet: CodexPet,
+  state: CodexPetState,
+): Live2DMotionBinding {
+  const map = pet.motionMap
+  const direct = map?.[state]
+  const aliased =
+    direct ??
+    (state === 'running' ? map?.working : undefined) ??
+    ((state === 'run-left' || state === 'run-right')
+      ? map?.[state] ?? map?.working
+      : undefined) ??
+    (state === 'review' || state === 'failed' ? map?.waiting ?? map?.idle : undefined)
+
+  if (aliased && typeof aliased.group === 'string') {
+    return {
+      group: aliased.group,
+      index: aliased.index,
+      loop:
+        aliased.loop ??
+        (state === 'running' || state === 'run-left' || state === 'run-right'),
+      expression: aliased.expression,
+    }
+  }
+
+  // Legacy motionGroups → synthetic binding.
+  const g = pet.motionGroups
+  const legacyGroup = (() => {
+    switch (state) {
+      case 'waiting':
+        return g?.waiting ?? 'Idle'
+      case 'running':
+      case 'run-left':
+      case 'run-right':
+        return g?.working ?? 'Tap'
+      case 'jumping':
+      case 'waving':
+        return g?.jumping ?? g?.working ?? 'Tap'
+      default:
+        return g?.idle ?? 'Idle'
+    }
+  })()
+  const loop =
+    state === 'running' ||
+    state === 'run-left' ||
+    state === 'run-right' ||
+    state === 'waiting'
+  return { group: legacyGroup, loop }
 }
 
 export const ATLAS = {
@@ -156,6 +235,9 @@ interface RawLive2DPetMeta {
   modelPath: string
   previewPath?: string
   motionGroups?: Live2DMotionGroups
+  motionMap?: Live2DMotionMap
+  availableMotions?: Record<string, string[]>
+  availableExpressions?: string[]
 }
 
 interface PetsManifest {
@@ -216,6 +298,9 @@ async function loadBuiltinLive2DPets(): Promise<CodexPet[]> {
             kind: 'live2d',
             modelUrl: `${LIVE2D_BASE}/${folder}/${meta.modelPath}`,
             motionGroups: meta.motionGroups,
+            motionMap: meta.motionMap,
+            availableMotions: meta.availableMotions,
+            availableExpressions: meta.availableExpressions,
           }
         } catch {
           return null

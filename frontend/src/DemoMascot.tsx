@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { invoke } from '@tauri-apps/api/core'
 import { emit, listen } from '@tauri-apps/api/event'
 import { load } from '@tauri-apps/plugin-store'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
-import { LogicalPosition, LogicalSize } from '@tauri-apps/api/dpi'
+import { LogicalSize } from '@tauri-apps/api/dpi'
 import { Maximize2 } from 'lucide-react'
 import { MiniPetMascot } from './components/MiniPetMascot'
 import { loadCodexPetById, loadDefaultCodexPet, type CodexPet, type CodexPetState } from './lib/codexPet'
@@ -252,14 +253,12 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
     }
   }, [statusUrlFromUrl])
 
-  // Direct drag using the current webview's absolute position. Read the native
-  // position once on pointerdown, then coalesce move events through RAF so fast
-  // pointer bursts do not queue stale async window-position reads.
+  // Match primary Mini drag: absolute origin via native get/set_webview_origin
+  // with confine=false so extra mascots can cross monitors / macOS Spaces.
   const handlePointerDown = useCallback((e: React.PointerEvent) => {
     if (e.button !== 0 || e.ctrlKey) return
     e.preventDefault()
     dragActiveRef.current = true
-    const win = getCurrentWebviewWindow()
     const startX = e.screenX
     const startY = e.screenY
     let lastX = e.screenX
@@ -276,10 +275,10 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
     let positionInFlight = false
     let positionDirty = false
 
-    Promise.all([win.scaleFactor(), win.outerPosition()])
-      .then(([scale, pos]) => {
-        originX = pos.x / scale
-        originY = pos.y / scale
+    invoke<[number, number]>('get_webview_origin')
+      .then(([x, y]) => {
+        originX = x
+        originY = y
         targetX = originX + latestDxTotal
         targetY = originY + latestDyTotal
         originReady = true
@@ -299,7 +298,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
       positionInFlight = true
       const x = targetX
       const y = targetY
-      win.setPosition(new LogicalPosition(x, y))
+      invoke('set_webview_origin', { x, y, confine: false })
         .catch(() => {})
         .finally(() => {
           positionInFlight = false
@@ -322,9 +321,6 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
       if (!dragging) {
         if (Math.abs(dxTotal) + Math.abs(dyTotal) >= 3) {
           dragging = true
-          // Force the hover/jump animation off so walkDir → run-left/run-right
-          // is visible while dragging (otherwise the pointer stays over the
-          // mascot and the jump cycle hides the walk frames).
           setDragging(true)
         } else {
           return
@@ -349,7 +345,11 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
         rafId = null
       }
       if (originReady) {
-        win.setPosition(new LogicalPosition(targetX, targetY)).catch(() => {})
+        invoke('set_webview_origin', { x: targetX, y: targetY, confine: false })
+          .then(() => invoke('reassert_floating'))
+          .catch(() => {})
+      } else {
+        invoke('reassert_floating').catch(() => {})
       }
       setWalkDir(0)
       setDragging(false)
@@ -365,10 +365,6 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
       if (ev.pointerId !== pid) return
       const wasDragging = dragging
       cleanup()
-      // A tap (no drag) on a functional extra mascot mirrors the primary
-      // mascot's click action: expand the main session panel. On macOS the
-      // primary mascot opens the panel via notch hover (a tap is a no-op), so
-      // keep extra mascots consistent and skip the click-to-expand there.
       if (functional && !wasDragging && isWindowsPlatform) {
         emit('extra-mascot-activate').catch(() => {})
       }

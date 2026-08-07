@@ -1,6 +1,11 @@
 import { useEffect, useRef } from 'react'
-import type { CodexPet, CodexPetState } from '../lib/codexPet'
-import { isLive2DPet } from '../lib/codexPet'
+import {
+  isLive2DPet,
+  resolveLive2DMotion,
+  type CodexPet,
+  type CodexPetState,
+  type Live2DMotionBinding,
+} from '../lib/codexPet'
 
 declare global {
   interface Window {
@@ -51,26 +56,9 @@ function ensureCubismCore(): Promise<void> {
   return cubismCorePromise
 }
 
-function motionGroupFor(pet: CodexPet, state: CodexPetState): string {
-  const g = pet.motionGroups
-  switch (state) {
-    case 'waiting':
-      return g?.waiting ?? 'Idle'
-    case 'running':
-    case 'run-left':
-    case 'run-right':
-      return g?.working ?? 'Tap'
-    case 'jumping':
-    case 'waving':
-      return g?.jumping ?? g?.working ?? 'Tap'
-    default:
-      return g?.idle ?? 'Idle'
-  }
-}
-
 /**
- * Cubism 4 Live2D renderer for desktop pets. Uses pixi-live2d-display +
- * Live2D Cubism Core Web. Models are expected under /assets/live2d/.
+ * Cubism 4 Live2D renderer for desktop pets. Motion selection is driven by
+ * `pet.motionMap` (oc-claw state → Cubism group/index/expression).
  */
 export function Live2DPet({
   pet,
@@ -87,6 +75,7 @@ export function Live2DPet({
   const stateRef = useRef(state)
   const onOneShotEndRef = useRef(onOneShotEnd)
   const sizeRef = useRef(size)
+  const loopTokenRef = useRef(0)
 
   useEffect(() => {
     stateRef.current = state
@@ -108,7 +97,8 @@ export function Live2DPet({
   useEffect(() => {
     const model = modelRef.current
     if (!model) return
-    void playMotion(model, pet, state, onOneShotEndRef)
+    const token = ++loopTokenRef.current
+    void runMotionLoop(model, pet, state, token, loopTokenRef, onOneShotEndRef, stateRef)
   }, [state, pet])
 
   useEffect(() => {
@@ -151,7 +141,16 @@ export function Live2DPet({
         modelRef.current = model
         app.stage.addChild(model)
         fitModel(model, sizeRef.current)
-        void playMotion(model, pet, stateRef.current, onOneShotEndRef)
+        const token = ++loopTokenRef.current
+        void runMotionLoop(
+          model,
+          pet,
+          stateRef.current,
+          token,
+          loopTokenRef,
+          onOneShotEndRef,
+          stateRef,
+        )
       } catch (e) {
         console.warn('[Live2DPet] load failed:', e)
       }
@@ -159,6 +158,7 @@ export function Live2DPet({
 
     return () => {
       cancelled = true
+      loopTokenRef.current += 1
       try {
         modelRef.current?.destroy?.()
       } catch {
@@ -207,7 +207,6 @@ function fitModel(model: any, size: number) {
   } catch {
     /* ignore */
   }
-  // Start from a neutral scale then fit by bounds.
   model.scale?.set?.(1)
   const bounds = model.getBounds?.()
   const bw = Math.max(1, bounds?.width ?? size)
@@ -218,24 +217,64 @@ function fitModel(model: any, size: number) {
   model.y = size
 }
 
-async function playMotion(
+async function runMotionLoop(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   model: any,
   pet: CodexPet,
   state: CodexPetState,
+  token: number,
+  loopTokenRef: React.MutableRefObject<number>,
   onOneShotEndRef: React.MutableRefObject<(() => void) | undefined>,
+  stateRef: React.MutableRefObject<CodexPetState>,
 ) {
-  const group = motionGroupFor(pet, state)
+  const binding = resolveLive2DMotion(pet, state)
+  applyExpression(model, binding)
+
+  const priority = state === 'jumping' ? 3 : 2
+  const index =
+    typeof binding.index === 'number' && Number.isFinite(binding.index)
+      ? binding.index
+      : undefined
+
   try {
-    const priority = state === 'jumping' ? 3 : 2
-    const result = model.motion?.(group, undefined, priority)
-    if (state === 'jumping' && result && typeof result.then === 'function') {
+    // Force-stop previous motion so waiting↔idle expression/index swaps apply.
+    try {
+      model.internalModel?.motionManager?.stopAllMotions?.()
+    } catch {
+      /* ignore */
+    }
+
+    const result = model.motion?.(binding.group, index, priority)
+    if (result && typeof result.then === 'function') {
       await result
-      onOneShotEndRef.current?.()
     }
   } catch (e) {
-    // Empty group "" is valid for Mao; unknown groups should not crash.
-    console.warn('[Live2DPet] motion failed:', group, e)
-    if (state === 'jumping') onOneShotEndRef.current?.()
+    console.warn('[Live2DPet] motion failed:', binding, e)
+  }
+
+  if (token !== loopTokenRef.current) return
+
+  if (state === 'jumping') {
+    onOneShotEndRef.current?.()
+    return
+  }
+
+  // Keep replaying while the parent still wants this looping state.
+  if (binding.loop && stateRef.current === state) {
+    // Small gap so Cubism doesn't stack identical motions instantly.
+    await new Promise((r) => setTimeout(r, 80))
+    if (token !== loopTokenRef.current) return
+    if (stateRef.current !== state) return
+    void runMotionLoop(model, pet, state, token, loopTokenRef, onOneShotEndRef, stateRef)
+  }
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function applyExpression(model: any, binding: Live2DMotionBinding) {
+  if (!binding.expression) return
+  try {
+    model.expression?.(binding.expression)
+  } catch (e) {
+    console.warn('[Live2DPet] expression failed:', binding.expression, e)
   }
 }

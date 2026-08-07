@@ -3605,6 +3605,149 @@ async fn set_mini_origin(
     Ok(())
 }
 
+/// Origin of the calling webview (extra/demo mascots). Same coordinate
+/// conventions as `get_mini_origin` so DemoMascot can share the primary
+/// drag math.
+#[tauri::command]
+async fn get_webview_origin(window: tauri::WebviewWindow) -> Result<(f64, f64), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let win_clone = window.clone();
+        window
+            .app_handle()
+            .run_on_main_thread(move || {
+                use objc2::msg_send;
+                use objc2::runtime::AnyObject;
+                use objc2_foundation::NSRect;
+                if let Ok(ns_win) = win_clone.ns_window() {
+                    let obj = unsafe { &*(ns_win as *mut AnyObject) };
+                    let frame: NSRect = unsafe { msg_send![obj, frame] };
+                    let _ = tx.send((frame.origin.x, frame.origin.y));
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        return rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .map_err(|_| "get_webview_origin timeout".into());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(pos) = window.outer_position() {
+            let scale = window.scale_factor().unwrap_or(1.0);
+            return Ok((pos.x as f64 / scale, pos.y as f64 / scale));
+        }
+        return Err("failed to read webview origin".into());
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = window;
+        Err("get_webview_origin unsupported".into())
+    }
+}
+
+/// Absolute-position the calling webview. `confine=false` skips per-monitor
+/// clamps so extra mascots can be dragged across screens / Spaces like mini.
+#[tauri::command]
+async fn set_webview_origin(
+    window: tauri::WebviewWindow,
+    x: f64,
+    y: f64,
+    confine: Option<bool>,
+) -> Result<(), String> {
+    let confine = confine.unwrap_or(true);
+    #[cfg(target_os = "macos")]
+    {
+        let win_clone = window.clone();
+        window
+            .app_handle()
+            .run_on_main_thread(move || {
+                use objc2::msg_send;
+                use objc2::runtime::{AnyClass, AnyObject};
+                use objc2_foundation::{NSPoint, NSRect, NSSize};
+                if let Ok(ns_win) = win_clone.ns_window() {
+                    let obj = unsafe { &*(ns_win as *mut AnyObject) };
+                    let frame: NSRect = unsafe { msg_send![obj, frame] };
+                    let (clamped_x, clamped_y) = if confine {
+                        let screen_frame: NSRect = unsafe {
+                            let screen: *mut AnyObject = msg_send![obj, screen];
+                            if screen.is_null() {
+                                let cls = match AnyClass::get(c"NSScreen") {
+                                    Some(c) => c,
+                                    None => return,
+                                };
+                                let main_screen: *mut AnyObject = msg_send![cls, mainScreen];
+                                if main_screen.is_null() {
+                                    return;
+                                }
+                                msg_send![&*main_screen, frame]
+                            } else {
+                                msg_send![&*screen, frame]
+                            }
+                        };
+                        let min_x = screen_frame.origin.x;
+                        let max_x = (screen_frame.origin.x + screen_frame.size.width - frame.size.width)
+                            .max(min_x);
+                        let min_y = screen_frame.origin.y;
+                        let max_y = (screen_frame.origin.y + screen_frame.size.height
+                            - frame.size.height
+                            - MASCOT_TOP_INSET)
+                            .max(min_y);
+                        (x.max(min_x).min(max_x), y.max(min_y).min(max_y))
+                    } else {
+                        (x, y)
+                    };
+                    let new_frame = NSRect::new(
+                        NSPoint::new(clamped_x, clamped_y),
+                        NSSize::new(frame.size.width, frame.size.height),
+                    );
+                    unsafe {
+                        let _: () =
+                            msg_send![obj, setFrame: new_frame, display: true, animate: false];
+                        // Keep floating while dragging across Spaces.
+                        let _: () = msg_send![obj, setLevel: 27isize];
+                        let behavior: usize = (1 << 0) | (1 << 4) | (1 << 8) | (1 << 6);
+                        let _: () = msg_send![obj, setCollectionBehavior: behavior];
+                    }
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if !confine {
+            let _ = window.set_position(tauri::LogicalPosition::new(x, y));
+            let _ = window.set_always_on_top(true);
+            return Ok(());
+        }
+        if let Ok(Some(monitor)) = window.current_monitor() {
+            let scale = monitor.scale_factor();
+            let mp = monitor.position();
+            let mx = mp.x as f64 / scale;
+            let my = mp.y as f64 / scale;
+            let sw = monitor.size().width as f64 / scale;
+            let sh = monitor.size().height as f64 / scale;
+            let (ww, wh) = window
+                .outer_size()
+                .map(|s| (s.width as f64 / scale, s.height as f64 / scale))
+                .unwrap_or((96.0, 96.0));
+            let cx = x.max(mx).min((mx + sw - ww).max(mx));
+            let cy = y.max(my).min((my + sh - wh).max(my));
+            let _ = window.set_position(tauri::LogicalPosition::new(cx, cy));
+        } else {
+            let _ = window.set_position(tauri::LogicalPosition::new(x, y));
+        }
+        let _ = window.set_always_on_top(true);
+        return Ok(());
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (window, x, y, confine);
+        Err("set_webview_origin unsupported".into())
+    }
+}
+
 /// Kept as a compatibility no-op while macOS IME handling is fixed directly on
 /// the underlying Wry webview class.
 #[tauri::command]
@@ -9249,16 +9392,12 @@ fn spawn_mascot_window(app: tauri::AppHandle, label: String, url: String, n: u64
                 unsafe {
                     let _: () = msg_send![demo_obj, setLevel: 27isize];
                     let _: () = msg_send![demo_obj, setFrame: new_frame, display: true, animate: false];
-                    // CanJoinAllSpaces | Stationary | FullScreenAuxiliary | IgnoresCycle
-                    // keeps demo mascots visible over other apps' fullscreen (handy for
-                    // screen-recording demos). Extra (multi-pet) mascots omit the
-                    // fullscreen bits so macOS hides them when a video/app goes
-                    // fullscreen — matching the primary mascot's behavior.
-                    let behavior: usize = if over_fullscreen {
-                        (1 << 0) | (1 << 4) | (1 << 8) | (1 << 6)
-                    } else {
-                        (1 << 4) | (1 << 6)
-                    };
+                    // Match the primary mini: CanJoinAllSpaces | Stationary |
+                    // FullScreenAuxiliary | IgnoresCycle. Extra mascots previously
+                    // omitted CanJoinAllSpaces which pinned them to one Mission
+                    // Control desktop and caused flicker / vanish when dragged
+                    // across Spaces.
+                    let behavior: usize = (1 << 0) | (1 << 4) | (1 << 8) | (1 << 6);
                     let _: () = msg_send![demo_obj, setCollectionBehavior: behavior];
                     let _: () = msg_send![demo_obj, setAcceptsMouseMovedEvents: true];
                 }
@@ -9280,7 +9419,6 @@ fn spawn_mascot_window(app: tauri::AppHandle, label: String, url: String, n: u64
         }
         let _ = win.set_always_on_top(true);
     }
-    #[cfg(not(target_os = "macos"))]
     let _ = over_fullscreen;
     let _ = win.show();
     Ok(label)
@@ -9408,9 +9546,9 @@ fn reassert_mini_floating(app: &tauri::AppHandle) {
         wins.push((win, true));
     }
     for (label, win) in app.webview_windows() {
-        if label.starts_with("extra-mascot-") {
-            // Extra mascots omit the fullscreen bits so they hide on fullscreen.
-            wins.push((win, false));
+        if label.starts_with("extra-mascot-") || label.starts_with("demo-mascot-") {
+            // Same floating / Spaces behavior as the primary mascot.
+            wins.push((win, true));
         }
     }
     for (win, over_fullscreen) in wins {
@@ -9424,18 +9562,18 @@ fn reassert_mini_floating(app: &tauri::AppHandle) {
                     let obj = unsafe { &*(ns_win as *mut AnyObject) };
                     unsafe {
                         let _: () = msg_send![obj, setLevel: 27isize];
-                        let behavior: usize = if over_fullscreen {
-                            (1 << 0) | (1 << 4) | (1 << 8) | (1 << 6)
-                        } else {
-                            (1 << 4) | (1 << 6)
-                        };
+                        // Always match primary: CanJoinAllSpaces | Stationary |
+                        // FullScreenAuxiliary | IgnoresCycle.
+                        let behavior: usize = (1 << 0) | (1 << 4) | (1 << 8) | (1 << 6);
                         let _: () = msg_send![obj, setCollectionBehavior: behavior];
+                        let _: () = msg_send![obj, setAcceptsMouseMovedEvents: true];
                     }
                 }
             }
             #[cfg(not(target_os = "macos"))]
             let _ = over_fullscreen;
             let _ = win_clone.set_always_on_top(true);
+            let _ = win_clone.show();
         });
     }
 }
@@ -17433,7 +17571,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_get, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs])
+        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, get_webview_origin, set_webview_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_get, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs])
         .manage(ActiveAgentPid { pid: Mutex::new(None) })
         .manage(ClaudeState { sessions: Arc::new(Mutex::new(HashMap::new())), pending_permissions: Arc::new(Mutex::new(HashMap::new())), dismissed: Arc::new(Mutex::new(std::collections::HashSet::new())) })
         .run(tauri::generate_context!())
