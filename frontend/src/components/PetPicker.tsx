@@ -19,6 +19,7 @@ import {
   isLive2DPet,
   loadCodexPets,
   loadCustomCodexPets,
+  loadCustomLive2DPets,
   type CodexPet,
 } from '../lib/codexPet'
 import { saveExtraMascots, loadMultiMascotMode, saveMultiMascotMode } from '../lib/petStore'
@@ -64,6 +65,7 @@ interface PetPickerProps {
   petdexFailed?: boolean
 }
 const CODEX_PETS_PATH_HINT = '~/.codex/pets'
+const LIVE2D_PETS_PATH_HINT = 'Application Support/.../live2d'
 
 // Detect Windows once at module load. We surface an extra hint on the
 // import step so Windows users know the folder they pick must already
@@ -132,6 +134,7 @@ export function PetPicker({
   // into view when expanded from the top.
   const createSectionRef = useRef<HTMLDivElement | null>(null)
   const [importing, setImporting] = useState(false)
+  const [importingLive2d, setImportingLive2d] = useState(false)
   const [importError, setImportError] = useState<string | null>(null)
   const debugToTerminal = useCallback((scope: string, msg: string) => {
     invoke('debug_log', { scope, msg }).catch(() => {})
@@ -139,13 +142,17 @@ export function PetPicker({
 
   const loadAll = useCallback(async () => {
     clearCodexPetCache()
-    const [b, c] = await Promise.all([loadCodexPets(), loadCustomCodexPets()])
+    const [b, c, live2d] = await Promise.all([
+      loadCodexPets(),
+      loadCustomCodexPets(),
+      loadCustomLive2DPets(),
+    ])
     setBuiltins(b)
     // Dedupe: a custom pet with the same id as a builtin would render
     // twice (once as builtin, once as custom). The builtin assets ship
     // with the app and always load, so prefer them and drop the dupes.
     const builtinIds = new Set(b.map((p) => p.id))
-    setCustoms(c.filter((p) => !builtinIds.has(p.id)))
+    setCustoms([...c, ...live2d].filter((p) => !builtinIds.has(p.id)))
   }, [])
 
   const toggleCreate = useCallback(() => {
@@ -165,7 +172,7 @@ export function PetPicker({
   }, [loadAll])
 
   const handlePickFolder = useCallback(async () => {
-    if (importing) return
+    if (importing || importingLive2d) return
     setImportError(null)
     debugToTerminal('picker', 'handlePickFolder start')
     onNativeDialogStart?.()
@@ -202,7 +209,44 @@ export function PetPicker({
       debugToTerminal('picker', 'schedule onNativeDialogEnd after 1500ms')
       setTimeout(() => onNativeDialogEnd?.(), 1500)
     }
-  }, [importing, loadAll, onNativeDialogStart, onNativeDialogEnd, debugToTerminal])
+  }, [importing, importingLive2d, loadAll, onNativeDialogStart, onNativeDialogEnd, debugToTerminal])
+
+  const handlePickLive2dFolder = useCallback(async () => {
+    if (importing || importingLive2d) return
+    setImportError(null)
+    debugToTerminal('picker', 'handlePickLive2dFolder start')
+    onNativeDialogStart?.()
+    try {
+      const picked = (await invoke('pick_live2d_pet_folder')) as string | null
+      debugToTerminal('picker', picked ? `live2d picked: ${picked}` : 'live2d picked: <cancel>')
+      if (!picked) return
+      setImportingLive2d(true)
+      try {
+        await invoke('import_live2d_pet', { srcPath: picked })
+        await loadAll()
+        debugToTerminal('picker', 'import_live2d_pet success')
+      } catch (e: unknown) {
+        console.warn('[PetPicker] live2d import failed:', e)
+        const msg =
+          typeof e === 'string'
+            ? e
+            : e instanceof Error
+              ? e.message
+              : 'import failed'
+        setImportError(msg)
+        debugToTerminal('picker', `import_live2d_pet failed: ${msg}`)
+      } finally {
+        setImportingLive2d(false)
+      }
+    } catch (e) {
+      console.warn('[PetPicker] live2d picker failed:', e)
+      const msg = e instanceof Error ? e.message : String(e)
+      debugToTerminal('picker', `pick_live2d_pet_folder failed: ${msg}`)
+    } finally {
+      debugToTerminal('picker', 'schedule onNativeDialogEnd after 1500ms')
+      setTimeout(() => onNativeDialogEnd?.(), 1500)
+    }
+  }, [importing, importingLive2d, loadAll, onNativeDialogStart, onNativeDialogEnd, debugToTerminal])
 
   const selectedPet =
     builtins.find((p) => p.id === selectedId) ||
@@ -500,9 +544,9 @@ export function PetPicker({
             {createOpen ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
             创建
           </div>
-          <span className="text-xs text-white/30">下载或选择本地 codex 宠物</span>
-        </button>
-        {createOpen && (
+            <span className="text-xs text-white/30">下载或选择本地 codex / Live2D 宠物</span>
+          </button>
+          {createOpen && (
           <div className="px-5 pb-5 space-y-3">
             {validPetdexUrl ? (
               <button
@@ -537,13 +581,13 @@ export function PetPicker({
             <button
               data-no-drag
               onClick={handlePickFolder}
-              disabled={importing}
+              disabled={importing || importingLive2d}
               className="w-full flex items-center gap-3 px-4 py-3 rounded-xl bg-white/[0.04] hover:bg-white/[0.07] disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
             >
               <CreateStepBadge n={2} />
               <div className="flex flex-col items-start gap-0.5 flex-1 min-w-0">
                 <span className="text-sm text-white/85 font-medium">
-                  {importing ? '正在导入…' : '选择本地文件夹导入'}
+                  {importing ? '正在导入…' : '选择本地 Codex 文件夹导入'}
                 </span>
                 {isWindowsPlatform && (
                   <span className="text-[11px] text-white/50 text-left">
@@ -559,6 +603,39 @@ export function PetPicker({
               ) : (
                 <FolderPlus className="w-4 h-4 text-white/40 shrink-0" strokeWidth={2.5} />
               )}
+            </button>
+            <button
+              data-no-drag
+              onClick={handlePickLive2dFolder}
+              disabled={importing || importingLive2d}
+              className="w-full flex items-center gap-3 px-4 py-3 rounded-xl bg-white/[0.04] hover:bg-white/[0.07] disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+            >
+              <CreateStepBadge n={3} />
+              <div className="flex flex-col items-start gap-0.5 flex-1 min-w-0">
+                <span className="text-sm text-white/85 font-medium">
+                  {importingLive2d ? '正在导入 Live2D…' : '选择本地 Live2D 文件夹导入'}
+                </span>
+                <span className="text-[11px] text-white/50 text-left">
+                  自动检测 <code className="text-white/70">*.model3.json</code>
+                  （可选 <code className="text-white/70">pet.json</code>）
+                </span>
+                <span className="text-[11px] text-white/40">
+                  会复制到 {LIVE2D_PETS_PATH_HINT}/&lt;id&gt;
+                </span>
+              </div>
+              {importingLive2d ? (
+                <Loader2 className="w-4 h-4 text-white/40 animate-spin shrink-0" strokeWidth={2.5} />
+              ) : (
+                <FolderPlus className="w-4 h-4 text-white/40 shrink-0" strokeWidth={2.5} />
+              )}
+            </button>
+            <button
+              data-no-drag
+              onClick={() => invoke('open_live2d_pets_dir').catch(() => {})}
+              className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-[11px] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors"
+            >
+              <FolderOpen className="w-3.5 h-3.5" strokeWidth={2.5} />
+              打开 Live2D 导入目录
             </button>
             {importError && (
               <div className="text-[11px] text-rose-400 px-1">{importError}</div>

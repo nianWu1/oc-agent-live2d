@@ -6,6 +6,10 @@ const STORE_KEY = 'live2d_motion_map_overrides'
 let cache: Record<string, Live2DMotionMap> = {}
 let ready: Promise<void> | null = null
 
+function isTauriAvailable(): boolean {
+  return typeof window !== 'undefined' && !!(window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__
+}
+
 async function getStore() {
   return load('settings.json', { defaults: {}, autoSave: true })
 }
@@ -13,6 +17,11 @@ async function getStore() {
 export function ensureLive2DMotionOverridesLoaded(): Promise<void> {
   if (!ready) {
     ready = (async () => {
+      // Browser / plain Vite tab has no Tauri IPC — skip quietly.
+      if (!isTauriAvailable()) {
+        cache = {}
+        return
+      }
       try {
         const store = await getStore()
         const raw = (await store.get(STORE_KEY)) as Record<string, Live2DMotionMap> | null
@@ -40,6 +49,9 @@ export async function saveLive2DMotionOverride(
   map: Live2DMotionMap,
 ): Promise<void> {
   await ensureLive2DMotionOverridesLoaded()
+  if (!isTauriAvailable()) {
+    throw new Error('Tauri IPC unavailable — run via `npx tauri dev`, not the browser')
+  }
   const cleaned: Live2DMotionMap = {}
   for (const [k, v] of Object.entries(map)) {
     if (v && typeof v.group === 'string') {

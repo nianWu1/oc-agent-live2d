@@ -11,9 +11,9 @@
   },
   "availableExpressions": ["f00", "f01", "f02", "f03", "f04", "f05", "f06", "f07"],
   "motionMap": {
-    "idle": { "group": "Idle", "index": 0 },
+    "idle": { "group": "Idle", "index": 0, "loop": true },
     "working": { "group": "Tap", "loop": true },
-    "waiting": { "group": "Idle", "index": 1, "expression": "f03" },
+    "waiting": { "group": "Idle", "index": 1, "expression": "f03", "loop": true },
     "jumping": { "group": "Tap", "index": 0 },
     "run-left": { "group": "Tap", "index": 1, "loop": true },
     "run-right": { "group": "Tap", "index": 1, "loop": true }

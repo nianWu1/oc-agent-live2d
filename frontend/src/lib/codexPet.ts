@@ -100,7 +100,11 @@ export function resolveLive2DMotion(
       index: aliased.index,
       loop:
         aliased.loop ??
-        (state === 'running' || state === 'run-left' || state === 'run-right'),
+        (state === 'running' ||
+          state === 'run-left' ||
+          state === 'run-right' ||
+          state === 'idle' ||
+          state === 'waiting'),
       expression: aliased.expression,
     }
   }
@@ -349,7 +353,10 @@ export async function loadCodexPetById(id: string): Promise<CodexPet | null> {
   const hit = builtins.find((p) => p.id === id)
   if (hit) return hit
   const customs = await loadCustomCodexPets()
-  return customs.find((p) => p.id === id) ?? null
+  const customHit = customs.find((p) => p.id === id)
+  if (customHit) return customHit
+  const live2dCustoms = await loadCustomLive2DPets()
+  return live2dCustoms.find((p) => p.id === id) ?? null
 }
 
 export async function loadDefaultCodexPet(): Promise<CodexPet | null> {
@@ -381,9 +388,41 @@ export async function loadCustomCodexPets(): Promise<CodexPet[]> {
       displayName: m.displayName,
       description: m.description,
       spritesheetUrl: m.spritesheetUrl,
+      kind: 'sprite' as const,
     }))
   } catch (e) {
     console.warn('[codexPet] loadCustomCodexPets failed:', e)
+    return []
+  }
+}
+
+/** User-imported Live2D models under app data `live2d/`. */
+export async function loadCustomLive2DPets(): Promise<CodexPet[]> {
+  try {
+    const { invoke } = await import('@tauri-apps/api/core')
+    const raw = (await invoke('list_custom_live2d_pets')) as Array<{
+      id: string
+      displayName: string
+      description: string
+      modelUrl: string
+      previewUrl: string
+      motionMap?: Live2DMotionMap
+      availableMotions?: Record<string, string[]>
+      availableExpressions?: string[]
+    }>
+    return raw.map((m) => ({
+      id: m.id,
+      displayName: m.displayName,
+      description: m.description,
+      spritesheetUrl: m.previewUrl || m.modelUrl,
+      kind: 'live2d' as const,
+      modelUrl: m.modelUrl,
+      motionMap: m.motionMap,
+      availableMotions: m.availableMotions,
+      availableExpressions: m.availableExpressions,
+    }))
+  } catch (e) {
+    console.warn('[codexPet] loadCustomLive2DPets failed:', e)
     return []
   }
 }

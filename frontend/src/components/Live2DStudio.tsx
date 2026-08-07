@@ -7,6 +7,7 @@ import {
   effectiveLive2DMotionMap,
   isLive2DPet,
   loadCodexPets,
+  loadCustomLive2DPets,
   type CodexPet,
   type Live2DMotionBinding,
   type Live2DMotionMap,
@@ -79,8 +80,15 @@ export function Live2DStudio() {
     void (async () => {
       await ensureLive2DMotionOverridesLoaded()
       clearCodexPetCache()
-      const all = await loadCodexPets()
-      const live = all.filter(isLive2DPet)
+      const [builtins, customs] = await Promise.all([
+        loadCodexPets(),
+        loadCustomLive2DPets(),
+      ])
+      const builtinIds = new Set(builtins.map((p) => p.id))
+      const live = [
+        ...builtins.filter(isLive2DPet),
+        ...customs.filter((p) => isLive2DPet(p) && !builtinIds.has(p.id)),
+      ]
       setPets(live)
       if (live[0]) setPetId(live[0].id)
     })()

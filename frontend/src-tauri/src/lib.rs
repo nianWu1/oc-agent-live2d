@@ -3044,6 +3044,10 @@ async fn open_mini(app: tauri::AppHandle) -> Result<(), String> {
                     }
                 }
             });
+            // orderFrontRegardless alone is not enough after visible:false /
+            // hide(); also call Tauri show so the webview paints on-screen.
+            let _ = win.show();
+            let _ = win.set_focus();
         }
         #[cfg(target_os = "windows")]
         {
@@ -3228,6 +3232,83 @@ fn large_collapsed_mascot_window_size(scale: f64, large_scale: f64) -> (f64, f64
     let w = 43.0 * scale * lms;
     let h = (w * 208.0 / 192.0).ceil();
     (w, h)
+}
+
+/// macOS: mini starts at (-9999,-9999) / visible:false. Tray "Show" previously
+/// only called `win.show()`, which can leave the window off-screen with no
+/// error. Always re-place on the primary screen, then orderFront + show.
+#[cfg(target_os = "macos")]
+fn force_show_mini_on_screen(app: &tauri::AppHandle, win: &tauri::WebviewWindow) {
+    let win_clone = win.clone();
+    let _ = app.run_on_main_thread(move || {
+        use objc2::runtime::{AnyClass, AnyObject};
+        use objc2::msg_send;
+        use objc2_foundation::{NSRect, NSPoint, NSSize};
+
+        if let Ok(ns_win) = win_clone.ns_window() {
+            let obj = unsafe { &*(ns_win as *mut AnyObject) };
+            unsafe {
+                let _: () = msg_send![obj, setLevel: 27isize];
+                let behavior: usize = (1 << 0) | (1 << 4) | (1 << 8) | (1 << 6);
+                let _: () = msg_send![obj, setCollectionBehavior: behavior];
+                // Ensure the window is hittable after a tray Show (pet pass-
+                // through may have left ignoresMouseEvents=true).
+                let _: () = msg_send![obj, setIgnoresMouseEvents: false];
+            }
+            let screen_info: Option<(f64, f64, f64, f64, f64)> = unsafe {
+                let cls = match AnyClass::get(c"NSScreen") {
+                    Some(c) => c,
+                    None => return,
+                };
+                let screens: *mut AnyObject = msg_send![cls, screens];
+                if screens.is_null() {
+                    return;
+                }
+                let count: usize = msg_send![&*screens, count];
+                if count == 0 {
+                    return;
+                }
+                let screen: *mut AnyObject = msg_send![&*screens, objectAtIndex: 0usize];
+                if screen.is_null() {
+                    return;
+                }
+                let frame: NSRect = msg_send![&*screen, frame];
+                let notch_off = get_notch_offset(screen);
+                Some((
+                    frame.origin.x,
+                    frame.origin.y,
+                    frame.size.width,
+                    frame.size.height,
+                    notch_off,
+                ))
+            };
+            if let Some((sx, sy, sw, sh, notch_off)) = screen_info {
+                let (win_w, win_h) = MINI_WINDOW_FRAME
+                    .lock()
+                    .ok()
+                    .and_then(|g| *g)
+                    .map(|(_, _, w, h)| (w, h))
+                    .unwrap_or_else(|| collapsed_mascot_window_size(1.0));
+                let x = sx + sw / 2.0 + notch_off;
+                let y = sy + sh - win_h - MASCOT_TOP_INSET;
+                log::info!(
+                    "[mini-pos] force_show_mini frame x={:.1} y={:.1} w={:.1} h={:.1}",
+                    x, y, win_w, win_h
+                );
+                let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(win_w, win_h));
+                unsafe {
+                    let _: () = msg_send![obj, setFrame: frame, display: true];
+                    let _: () = msg_send![obj, orderFrontRegardless];
+                }
+                if let Ok(mut f) = MINI_WINDOW_FRAME.lock() {
+                    *f = Some((x, y, win_w, win_h));
+                }
+            }
+        }
+    });
+    let _ = win.show();
+    let _ = win.set_focus();
+    let _ = app.emit("mini-force-visible", ());
 }
 
 /// Compute a UI-scale multiplier for Windows based on the monitor's logical
@@ -3861,6 +3942,7 @@ async fn set_mini_expanded(app: tauri::AppHandle, expanded: bool, position: Opti
                         let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(win_w, win_h));
                         unsafe {
                             let _: () = msg_send![obj, setFrame: frame, display: true, animate: false];
+                            let _: () = msg_send![obj, orderFrontRegardless];
                         }
                         (x, y, win_w, win_h)
                     };
@@ -9746,6 +9828,414 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
     Ok(())
 }
 
+// ── Custom Live2D pets (app_data_dir/live2d/) ──────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct Live2DPetMeta {
+    pub id: String,
+    #[serde(rename = "displayName")]
+    pub display_name: String,
+    pub description: String,
+    #[serde(rename = "modelUrl")]
+    pub model_url: String,
+    #[serde(rename = "previewUrl")]
+    pub preview_url: String,
+    #[serde(rename = "motionMap", skip_serializing_if = "Option::is_none")]
+    pub motion_map: Option<serde_json::Value>,
+    #[serde(rename = "availableMotions", skip_serializing_if = "Option::is_none")]
+    pub available_motions: Option<serde_json::Value>,
+    #[serde(rename = "availableExpressions", skip_serializing_if = "Option::is_none")]
+    pub available_expressions: Option<serde_json::Value>,
+}
+
+fn live2d_pets_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|p| p.join("live2d"))
+        .map_err(|e| e.to_string())
+}
+
+fn live2d_asset_url(app: &tauri::AppHandle, abs: &std::path::Path) -> String {
+    use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+    let Ok(root) = live2d_pets_dir(app) else {
+        return String::new();
+    };
+    let rel = match abs.strip_prefix(&root) {
+        Ok(p) => p.to_path_buf(),
+        Err(_) => return String::new(),
+    };
+    let parts: Vec<String> = rel
+        .components()
+        .map(|c| utf8_percent_encode(&c.as_os_str().to_string_lossy(), NON_ALPHANUMERIC).to_string())
+        .collect();
+    let prefix = if cfg!(target_os = "windows") {
+        "http://live2dpet.localhost"
+    } else {
+        "live2dpet://localhost"
+    };
+    format!("{}/{}", prefix, parts.join("/"))
+}
+
+fn find_model3_json(root: &std::path::Path) -> Option<PathBuf> {
+    // Prefer shallow matches, then a shallow recursive walk (depth-limited).
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file()
+                && p.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("json")).unwrap_or(false)
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.to_ascii_lowercase().ends_with(".model3.json"))
+                    .unwrap_or(false)
+            {
+                return Some(p);
+            }
+        }
+    }
+    fn walk(dir: &std::path::Path, depth: u32) -> Option<PathBuf> {
+        if depth > 4 {
+            return None;
+        }
+        let entries = std::fs::read_dir(dir).ok()?;
+        let mut dirs = Vec::new();
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file() {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
+                if name.ends_with(".model3.json") {
+                    return Some(p);
+                }
+            } else if p.is_dir() {
+                dirs.push(p);
+            }
+        }
+        for d in dirs {
+            if let Some(hit) = walk(&d, depth + 1) {
+                return Some(hit);
+            }
+        }
+        None
+    }
+    walk(root, 0)
+}
+
+fn sanitize_live2d_id(raw: &str) -> String {
+    let mut out = String::new();
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch.to_ascii_lowercase());
+        } else if ch.is_whitespace() || ch == '.' {
+            if !out.ends_with('_') {
+                out.push('_');
+            }
+        }
+    }
+    let trimmed = out.trim_matches('_').to_string();
+    if trimmed.is_empty() {
+        "live2d_import".into()
+    } else if !trimmed.starts_with("live2d") {
+        format!("live2d-{}", trimmed)
+    } else {
+        trimmed
+    }
+}
+
+fn path_to_unix_rel(path: &std::path::Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn build_default_live2d_motion_map(motions: &serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+    let keys: Vec<String> = motions.keys().cloned().collect();
+    let idle_key = keys
+        .iter()
+        .find(|k| k.eq_ignore_ascii_case("idle"))
+        .cloned()
+        .or_else(|| keys.first().cloned())
+        .unwrap_or_default();
+    let action_key = keys
+        .iter()
+        .find(|k| !k.eq_ignore_ascii_case("idle"))
+        .cloned()
+        .unwrap_or_else(|| idle_key.clone());
+    serde_json::json!({
+        "idle": { "group": idle_key, "index": 0, "loop": true },
+        "working": { "group": action_key, "index": 0, "loop": true },
+        "waiting": { "group": idle_key, "index": 0, "loop": true },
+        "jumping": { "group": action_key, "index": 0 },
+        "run-left": { "group": action_key, "index": 0, "loop": true },
+        "run-right": { "group": action_key, "index": 0, "loop": true }
+    })
+}
+
+fn discover_live2d_pet_json(src: &std::path::Path) -> Result<serde_json::Value, String> {
+    let pet_json_path = src.join("pet.json");
+    if pet_json_path.is_file() {
+        let raw = std::fs::read_to_string(&pet_json_path).map_err(|e| e.to_string())?;
+        let mut meta: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        if meta.get("kind").and_then(|v| v.as_str()) != Some("live2d") {
+            if let Some(obj) = meta.as_object_mut() {
+                obj.insert("kind".into(), serde_json::json!("live2d"));
+            }
+        }
+        let model_rel = meta
+            .get("modelPath")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| "pet.json missing modelPath".to_string())?;
+        if !src.join(&model_rel).is_file() {
+            return Err(format!("modelPath not found: {}", model_rel));
+        }
+        return Ok(meta);
+    }
+
+    let model_abs = find_model3_json(src).ok_or_else(|| {
+        "no .model3.json found in folder (need Cubism 4 Live2D model)".to_string()
+    })?;
+    let model_rel = model_abs
+        .strip_prefix(src)
+        .map_err(|_| "model path outside selected folder".to_string())?;
+    let model_rel_s = path_to_unix_rel(model_rel);
+    let model_raw = std::fs::read_to_string(&model_abs).map_err(|e| e.to_string())?;
+    let model_json: serde_json::Value =
+        serde_json::from_str(&model_raw).map_err(|e| format!("invalid model3.json: {}", e))?;
+
+    let motions = model_json
+        .pointer("/FileReferences/Motions")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let mut available_motions = serde_json::Map::new();
+    for (group, list) in &motions {
+        let files: Vec<String> = list
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| item.get("File").and_then(|f| f.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        available_motions.insert(group.clone(), serde_json::json!(files));
+    }
+    let available_expressions: Vec<String> = model_json
+        .pointer("/FileReferences/Expressions")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.get("Name").and_then(|n| n.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let preview_rel = model_json
+        .pointer("/FileReferences/Textures/0")
+        .and_then(|v| v.as_str())
+        .map(|tex| {
+            let model_parent = model_rel
+                .parent()
+                .map(path_to_unix_rel)
+                .unwrap_or_default();
+            if model_parent.is_empty() {
+                tex.to_string()
+            } else {
+                format!("{}/{}", model_parent, tex)
+            }
+        });
+
+    let folder_name = src
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Live2D".into());
+    let id = sanitize_live2d_id(&folder_name);
+    let motion_map = build_default_live2d_motion_map(&motions);
+
+    let mut meta = serde_json::json!({
+        "id": id,
+        "displayName": folder_name,
+        "description": "Imported Live2D model",
+        "kind": "live2d",
+        "modelPath": model_rel_s,
+        "motionMap": motion_map,
+        "availableMotions": available_motions,
+        "availableExpressions": available_expressions,
+    });
+    if let Some(preview) = preview_rel {
+        if let Some(obj) = meta.as_object_mut() {
+            obj.insert("previewPath".into(), serde_json::json!(preview));
+        }
+    }
+    Ok(meta)
+}
+
+fn live2d_meta_from_dir(app: &tauri::AppHandle, dir: &std::path::Path) -> Option<Live2DPetMeta> {
+    let pet_json = dir.join("pet.json");
+    if !pet_json.is_file() {
+        return None;
+    }
+    let raw = std::fs::read_to_string(&pet_json).ok()?;
+    let meta: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    if meta.get("kind").and_then(|v| v.as_str()) != Some("live2d") {
+        return None;
+    }
+    let id = meta
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| {
+            dir.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        });
+    let display_name = meta
+        .get("displayName")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| id.clone());
+    let description = meta
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_default();
+    let model_path = meta.get("modelPath").and_then(|v| v.as_str())?;
+    let abs_model = dir.join(model_path);
+    if !abs_model.is_file() {
+        return None;
+    }
+    let preview_path = meta
+        .get("previewPath")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| model_path.replace(".model3.json", ".png"));
+    let abs_preview = dir.join(&preview_path);
+    let preview_url = if abs_preview.is_file() {
+        live2d_asset_url(app, &abs_preview)
+    } else {
+        live2d_asset_url(app, &abs_model)
+    };
+    Some(Live2DPetMeta {
+        id,
+        display_name,
+        description,
+        model_url: live2d_asset_url(app, &abs_model),
+        preview_url,
+        motion_map: meta.get("motionMap").cloned(),
+        available_motions: meta.get("availableMotions").cloned(),
+        available_expressions: meta.get("availableExpressions").cloned(),
+    })
+}
+
+#[tauri::command]
+async fn list_custom_live2d_pets(app: tauri::AppHandle) -> Result<Vec<Live2DPetMeta>, String> {
+    let root = live2d_pets_dir(&app)?;
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(&root) {
+        Ok(e) => e,
+        Err(_) => return Ok(Vec::new()),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if let Some(meta) = live2d_meta_from_dir(&app, &path) {
+            out.push(meta);
+        }
+    }
+    out.sort_by(|a, b| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()));
+    Ok(out)
+}
+
+#[tauri::command]
+async fn pick_live2d_pet_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    use tauri::Manager;
+    use tauri_plugin_dialog::DialogExt;
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut builder = app.dialog().file().set_title("选择 Live2D 模型文件夹");
+    if let Some(win) = app.get_webview_window("mini") {
+        builder = builder.set_parent(&win);
+    }
+    builder.pick_folder(move |path| {
+        let _ = tx.send(path);
+    });
+    let picked = rx.await.map_err(|e| e.to_string())?;
+    let result = picked
+        .and_then(|p| p.into_path().ok())
+        .map(|p| p.to_string_lossy().into_owned());
+    reassert_mini_floating(&app);
+    Ok(result)
+}
+
+#[tauri::command]
+async fn open_live2d_pets_dir(app: tauri::AppHandle) -> Result<String, String> {
+    let dir = live2d_pets_dir(&app)?;
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    }
+    let path = dir.to_string_lossy().to_string();
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(&path).spawn().map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer").arg(&path).spawn().map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open").arg(&path).spawn().map_err(|e| e.to_string())?;
+    }
+    Ok(path)
+}
+
+/// Import a Live2D folder into `app_data_dir/live2d/<id>`.
+/// Accepts either a ready `pet.json` (kind=live2d) or a raw Cubism folder
+/// containing a `.model3.json` (auto-detect + generate pet.json).
+#[tauri::command]
+async fn import_live2d_pet(app: tauri::AppHandle, src_path: String) -> Result<Live2DPetMeta, String> {
+    let src = PathBuf::from(&src_path);
+    if !src.is_dir() {
+        return Err(format!("not a directory: {}", src_path));
+    }
+    let meta = discover_live2d_pet_json(&src)?;
+    let id = meta
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| {
+            sanitize_live2d_id(
+                &src.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "live2d".into()),
+            )
+        });
+    let root = live2d_pets_dir(&app)?;
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let dst = root.join(&id);
+    if dst.exists() {
+        let _ = std::fs::remove_dir_all(&dst);
+    }
+    copy_dir_recursive(&src, &dst)?;
+    // Always write/normalize pet.json so auto-detected imports persist.
+    let mut normalized = meta.clone();
+    if let Some(obj) = normalized.as_object_mut() {
+        obj.insert("id".into(), serde_json::json!(id));
+        obj.insert("kind".into(), serde_json::json!("live2d"));
+    }
+    std::fs::write(
+        dst.join("pet.json"),
+        serde_json::to_string_pretty(&normalized).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+
+    live2d_meta_from_dir(&app, &dst).ok_or_else(|| "import succeeded but pet meta could not be read".into())
+}
+
 /// Activate a macOS app by its name (e.g. "Feishu", "Telegram", "Lark").
 #[tauri::command]
 async fn activate_app(app_name: String) -> Result<String, String> {
@@ -9755,6 +10245,7 @@ async fn activate_app(app_name: String) -> Result<String, String> {
         std::process::Command::new("osascript")
             .args(["-e", &script])
             .output()
+
             .map_err(|e| e.to_string())?;
         Ok(format!("Activated {}", app_name))
     }
@@ -17223,6 +17714,14 @@ pub fn run() {
             let file_path = root.join(path.trim_start_matches('/'));
             build_asset_response(&req, path.as_ref(), &file_path, cfg!(target_os = "windows"), "codexpet")
         })
+        .register_uri_scheme_protocol("live2dpet", |ctx, req| {
+            // Custom Live2D models imported into app_data_dir/live2d/.
+            let raw_path = req.uri().path();
+            let path = percent_decode_str(raw_path).decode_utf8_lossy();
+            let data_dir = ctx.app_handle().path().app_data_dir().unwrap_or_default();
+            let file_path = data_dir.join("live2d").join(path.trim_start_matches('/'));
+            build_asset_response(&req, path.as_ref(), &file_path, cfg!(target_os = "windows"), "live2dpet")
+        })
         .setup(|app| {
             // Fix PATH so openclaw (Node.js script) and node are both reachable
             fix_path();
@@ -17352,6 +17851,10 @@ pub fn run() {
                             let (win_w, win_h) = collapsed_mascot_window_size(1.0);
                             let x = sx + sw / 2.0 + notch_off;
                             let y = sy + sh - win_h - MASCOT_TOP_INSET;
+                            log::info!(
+                                "[mini-pos] startup(mac) frame x={:.1} y={:.1} w={:.1} h={:.1}",
+                                x, y, win_w, win_h
+                            );
                             let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(win_w, win_h));
                             unsafe {
                                 let _: () = msg_send![obj, setFrame: frame, display: true];
@@ -17360,6 +17863,8 @@ pub fn run() {
                         }
                     }
                 });
+                // Tauri creates mini with visible:false; orderFront alone can race.
+                let _ = win.show();
             }
 
             // Windows: position mini window at top-center of primary monitor
@@ -17541,6 +18046,11 @@ pub fn run() {
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => {
                         if let Some(win) = app.get_webview_window("mini") {
+                            #[cfg(target_os = "macos")]
+                            {
+                                log::info!("[mini-pos] tray Show requested");
+                                force_show_mini_on_screen(app, &win);
+                            }
                             #[cfg(target_os = "windows")]
                             {
                                 FULLSCREEN_HIDING.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -17552,9 +18062,9 @@ pub fn run() {
                                     let _ = win.set_position(tauri::LogicalPosition::new(x, 0.0));
                                 }
                                 let _ = win.set_always_on_top(true);
+                                let _ = win.show();
+                                let _ = win.set_focus();
                             }
-                            let _ = win.show();
-                            let _ = win.set_focus();
                         }
                     }
                     "hide" => {
@@ -17571,7 +18081,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, get_webview_origin, set_webview_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_get, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs])
+        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, get_webview_origin, set_webview_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_get, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, list_custom_live2d_pets, open_live2d_pets_dir, import_live2d_pet, pick_live2d_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs])
         .manage(ActiveAgentPid { pid: Mutex::new(None) })
         .manage(ClaudeState { sessions: Arc::new(Mutex::new(HashMap::new())), pending_permissions: Arc::new(Mutex::new(HashMap::new())), dismissed: Arc::new(Mutex::new(std::collections::HashSet::new())) })
         .run(tauri::generate_context!())

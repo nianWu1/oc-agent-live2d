@@ -251,6 +251,80 @@ function fitModel(model: any, size: number) {
   model.y = size
 }
 
+/**
+ * `model.motion()` resolves when playback *starts*, not when it ends.
+ * Wait for MotionManager `motionFinish` (or poll `isFinished`) so loop /
+ * one-shot timing matches the Cubism motion duration.
+ */
+function waitForMotionFinish(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  model: any,
+  token: number,
+  loopTokenRef: React.MutableRefObject<number>,
+): Promise<void> {
+  return new Promise((resolve) => {
+    if (token !== loopTokenRef.current) {
+      resolve()
+      return
+    }
+    const mm = model?.internalModel?.motionManager
+    if (!mm) {
+      resolve()
+      return
+    }
+
+    let settled = false
+    const finish = () => {
+      if (settled) return
+      settled = true
+      try {
+        mm.off?.('motionFinish', onFinish)
+      } catch {
+        /* ignore */
+      }
+      resolve()
+    }
+    const onFinish = () => finish()
+
+    // Defer one frame so a freshly started motion is not mistaken for the
+    // previous motion's finished state.
+    requestAnimationFrame(() => {
+      if (token !== loopTokenRef.current) {
+        finish()
+        return
+      }
+      if (typeof mm.once === 'function') {
+        mm.once('motionFinish', onFinish)
+      }
+
+      const startedAt = performance.now()
+      const poll = () => {
+        if (settled) return
+        if (token !== loopTokenRef.current) {
+          finish()
+          return
+        }
+        try {
+          if (mm.isFinished?.()) {
+            finish()
+            return
+          }
+        } catch {
+          finish()
+          return
+        }
+        // Safety valve — some motions never emit finish (or stay reserved).
+        if (performance.now() - startedAt > 120_000) {
+          finish()
+          return
+        }
+        requestAnimationFrame(poll)
+      }
+      requestAnimationFrame(poll)
+    })
+  })
+}
+
 async function runMotionLoop(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   model: any,
@@ -272,6 +346,7 @@ async function runMotionLoop(
       ? binding.index
       : undefined
 
+  let started = false
   try {
     try {
       model.internalModel?.motionManager?.stopAllMotions?.()
@@ -281,11 +356,22 @@ async function runMotionLoop(
 
     const result = model.motion?.(binding.group, index, priority)
     if (result && typeof result.then === 'function') {
-      await result
+      started = !!(await result)
+    } else {
+      started = result !== false
     }
   } catch (e) {
     console.warn('[Live2DPet] motion failed:', binding, e)
   }
+
+  if (token !== loopTokenRef.current) return
+
+  if (!started) {
+    console.warn('[Live2DPet] motion did not start:', binding)
+    return
+  }
+
+  await waitForMotionFinish(model, token, loopTokenRef)
 
   if (token !== loopTokenRef.current) return
 
@@ -303,7 +389,6 @@ async function runMotionLoop(
     forceBindingRef.current.expression === forced.expression
 
   if (forced ? stillForced && (forced.loop ?? true) : binding.loop && stateRef.current === state) {
-    await new Promise((r) => setTimeout(r, 80))
     if (token !== loopTokenRef.current) return
     if (forced) {
       if (!forceBindingRef.current) return

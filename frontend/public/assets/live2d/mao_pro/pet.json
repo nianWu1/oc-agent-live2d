@@ -18,9 +18,9 @@
   },
   "availableExpressions": ["exp_01", "exp_02", "exp_03", "exp_04", "exp_05", "exp_06", "exp_07", "exp_08"],
   "motionMap": {
-    "idle": { "group": "Idle", "index": 0 },
+    "idle": { "group": "Idle", "index": 0, "loop": true },
     "working": { "group": "", "index": 0, "loop": true },
-    "waiting": { "group": "Idle", "index": 0, "expression": "exp_03" },
+    "waiting": { "group": "Idle", "index": 0, "expression": "exp_03", "loop": true },
     "jumping": { "group": "", "index": 3 },
     "run-left": { "group": "", "index": 1, "loop": true },
     "run-right": { "group": "", "index": 2, "loop": true }
