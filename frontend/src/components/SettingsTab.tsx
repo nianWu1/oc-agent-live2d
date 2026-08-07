@@ -11,6 +11,7 @@ import { AnimatePresence, motion } from 'motion/react'
 import { useTranslation } from 'react-i18next'
 import { getStore, loadOcConnections, saveOcConnections } from '../lib/store'
 import type { OcConnection } from '../lib/types'
+import { Live2DStudio } from './Live2DStudio'
 
 type UpdateProgressPayload = {
   stage: string
@@ -1026,6 +1027,17 @@ export function SettingsTab({ notifySound, onChangeNotifySound, waitingSound, on
           </div>
         </section>
       )}
+
+      {/* Live2D preview + motion mapping studio */}
+      <section className="flex flex-col gap-4">
+        <h2 className="text-lg font-medium text-white">Live2D 预览</h2>
+        <div className="bg-[#0f0f0f] border border-white/5 rounded-2xl overflow-hidden p-4">
+          <p className="text-xs text-white/40 mb-4">
+            试播模型自带动作，再把 oc-claw 的 idle / working / waiting 等状态映射过去。映射保存在本地，不改仓库文件。
+          </p>
+          <Live2DStudio />
+        </div>
+      </section>
 
       {/* Pet mode: mascot size */}
       {isPetMode && (

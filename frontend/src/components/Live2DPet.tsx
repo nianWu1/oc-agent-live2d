@@ -1,4 +1,5 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { listen } from '@tauri-apps/api/event'
 import {
   isLive2DPet,
   resolveLive2DMotion,
@@ -20,6 +21,8 @@ interface Live2DPetProps {
   onOneShotEnd?: () => void
   className?: string
   style?: React.CSSProperties
+  /** When set, ignore oc-claw state and play this binding (settings studio). */
+  forceBinding?: Live2DMotionBinding | null
 }
 
 let cubismCorePromise: Promise<void> | null = null
@@ -67,6 +70,7 @@ export function Live2DPet({
   onOneShotEnd,
   className,
   style,
+  forceBinding = null,
 }: Live2DPetProps) {
   const hostRef = useRef<HTMLDivElement>(null)
   const appRef = useRef<import('pixi.js').Application | null>(null)
@@ -76,6 +80,19 @@ export function Live2DPet({
   const onOneShotEndRef = useRef(onOneShotEnd)
   const sizeRef = useRef(size)
   const loopTokenRef = useRef(0)
+  const forceBindingRef = useRef(forceBinding)
+  const [mapRevision, setMapRevision] = useState(0)
+
+  useEffect(() => {
+    const unlisten = listen<{ petId?: string }>('live2d-motion-map-changed', (ev) => {
+      if (!ev.payload?.petId || ev.payload.petId === pet.id) {
+        setMapRevision((n) => n + 1)
+      }
+    })
+    return () => {
+      unlisten.then((fn) => fn())
+    }
+  }, [pet.id])
 
   useEffect(() => {
     stateRef.current = state
@@ -84,6 +101,10 @@ export function Live2DPet({
   useEffect(() => {
     onOneShotEndRef.current = onOneShotEnd
   }, [onOneShotEnd])
+
+  useEffect(() => {
+    forceBindingRef.current = forceBinding
+  }, [forceBinding])
 
   useEffect(() => {
     sizeRef.current = size
@@ -98,8 +119,17 @@ export function Live2DPet({
     const model = modelRef.current
     if (!model) return
     const token = ++loopTokenRef.current
-    void runMotionLoop(model, pet, state, token, loopTokenRef, onOneShotEndRef, stateRef)
-  }, [state, pet])
+    void runMotionLoop(
+      model,
+      pet,
+      state,
+      token,
+      loopTokenRef,
+      onOneShotEndRef,
+      stateRef,
+      forceBindingRef,
+    )
+  }, [state, pet, forceBinding, mapRevision])
 
   useEffect(() => {
     if (!isLive2DPet(pet) || !pet.modelUrl) return
@@ -150,6 +180,7 @@ export function Live2DPet({
           loopTokenRef,
           onOneShotEndRef,
           stateRef,
+          forceBindingRef,
         )
       } catch (e) {
         console.warn('[Live2DPet] load failed:', e)
@@ -226,18 +257,19 @@ async function runMotionLoop(
   loopTokenRef: React.MutableRefObject<number>,
   onOneShotEndRef: React.MutableRefObject<(() => void) | undefined>,
   stateRef: React.MutableRefObject<CodexPetState>,
+  forceBindingRef: React.MutableRefObject<Live2DMotionBinding | null | undefined>,
 ) {
-  const binding = resolveLive2DMotion(pet, state)
+  const forced = forceBindingRef.current
+  const binding = forced ?? resolveLive2DMotion(pet, state)
   applyExpression(model, binding)
 
-  const priority = state === 'jumping' ? 3 : 2
+  const priority = forced ? 3 : state === 'jumping' ? 3 : 2
   const index =
     typeof binding.index === 'number' && Number.isFinite(binding.index)
       ? binding.index
       : undefined
 
   try {
-    // Force-stop previous motion so waiting↔idle expression/index swaps apply.
     try {
       model.internalModel?.motionManager?.stopAllMotions?.()
     } catch {
@@ -254,18 +286,37 @@ async function runMotionLoop(
 
   if (token !== loopTokenRef.current) return
 
-  if (state === 'jumping') {
+  if (!forced && state === 'jumping') {
     onOneShotEndRef.current?.()
     return
   }
 
-  // Keep replaying while the parent still wants this looping state.
-  if (binding.loop && stateRef.current === state) {
-    // Small gap so Cubism doesn't stack identical motions instantly.
+  // Studio forceBinding or looping oc-claw states keep replaying.
+  const stillForced =
+    !!forced &&
+    forceBindingRef.current &&
+    forceBindingRef.current.group === forced.group &&
+    forceBindingRef.current.index === forced.index &&
+    forceBindingRef.current.expression === forced.expression
+
+  if (forced ? stillForced && (forced.loop ?? true) : binding.loop && stateRef.current === state) {
     await new Promise((r) => setTimeout(r, 80))
     if (token !== loopTokenRef.current) return
-    if (stateRef.current !== state) return
-    void runMotionLoop(model, pet, state, token, loopTokenRef, onOneShotEndRef, stateRef)
+    if (forced) {
+      if (!forceBindingRef.current) return
+    } else if (stateRef.current !== state) {
+      return
+    }
+    void runMotionLoop(
+      model,
+      pet,
+      state,
+      token,
+      loopTokenRef,
+      onOneShotEndRef,
+      stateRef,
+      forceBindingRef,
+    )
   }
 }
 

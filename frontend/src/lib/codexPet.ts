@@ -3,6 +3,14 @@
 // matching the openai/skills hatch-pet output format. Row layout is by
 // convention; pet.json itself does not declare it.
 
+import {
+  getLive2DMotionOverride,
+  ensureLive2DMotionOverridesLoaded,
+} from './live2dMotionOverrides'
+
+// Kick off override load early so resolveLive2DMotion sees user edits.
+void ensureLive2DMotionOverridesLoaded()
+
 export type CodexPetState =
   | 'idle'
   | 'run-right'
@@ -73,7 +81,10 @@ export function resolveLive2DMotion(
   pet: CodexPet,
   state: CodexPetState,
 ): Live2DMotionBinding {
-  const map = pet.motionMap
+  const override = getLive2DMotionOverride(pet.id)
+  const map: Live2DMotionMap | undefined = override
+    ? { ...(pet.motionMap ?? {}), ...override }
+    : pet.motionMap
   const direct = map?.[state]
   const aliased =
     direct ??
@@ -117,6 +128,12 @@ export function resolveLive2DMotion(
     state === 'run-right' ||
     state === 'waiting'
   return { group: legacyGroup, loop }
+}
+
+/** Effective motion map (builtin pet.json + user overrides). */
+export function effectiveLive2DMotionMap(pet: CodexPet): Live2DMotionMap {
+  const override = getLive2DMotionOverride(pet.id)
+  return { ...(pet.motionMap ?? {}), ...(override ?? {}) }
 }
 
 export const ATLAS = {
