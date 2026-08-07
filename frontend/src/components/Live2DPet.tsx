@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { listen } from '@tauri-apps/api/event'
 import {
   isLive2DPet,
+  loadLive2DPackFiles,
   resolveLive2DMotion,
   type CodexPet,
   type CodexPetState,
@@ -138,7 +139,7 @@ export function Live2DPet({
   }, [state, pet, forceBinding, mapRevision])
 
   useEffect(() => {
-    if (!isLive2DPet(pet) || !pet.modelUrl) return
+    if (!isLive2DPet(pet)) return
     const host = hostRef.current
     if (!host) return
 
@@ -168,8 +169,23 @@ export function Live2DPet({
         host.appendChild(app.view as HTMLCanvasElement)
         appRef.current = app
 
-        console.info('[Live2DPet] loading', pet.id, pet.modelUrl)
-        const model = await Live2DModel.from(pet.modelUrl!, {
+        // Imported pets: load via IPC+File/blob to avoid Network Error when
+        // Cubism XHR-fetches moc/textures from asset:// or custom protocols.
+        let source: string | File[]
+        if (pet.live2dPackId) {
+          console.info('[Live2DPet] loading pack', pet.id, pet.live2dPackId)
+          source = await loadLive2DPackFiles(pet.live2dPackId)
+        } else if (pet.modelUrl) {
+          console.info('[Live2DPet] loading', pet.id, pet.modelUrl)
+          source = pet.modelUrl
+        } else {
+          throw new Error('Live2D pet has no modelUrl / live2dPackId')
+        }
+        if (cancelled) return
+
+        // File[] is supported at runtime by FileLoader middleware.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const model = await Live2DModel.from(source as any, {
           autoInteract: false,
         })
         if (cancelled) {
@@ -220,7 +236,7 @@ export function Live2DPet({
       appRef.current = null
       if (host) host.innerHTML = ''
     }
-  }, [pet.id, pet.modelUrl])
+  }, [pet.id, pet.modelUrl, pet.live2dPackId])
 
   const height = Math.round(size * (208 / 192))
 
@@ -378,9 +394,39 @@ async function runMotionLoop(
   const hasAnyMotion = Object.values(pet.availableMotions ?? {}).some(
     (files) => Array.isArray(files) && files.length > 0,
   )
-  // Packs like maho / MAY ship only moc+texture (no motion3). Keep the
-  // static model on stage; do not spam failed motion() calls.
-  if (!forced && motionGroupsKnown && !hasAnyMotion) {
+  const groupFiles = binding.group
+    ? pet.availableMotions?.[binding.group]
+    : undefined
+  const groupHasMotion =
+    Array.isArray(groupFiles) && groupFiles.length > 0
+  // Expression-only packs (tango / maho / MAY): no motion3 — drive preview
+  // by switching expressions between oc-claw states (Cubism fades between them).
+  const playMotion = (() => {
+    if (motionGroupsKnown) {
+      if (!hasAnyMotion) return false
+      if (!binding.group) return false
+      if (pet.availableMotions && Object.prototype.hasOwnProperty.call(pet.availableMotions, binding.group)) {
+        return groupHasMotion
+      }
+      // Group not listed in availableMotions — still attempt play.
+      return true
+    }
+    return !!binding.group
+  })()
+
+  if (!playMotion) {
+    await runExpressionOnlyHold(
+      model,
+      pet,
+      state,
+      binding,
+      forced,
+      token,
+      loopTokenRef,
+      onOneShotEndRef,
+      stateRef,
+      forceBindingRef,
+    )
     return
   }
 
@@ -411,6 +457,22 @@ async function runMotionLoop(
   if (token !== loopTokenRef.current) return
 
   if (!started) {
+    // Fallback: if motion group is missing, still show expression transition.
+    if (binding.expression) {
+      await runExpressionOnlyHold(
+        model,
+        pet,
+        state,
+        binding,
+        forced,
+        token,
+        loopTokenRef,
+        onOneShotEndRef,
+        stateRef,
+        forceBindingRef,
+      )
+      return
+    }
     console.warn('[Live2DPet] motion did not start:', binding)
     return
   }
@@ -450,6 +512,102 @@ async function runMotionLoop(
       forceBindingRef,
     )
   }
+}
+
+function sleep(ms: number, token: number, loopTokenRef: React.MutableRefObject<number>) {
+  return new Promise<void>((resolve) => {
+    const started = performance.now()
+    const tick = () => {
+      if (token !== loopTokenRef.current) {
+        resolve()
+        return
+      }
+      if (performance.now() - started >= ms) {
+        resolve()
+        return
+      }
+      requestAnimationFrame(tick)
+    }
+    requestAnimationFrame(tick)
+  })
+}
+
+async function runExpressionOnlyHold(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  model: any,
+  pet: CodexPet,
+  state: CodexPetState,
+  binding: Live2DMotionBinding,
+  forced: Live2DMotionBinding | null | undefined,
+  token: number,
+  loopTokenRef: React.MutableRefObject<number>,
+  onOneShotEndRef: React.MutableRefObject<(() => void) | undefined>,
+  stateRef: React.MutableRefObject<CodexPetState>,
+  forceBindingRef: React.MutableRefObject<Live2DMotionBinding | null | undefined>,
+) {
+  if (!binding.expression) {
+    // Still allow a static moc+texture model to remain on stage.
+    return
+  }
+
+  // Soft pulse: briefly clear then re-apply so Cubism expression fade is visible
+  // when studio try-plays the same expression, or when looping a single state.
+  const shouldPulse =
+    !!forced ||
+    state === 'running' ||
+    state === 'run-left' ||
+    state === 'run-right' ||
+    state === 'waiting'
+
+  if (!forced && state === 'jumping') {
+    await sleep(900, token, loopTokenRef)
+    if (token === loopTokenRef.current) onOneShotEndRef.current?.()
+    return
+  }
+
+  const stillForced =
+    !!forced &&
+    forceBindingRef.current &&
+    forceBindingRef.current.group === forced.group &&
+    forceBindingRef.current.index === forced.index &&
+    forceBindingRef.current.expression === forced.expression
+
+  const keepGoing = forced
+    ? stillForced && (forced.loop ?? true)
+    : !!binding.loop && stateRef.current === state
+
+  if (!keepGoing) return
+
+  await sleep(shouldPulse ? 2200 : 3200, token, loopTokenRef)
+  if (token !== loopTokenRef.current) return
+  if (forced) {
+    if (!forceBindingRef.current) return
+  } else if (stateRef.current !== state) {
+    return
+  }
+
+  if (shouldPulse) {
+    try {
+      // Reset toward default then re-apply — produces a visible fade cycle.
+      model.expression?.()
+    } catch {
+      /* ignore */
+    }
+    await sleep(280, token, loopTokenRef)
+    if (token !== loopTokenRef.current) return
+    applyExpression(model, binding)
+  }
+
+  void runMotionLoop(
+    model,
+    pet,
+    state,
+    token,
+    loopTokenRef,
+    onOneShotEndRef,
+    stateRef,
+    forceBindingRef,
+  )
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

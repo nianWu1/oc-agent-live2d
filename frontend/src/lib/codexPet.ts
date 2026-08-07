@@ -70,10 +70,15 @@ export interface CodexPet {
   /** Declared for editors / docs; not required at runtime. */
   availableMotions?: Record<string, string[]>
   availableExpressions?: string[]
+  /**
+   * When set, Live2DPet loads the model via `load_live2d_pack` (in-memory
+   * File/blob) instead of fetching modelUrl — required for imported pets.
+   */
+  live2dPackId?: string
 }
 
 export function isLive2DPet(pet: CodexPet | null | undefined): boolean {
-  return !!pet && pet.kind === 'live2d' && !!pet.modelUrl
+  return !!pet && pet.kind === 'live2d' && (!!pet.modelUrl || !!pet.live2dPackId)
 }
 
 /** Resolve the Live2D binding for a given oc-claw sprite state. */
@@ -413,8 +418,8 @@ export async function loadCustomLive2DPets(): Promise<CodexPet[]> {
       availableExpressions?: string[]
     }>
     return raw.map((m) => {
-      // Prefer convertFileSrc (asset://) — reliable in Vite-dev + WKWebView.
-      // Fall back to the custom live2dpet protocol URL.
+      // Preview thumbnails still use convertFileSrc / protocol URLs.
+      // Model runtime loading uses live2dPackId → load_live2d_pack (blobs).
       let modelUrl = m.modelUrl
       let previewUrl = m.previewUrl
       try {
@@ -431,6 +436,7 @@ export async function loadCustomLive2DPets(): Promise<CodexPet[]> {
         spritesheetUrl: previewUrl || modelUrl,
         kind: 'live2d' as const,
         modelUrl,
+        live2dPackId: m.id,
         motionMap: m.motionMap,
         availableMotions: m.availableMotions,
         availableExpressions: m.availableExpressions,
@@ -440,4 +446,48 @@ export async function loadCustomLive2DPets(): Promise<CodexPet[]> {
     console.warn('[codexPet] loadCustomLive2DPets failed:', e)
     return []
   }
+}
+
+/** Decode imported Live2D pack into File[] for pixi-live2d-display FileLoader. */
+export async function loadLive2DPackFiles(petId: string): Promise<File[]> {
+  const { invoke } = await import('@tauri-apps/api/core')
+  const pack = (await invoke('load_live2d_pack', { id: petId })) as {
+    id: string
+    modelPath: string
+    files: Record<string, string>
+  }
+  const files: File[] = []
+  for (const [rel, b64] of Object.entries(pack.files ?? {})) {
+    const path = rel.replace(/\\/g, '/')
+    const bytes = base64ToBytes(b64)
+    const name = path.split('/').pop() || 'file'
+    const file = new File([bytes], name)
+    Object.defineProperty(file, 'webkitRelativePath', {
+      value: path,
+      configurable: true,
+    })
+    files.push(file)
+  }
+  if (files.length === 0) {
+    throw new Error(`empty live2d pack: ${petId}`)
+  }
+  // Prefer the declared model3 as first match for FileLoader.createSettings.
+  const modelIdx = files.findIndex(
+    (f) =>
+      f.name.endsWith('model3.json') &&
+      (f as File & { webkitRelativePath?: string }).webkitRelativePath ===
+        pack.modelPath.replace(/\\/g, '/'),
+  )
+  if (modelIdx > 0) {
+    const [m] = files.splice(modelIdx, 1)
+    files.unshift(m)
+  }
+  return files
+}
+
+function base64ToBytes(b64: string): Uint8Array {
+  const bin = atob(b64)
+  const out = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i)
+  return out
 }

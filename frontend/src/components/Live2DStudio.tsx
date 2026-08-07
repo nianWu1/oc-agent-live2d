@@ -9,6 +9,7 @@ import {
   isLive2DPet,
   loadCodexPets,
   loadCustomLive2DPets,
+  loadLive2DPackFiles,
   type CodexPet,
   type Live2DMotionBinding,
   type Live2DMotionMap,
@@ -33,16 +34,15 @@ type Discovered = {
   expressions: string[]
 }
 
-async function discoverFromModel(modelUrl: string): Promise<Discovered> {
-  try {
-    const res = await fetch(modelUrl)
-    if (!res.ok) return { motions: {}, expressions: [] }
-    const json = (await res.json()) as {
-      FileReferences?: {
-        Motions?: Record<string, unknown[]>
-        Expressions?: Array<{ Name?: string }>
-      }
+async function discoverFromModel(
+  pet: CodexPet,
+): Promise<Discovered> {
+  const parse = (json: {
+    FileReferences?: {
+      Motions?: Record<string, unknown[]>
+      Expressions?: Array<{ Name?: string }>
     }
+  }): Discovered => {
     const motions: Record<string, number> = {}
     for (const [group, list] of Object.entries(json.FileReferences?.Motions ?? {})) {
       motions[group] = Array.isArray(list) ? list.length : 0
@@ -51,9 +51,45 @@ async function discoverFromModel(modelUrl: string): Promise<Discovered> {
       .map((e) => e.Name)
       .filter((n): n is string => !!n)
     return { motions, expressions }
-  } catch {
-    return { motions: {}, expressions: [] }
   }
+
+  const fromMeta = (): Discovered | null => {
+    const motions: Record<string, number> = {}
+    for (const [g, files] of Object.entries(pet.availableMotions ?? {})) {
+      motions[g] = files.length
+    }
+    const expressions = pet.availableExpressions ?? []
+    if (Object.keys(motions).length === 0 && expressions.length === 0) return null
+    return { motions, expressions }
+  }
+
+  // Imported packs: prefer pet.json meta (URL fetch hits Network Error).
+  if (pet.live2dPackId) {
+    const meta = fromMeta()
+    if (meta) return meta
+    try {
+      const files = await loadLive2DPackFiles(pet.live2dPackId)
+      const modelFile =
+        files.find((f) => f.name.endsWith('model3.json')) ??
+        files.find((f) => f.name.endsWith('model.json'))
+      if (modelFile) {
+        const text = await modelFile.text()
+        return parse(JSON.parse(text))
+      }
+    } catch {
+      /* fall through */
+    }
+  }
+
+  if (pet.modelUrl) {
+    try {
+      const res = await fetch(pet.modelUrl)
+      if (res.ok) return parse(await res.json())
+    } catch {
+      /* ignore */
+    }
+  }
+  return fromMeta() ?? { motions: {}, expressions: [] }
 }
 
 function groupLabel(group: string): string {
@@ -137,10 +173,10 @@ export function Live2DStudio() {
   }, [pet, isCustomPet, deleting, reloadPets])
 
   useEffect(() => {
-    if (!pet?.modelUrl) return
+    if (!pet) return
     setForceBinding(null)
     setDraftMap(effectiveLive2DMotionMap(pet))
-    void discoverFromModel(pet.modelUrl).then((d) => {
+    void discoverFromModel(pet).then((d) => {
       const fromPet: Record<string, number> = {}
       for (const [g, files] of Object.entries(pet.availableMotions ?? {})) {
         fromPet[g] = files.length
@@ -296,20 +332,22 @@ export function Live2DStudio() {
             <div className="text-[11px] text-rose-300/90 bg-rose-500/10 border border-rose-500/20 rounded-lg px-3 py-2 break-all">
               加载失败：{loadError}
               <div className="text-white/40 mt-1">
-                可尝试重新导入该文件夹（会自动去掉文件名空格并修补 Motions）。
+                需重启应用以加载最新后端。导入模型走内存加载，不再依赖 asset 协议。
               </div>
             </div>
           )}
           {pet && motionCount === 0 && (
             <div className="text-[11px] text-amber-200/80 bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2">
               此模型没有 <code className="text-white/70">*.motion3.json</code>
-              （如 maho / MAY）。可以静态显示，但无法播放 idle/working 动作。
+              。若有表情，会用不同表情之间的过渡表示 idle / working 等状态；也可点下方表情试播。
             </div>
           )}
           {tab === 'preview' && (
             <>
               <div className="text-[11px] text-white/40">
-                点下面按钮试播模型自带动作。看好哪个再去「映射配置」绑到 oc-claw 状态。
+                {motionCount > 0
+                  ? '点下面按钮试播模型自带动作。看好哪个再去「映射配置」绑到 oc-claw 状态。'
+                  : '无动作时请用表情试播；「映射配置」里可为每个状态指定不同表情。'}
               </div>
               {forceBinding && (
                 <div className="text-[11px] text-sky-300/80 font-mono truncate">
@@ -360,10 +398,10 @@ export function Live2DStudio() {
                           type="button"
                           onClick={() =>
                             play({
-                              group: forceBinding?.group ?? motionGroups[0] ?? 'Idle',
-                              index: forceBinding?.index ?? 0,
+                              group: '',
+                              index: null,
                               expression: name,
-                              loop: false,
+                              loop: true,
                             })
                           }
                           className={`px-2 py-1 rounded-md text-[11px] border ${

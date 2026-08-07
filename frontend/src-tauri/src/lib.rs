@@ -10267,6 +10267,30 @@ fn build_default_live2d_motion_map(motions: &serde_json::Map<String, serde_json:
     })
 }
 
+/// When a pack has expressions but no motions (maho / MAY / tango), map oc-claw
+/// states to different expressions so the pet can still "animate" via fades.
+fn build_expression_only_motion_map(exprs: &[String]) -> serde_json::Value {
+    let pick = |i: usize| -> Option<&String> {
+        if exprs.is_empty() {
+            None
+        } else {
+            Some(&exprs[i % exprs.len()])
+        }
+    };
+    let idle = pick(0);
+    let working = pick(1).or(idle);
+    let waiting = pick(2).or(idle);
+    let jumping = pick(3).or(working).or(idle);
+    serde_json::json!({
+        "idle": { "group": "", "loop": true, "expression": idle },
+        "working": { "group": "", "loop": true, "expression": working },
+        "waiting": { "group": "", "loop": true, "expression": waiting },
+        "jumping": { "group": "", "expression": jumping },
+        "run-left": { "group": "", "loop": true, "expression": working },
+        "run-right": { "group": "", "loop": true, "expression": working }
+    })
+}
+
 fn discover_live2d_pet_json(src: &std::path::Path) -> Result<serde_json::Value, String> {
     let pet_json_path = src.join("pet.json");
     if pet_json_path.is_file() {
@@ -10342,12 +10366,26 @@ fn discover_live2d_pet_json(src: &std::path::Path) -> Result<serde_json::Value, 
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "Live2D".into());
     let id = sanitize_live2d_id(&folder_name);
-    let motion_map = build_default_live2d_motion_map(&motions);
+    let has_motions = !motions.is_empty();
+    let motion_map = if has_motions {
+        build_default_live2d_motion_map(&motions)
+    } else if !available_expressions.is_empty() {
+        build_expression_only_motion_map(&available_expressions)
+    } else {
+        build_default_live2d_motion_map(&motions)
+    };
+    let description = if has_motions {
+        "Imported Live2D model"
+    } else if !available_expressions.is_empty() {
+        "Imported Live2D model (expression-driven — no motion3)"
+    } else {
+        "Imported Live2D model (static — no motion3.json in pack)"
+    };
 
     let mut meta = serde_json::json!({
         "id": id,
         "displayName": folder_name,
-        "description": "Imported Live2D model",
+        "description": description,
         "kind": "live2d",
         "modelPath": model_rel_s,
         "motionMap": motion_map,
@@ -10418,16 +10456,43 @@ fn live2d_meta_from_dir(app: &tauri::AppHandle, dir: &std::path::Path) -> Option
     }
     // Repair previously imported packs that shipped loose motion files but
     // empty FileReferences.Motions (preview/play would otherwise fail).
+    // Also upgrade expression-only packs so states map to different faces.
     if let Ok(motions) = collect_motions_map(&abs_model) {
         let _ = patch_model3_motions(&abs_model, &motions);
-        if !motions.is_empty() {
-            let needs_map = meta
-                .get("availableMotions")
-                .and_then(|v| v.as_object())
-                .map(|m| m.is_empty())
-                .unwrap_or(true);
-            if needs_map {
-                if let Some(obj) = meta.as_object_mut() {
+        let model_raw = std::fs::read_to_string(&abs_model).unwrap_or_default();
+        let model_json: serde_json::Value =
+            serde_json::from_str(&model_raw).unwrap_or(serde_json::json!({}));
+        let exprs: Vec<String> = model_json
+            .pointer("/FileReferences/Expressions")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| item.get("Name").and_then(|n| n.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(obj) = meta.as_object_mut() {
+            let mut dirty = false;
+            if obj
+                .get("availableExpressions")
+                .and_then(|v| v.as_array())
+                .map(|a| a.is_empty())
+                .unwrap_or(true)
+                && !exprs.is_empty()
+            {
+                obj.insert(
+                    "availableExpressions".into(),
+                    serde_json::json!(exprs.clone()),
+                );
+                dirty = true;
+            }
+            if !motions.is_empty() {
+                let needs_map = obj
+                    .get("availableMotions")
+                    .and_then(|v| v.as_object())
+                    .map(|m| m.is_empty())
+                    .unwrap_or(true);
+                if needs_map {
                     let mut available = serde_json::Map::new();
                     for (group, list) in &motions {
                         let files: Vec<String> = list
@@ -10444,11 +10509,40 @@ fn live2d_meta_from_dir(app: &tauri::AppHandle, dir: &std::path::Path) -> Option
                     }
                     obj.insert("availableMotions".into(), serde_json::Value::Object(available));
                     obj.insert("motionMap".into(), build_default_live2d_motion_map(&motions));
-                    let _ = std::fs::write(
-                        &pet_json,
-                        serde_json::to_string_pretty(&meta).unwrap_or_default(),
-                    );
+                    dirty = true;
                 }
+            } else if !exprs.is_empty() {
+                let map_has_expr = obj
+                    .get("motionMap")
+                    .and_then(|v| v.as_object())
+                    .map(|m| {
+                        m.values().any(|b| {
+                            b.get("expression")
+                                .and_then(|e| e.as_str())
+                                .map(|s| !s.is_empty())
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false);
+                if !map_has_expr {
+                    obj.insert(
+                        "motionMap".into(),
+                        build_expression_only_motion_map(&exprs),
+                    );
+                    obj.insert(
+                        "description".into(),
+                        serde_json::json!(
+                            "Imported Live2D model (expression-driven — no motion3)"
+                        ),
+                    );
+                    dirty = true;
+                }
+            }
+            if dirty {
+                let _ = std::fs::write(
+                    &pet_json,
+                    serde_json::to_string_pretty(&meta).unwrap_or_default(),
+                );
             }
         }
     }
@@ -10591,11 +10685,33 @@ async fn import_live2d_pet(app: tauri::AppHandle, src_path: String) -> Result<Li
             .and_then(|v| v.as_object())
             .map(|m| m.values().any(|v| v.as_array().map(|a| !a.is_empty()).unwrap_or(false)))
             .unwrap_or(false);
+        let exprs: Vec<String> = obj
+            .get("availableExpressions")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
         if !has_motions {
-            obj.insert(
-                "description".into(),
-                serde_json::json!("Imported Live2D model (static — no motion3.json in pack)"),
-            );
+            if !exprs.is_empty() {
+                obj.insert(
+                    "motionMap".into(),
+                    build_expression_only_motion_map(&exprs),
+                );
+                obj.insert(
+                    "description".into(),
+                    serde_json::json!(
+                        "Imported Live2D model (expression-driven — no motion3)"
+                    ),
+                );
+            } else {
+                obj.insert(
+                    "description".into(),
+                    serde_json::json!("Imported Live2D model (static — no motion3.json in pack)"),
+                );
+            }
         }
     }
     if let Some(model_rel) = normalized.get("modelPath").and_then(|v| v.as_str()).map(String::from) {
@@ -10627,6 +10743,22 @@ async fn import_live2d_pet(app: tauri::AppHandle, src_path: String) -> Result<Li
                                 "motionMap".into(),
                                 build_default_live2d_motion_map(&motions),
                             );
+                        } else {
+                            let exprs: Vec<String> = obj
+                                .get("availableExpressions")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|v| v.as_str().map(String::from))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            if !exprs.is_empty() {
+                                obj.insert(
+                                    "motionMap".into(),
+                                    build_expression_only_motion_map(&exprs),
+                                );
+                            }
                         }
                     }
                 }
@@ -10670,6 +10802,119 @@ async fn delete_live2d_pet(app: tauri::AppHandle, id: String) -> Result<(), Stri
     log::info!("[live2d] deleted imported pet {}", id);
     let _ = app.emit("live2d-pet-deleted", serde_json::json!({ "petId": id }));
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+pub struct Live2DPackPayload {
+    pub id: String,
+    #[serde(rename = "modelPath")]
+    pub model_path: String,
+    /// Relative unix paths (from pet root) → base64 file bytes.
+    /// Frontend builds `File` + webkitRelativePath and loads via FileLoader
+    /// to avoid custom-protocol / CORS Network Error in Vite preview.
+    pub files: std::collections::BTreeMap<String, String>,
+}
+
+fn collect_live2d_pack_files(
+    root: &std::path::Path,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    use base64::Engine;
+    let mut out = std::collections::BTreeMap::new();
+    let mut total: u64 = 0;
+    const MAX_BYTES: u64 = 96 * 1024 * 1024;
+
+    fn walk(
+        dir: &std::path::Path,
+        root: &std::path::Path,
+        out: &mut std::collections::BTreeMap<String, String>,
+        total: &mut u64,
+    ) -> Result<(), String> {
+        let entries = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, root, out, total)?;
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            // Skip metadata / junk; keep model assets.
+            if name.eq_ignore_ascii_case("pet.json")
+                || name.eq_ignore_ascii_case(".ds_store")
+                || name.starts_with('.')
+            {
+                continue;
+            }
+            let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+            *total = total.saturating_add(meta.len());
+            if *total > MAX_BYTES {
+                return Err(format!(
+                    "live2d pack too large (>{} MB)",
+                    MAX_BYTES / (1024 * 1024)
+                ));
+            }
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|_| "path outside pack".to_string())?;
+            let rel_s = path_to_unix_rel(rel);
+            let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+            out.insert(
+                rel_s,
+                base64::engine::general_purpose::STANDARD.encode(bytes),
+            );
+        }
+        Ok(())
+    }
+
+    walk(root, root, &mut out, &mut total)?;
+    if out.is_empty() {
+        return Err("live2d pack has no files".into());
+    }
+    Ok(out)
+}
+
+/// Load an imported Live2D pack as in-memory files (base64) so the webview
+/// can construct blob/`File` sources without hitting Network Error on
+/// asset:// or custom protocol fetches from Vite http://localhost.
+#[tauri::command]
+async fn load_live2d_pack(app: tauri::AppHandle, id: String) -> Result<Live2DPackPayload, String> {
+    let id = id.trim().to_string();
+    if id.is_empty()
+        || id.contains("..")
+        || id.contains('/')
+        || id.contains('\\')
+        || id.contains('\0')
+    {
+        return Err("invalid live2d pet id".into());
+    }
+    let root = live2d_pets_dir(&app)?;
+    let dir = root.join(&id);
+    let canon_root = root.canonicalize().unwrap_or(root.clone());
+    let canon_dir = dir
+        .canonicalize()
+        .map_err(|_| format!("live2d pet not found: {}", id))?;
+    if !canon_dir.starts_with(&canon_root) || !canon_dir.is_dir() {
+        return Err(format!("live2d pet not found: {}", id));
+    }
+    let _ = normalize_live2d_pack_filenames(&canon_dir);
+    let model_abs = find_model3_json(&canon_dir)
+        .ok_or_else(|| format!("no .model3.json in pack: {}", id))?;
+    let model_path = path_to_unix_rel(
+        model_abs
+            .strip_prefix(&canon_dir)
+            .map_err(|_| "model path outside pack".to_string())?,
+    );
+    let files = collect_live2d_pack_files(&canon_dir)?;
+    Ok(Live2DPackPayload {
+        id,
+        model_path,
+        files,
+    })
 }
 
 /// Activate a macOS app by its name (e.g. "Feishu", "Telegram", "Lark").
@@ -18529,7 +18774,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, get_webview_origin, set_webview_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_get, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, list_custom_live2d_pets, open_live2d_pets_dir, import_live2d_pet, pick_live2d_pet_folder, delete_live2d_pet, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs])
+        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, get_webview_origin, set_webview_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_get, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, list_custom_live2d_pets, open_live2d_pets_dir, import_live2d_pet, pick_live2d_pet_folder, delete_live2d_pet, load_live2d_pack, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs])
         .manage(ActiveAgentPid { pid: Mutex::new(None) })
         .manage(ClaudeState { sessions: Arc::new(Mutex::new(HashMap::new())), pending_permissions: Arc::new(Mutex::new(HashMap::new())), dismissed: Arc::new(Mutex::new(std::collections::HashSet::new())) })
         .run(tauri::generate_context!())
